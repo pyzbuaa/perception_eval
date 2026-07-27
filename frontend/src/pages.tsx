@@ -2577,6 +2577,28 @@ function parameterComparisonIssue(runs: ResultRun[]) {
   return ''
 }
 
+function datasetComparisonIssue(runs: ResultRun[]) {
+  if (runs.length < 2) return '请至少选择两次评测结果'
+  if (runs.some((run) => !hasMeasuredPerformance(run))) return '所选结果包含未采集真实性能数据的运行'
+  const first = runs[0]
+  if (!first.evaluation_categories.length) return '所选结果未记录评测类别范围，无法进行可比性校验'
+  const categories = [...first.evaluation_categories].sort().join('\u0000')
+  const hardware = first.environment_fingerprint || JSON.stringify(first.hardware_profile)
+  const protocol = String(first.config.metric_protocol || '')
+  const adapter = String(first.config.adapter_id || '')
+  const parameters = JSON.stringify(resultInferenceParameters(first))
+  for (const run of runs.slice(1)) {
+    if (run.model_id !== first.model_id) return '只能比较同一个模型版本在不同数据集上的结果'
+    if ([...run.evaluation_categories].sort().join('\u0000') !== categories) return '所选结果的评测类别范围不一致'
+    if (JSON.stringify(resultInferenceParameters(run)) !== parameters) return '所选结果的推理配置不一致'
+    if ((run.environment_fingerprint || JSON.stringify(run.hardware_profile)) !== hardware) return '所选结果的硬件或运行环境不一致'
+    if (String(run.config.metric_protocol || '') !== protocol) return '所选结果的指标计算协议不一致'
+    if (String(run.config.adapter_id || '') !== adapter) return '所选结果使用的推理适配器不一致'
+  }
+  if (new Set(runs.map((run) => run.dataset_id)).size < 2) return '请选择至少两个不同数据集的评测结果'
+  return ''
+}
+
 type ParameterComparisonRow = {
   key: string
   label: string
@@ -2585,6 +2607,26 @@ type ParameterComparisonRow = {
   map: number
   map50: number
   map75: number
+  latencyP50: number
+  latencyP95: number
+  fps: number
+  peakMemory: number
+  curves: { recall: number[]; precision: number[] }
+}
+
+type DatasetComparisonRow = {
+  key: string
+  datasetName: string
+  scene: string
+  condition: string
+  resolution: string
+  runs: ResultRun[]
+  map: number
+  map50: number
+  map75: number
+  precision: number
+  recall: number
+  f1: number
   latencyP50: number
   latencyP95: number
   fps: number
@@ -2626,12 +2668,48 @@ function aggregateParameterRuns(runs: ResultRun[]): ParameterComparisonRow[] {
   })
 }
 
+function aggregateDatasetRuns(runs: ResultRun[]): DatasetComparisonRow[] {
+  const grouped = new Map<string, ResultRun[]>()
+  runs.forEach((run) => grouped.set(run.dataset_id, [...(grouped.get(run.dataset_id) || []), run]))
+  return [...grouped.entries()].map(([key, groupedRuns]) => {
+    const first = groupedRuns[0]
+    const precisionLength = Math.max(...groupedRuns.map((run) => run.curves.precision.length), 0)
+    const recallLength = Math.max(...groupedRuns.map((run) => run.curves.recall.length), 0)
+    return {
+      key,
+      datasetName: first.dataset_name,
+      scene: first.scene_domain,
+      condition: first.condition_type || '无',
+      resolution: first.resolution,
+      runs: groupedRuns,
+      map: average(groupedRuns.map((run) => run.map)),
+      map50: average(groupedRuns.map((run) => run.map50)),
+      map75: average(groupedRuns.map((run) => run.map75)),
+      precision: average(groupedRuns.map((run) => run.precision)),
+      recall: average(groupedRuns.map((run) => run.recall)),
+      f1: average(groupedRuns.map((run) => run.f1)),
+      latencyP50: average(groupedRuns.map((run) => run.latency_p50)),
+      latencyP95: average(groupedRuns.map((run) => run.latency_p95)),
+      fps: average(groupedRuns.map((run) => run.fps)),
+      peakMemory: average(groupedRuns.map((run) => run.peak_memory)),
+      curves: {
+        recall: Array.from({ length: recallLength }, (_, point) => average(groupedRuns.map((run) => run.curves.recall[point]).filter((value) => Number.isFinite(value)))),
+        precision: Array.from({ length: precisionLength }, (_, point) => average(groupedRuns.map((run) => run.curves.precision[point]).filter((value) => Number.isFinite(value)))),
+      },
+    }
+  })
+}
+
 export function ExplorerPage({ dark }: PageProps) {
   const [data, setData] = useState<ResultResponse>({ count: 0, groups: [], runs: [], dimensions: resultDimensions() })
   const [loading, setLoading] = useState(true)
   const [selectedRunIds, setSelectedRunIds] = useState<string[]>([])
   const [comparisonRuns, setComparisonRuns] = useState<ResultRun[]>([])
   const [baselineKey, setBaselineKey] = useState('')
+  const [datasetComparisonRuns, setDatasetComparisonRuns] = useState<ResultRun[]>([])
+  const [datasetBaselineKey, setDatasetBaselineKey] = useState('')
+  const [modelFilter, setModelFilter] = useState<string>()
+  const [datasetFilter, setDatasetFilter] = useState<string>()
   const [selectedRun, setSelectedRun] = useState<ResultRun>()
   const [visualizationGroup, setVisualizationGroup] = useState<ResultGroup>()
   const [runPage, setRunPage] = useState(1)
@@ -2643,13 +2721,16 @@ export function ExplorerPage({ dark }: PageProps) {
     setSelectedRunIds((current) => current.filter((runId) => available.has(runId)))
   }, [data.runs])
   const natureTag = (result: { is_demo: boolean; is_official: boolean }) => result.is_demo ? <DemoTag /> : result.is_official ? <Tag color="green">真实模型 · 正式结果</Tag> : null
-  const runs = [...data.runs].sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
+  const allRuns = [...data.runs].sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
+  const runs = allRuns.filter((run) => (!modelFilter || run.model_id === modelFilter) && (!datasetFilter || run.dataset_id === datasetFilter))
   const comparisonRows = useMemo(() => aggregateParameterRuns(comparisonRuns), [comparisonRuns])
   const changedParameterKeys = Object.keys(resultParameterLabels).filter((key) => new Set(comparisonRows.map((row) => row.parameters[key])).size > 1)
   const commonParameterKeys = Object.keys(resultParameterLabels).filter((key) => comparisonRows.length && !changedParameterKeys.includes(key))
   const baseline = comparisonRows.find((row) => row.key === baselineKey) || comparisonRows[0]
+  const datasetComparisonRows = useMemo(() => aggregateDatasetRuns(datasetComparisonRuns), [datasetComparisonRuns])
+  const datasetBaseline = datasetComparisonRows.find((row) => row.key === datasetBaselineKey) || datasetComparisonRows[0]
   const openParameterComparison = () => {
-    const selectedRuns = runs.filter((run) => selectedRunIds.includes(run.run_id))
+    const selectedRuns = allRuns.filter((run) => selectedRunIds.includes(run.run_id))
     const issue = parameterComparisonIssue(selectedRuns)
     if (issue) {
       message.warning(issue)
@@ -2664,8 +2745,25 @@ export function ExplorerPage({ dark }: PageProps) {
       message.warning('单次最多对比四种推理配置，请减少选择')
       return
     }
+    setDatasetComparisonRuns([])
     setComparisonRuns(selectedRuns)
     setBaselineKey(grouped[0].key)
+  }
+  const openDatasetComparison = () => {
+    const selectedRuns = allRuns.filter((run) => selectedRunIds.includes(run.run_id))
+    const issue = datasetComparisonIssue(selectedRuns)
+    if (issue) {
+      message.warning(issue)
+      return
+    }
+    const grouped = aggregateDatasetRuns(selectedRuns)
+    if (grouped.length > 4) {
+      message.warning('单次最多对比四个数据集，请减少选择')
+      return
+    }
+    setComparisonRuns([])
+    setDatasetComparisonRuns(selectedRuns)
+    setDatasetBaselineKey(grouped[0].key)
   }
   const visualize = (run: ResultRun) => {
     const group = data.groups.find((item) => item.run_ids.includes(run.run_id))
@@ -2678,6 +2776,7 @@ export function ExplorerPage({ dark }: PageProps) {
       if (visualizationGroup?.run_ids.includes(run.run_id)) setVisualizationGroup(undefined)
       setSelectedRunIds((current) => current.filter((runId) => runId !== run.run_id))
       if (comparisonRuns.some((item) => item.run_id === run.run_id)) setComparisonRuns([])
+      if (datasetComparisonRuns.some((item) => item.run_id === run.run_id)) setDatasetComparisonRuns([])
       message.success('评测结果已移入回收站')
       await load()
     } catch (error) { message.error((error as Error).message) }
@@ -2712,10 +2811,45 @@ export function ExplorerPage({ dark }: PageProps) {
       { name: 'P95', type: 'line', data: orderedComparisonRows.map((row) => row.latencyP95), smooth: true },
     ],
   }
+  const datasetCommonParameters = datasetComparisonRuns[0] ? resultInferenceParameters(datasetComparisonRuns[0]) : undefined
+  const datasetChartBase = {
+    tooltip: { trigger: 'axis' },
+    legend: { top: 0, textStyle: { color: comparisonTextColor } },
+    grid: { left: 64, right: 64, top: 48, bottom: 72 },
+    xAxis: { type: 'category', data: datasetComparisonRows.map((row) => row.datasetName), axisLabel: { color: comparisonTextColor, interval: 0, rotate: datasetComparisonRows.length > 2 ? 15 : 0 } },
+  }
+  const datasetAccuracyOption = {
+    ...datasetChartBase,
+    yAxis: { type: 'value', name: '精度', min: 0, max: 1, axisLabel: { formatter: (value: number) => `${Math.round(value * 100)}%`, color: comparisonTextColor }, splitLine: { lineStyle: { color: comparisonSplitColor } } },
+    series: [
+      { name: 'mAP', type: 'bar', data: datasetComparisonRows.map((row) => row.map) },
+      { name: 'AP50', type: 'bar', data: datasetComparisonRows.map((row) => row.map50) },
+      { name: 'AP75', type: 'bar', data: datasetComparisonRows.map((row) => row.map75) },
+      { name: 'F1', type: 'bar', data: datasetComparisonRows.map((row) => row.f1) },
+    ],
+  }
+  const datasetPerformanceOption = {
+    ...datasetChartBase,
+    yAxis: [
+      { type: 'value', name: '时延 / ms', min: 0, axisLabel: { color: comparisonTextColor }, splitLine: { lineStyle: { color: comparisonSplitColor } } },
+      { type: 'value', name: 'FPS', min: 0, axisLabel: { color: comparisonTextColor }, splitLine: { show: false } },
+    ],
+    series: [
+      { name: 'P50', type: 'bar', yAxisIndex: 0, data: datasetComparisonRows.map((row) => row.latencyP50) },
+      { name: 'P95', type: 'bar', yAxisIndex: 0, data: datasetComparisonRows.map((row) => row.latencyP95) },
+      { name: 'FPS', type: 'line', yAxisIndex: 1, smooth: true, data: datasetComparisonRows.map((row) => row.fps) },
+    ],
+  }
   const relativeDelta = (value: number, base: number) => base ? `${value >= base ? '+' : ''}${((value / base - 1) * 100).toFixed(1)}%` : '—'
   const mapDelta = (value: number, base: number) => `${value >= base ? '+' : ''}${((value - base) * 100).toFixed(2)}pp`
   return <Space direction="vertical" size={18} style={{ width: '100%' }}>
-      <Card title="模型对比" extra={<Space><Button type="primary" disabled={selectedRunIds.length < 2} onClick={openParameterComparison}>参数对比{selectedRunIds.length ? `（${selectedRunIds.length}）` : ''}</Button><Button icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新结果</Button></Space>}>
+      <Card title="模型对比" extra={<Space><Button disabled={selectedRunIds.length < 2} onClick={openParameterComparison}>参数对比{selectedRunIds.length ? `（${selectedRunIds.length}）` : ''}</Button><Button type="primary" disabled={selectedRunIds.length < 2} onClick={openDatasetComparison}>数据集对比{selectedRunIds.length ? `（${selectedRunIds.length}）` : ''}</Button><Button icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新结果</Button></Space>}>
+        <Space wrap style={{ marginBottom: 16 }}>
+          <Select allowClear showSearch optionFilterProp="label" placeholder="按模型筛选" value={modelFilter} onChange={(value) => { setModelFilter(value); setRunPage(1) }} style={{ width: 280 }} options={data.dimensions.model_options.map(([value, label]) => ({ value, label }))} />
+          <Select allowClear showSearch optionFilterProp="label" placeholder="按数据集筛选" value={datasetFilter} onChange={(value) => { setDatasetFilter(value); setRunPage(1) }} style={{ width: 280 }} options={data.dimensions.dataset_options.map(([value, label]) => ({ value, label }))} />
+          {(modelFilter || datasetFilter) && <Button onClick={() => { setModelFilter(undefined); setDatasetFilter(undefined); setRunPage(1) }}>清空筛选</Button>}
+          <Typography.Text type="secondary">当前 {runs.length} / {allRuns.length} 次评测；模型与数据集条件取交集</Typography.Text>
+        </Space>
         <Table<ResultRun>
           size="small"
           loading={loading}
@@ -2823,6 +2957,44 @@ export function ExplorerPage({ dark }: PageProps) {
             ? <Row gutter={[16, 16]}><Col xs={24} xl={12}><Card title={`${resultParameterLabels[singleParameterKey]}—精度`}><ReactECharts option={accuracyComparisonOption} style={{ height: 340 }} /></Card></Col><Col xs={24} xl={12}><Card title={`${resultParameterLabels[singleParameterKey]}—时延`}><ReactECharts option={latencyComparisonOption} style={{ height: 340 }} /></Card></Col></Row>
             : <Alert type="warning" showIcon message="同时变化了多个推理参数" description="平台仅展示结果差异，不将性能变化归因于某一个参数。若要查看单参数趋势，请选择其他参数完全一致的评测结果。" />}
           <Card title="PR 曲线对比"><PRChart groups={comparisonRows.map((row) => ({ model_name: `${row.label} ${changedParameterKeys.map((key) => row.parameters[key]).join(' / ')}`, curves: row.curves }))} dark={dark} height={360} /></Card>
+        </Space>}
+      </Drawer>
+      <Drawer open={Boolean(datasetComparisonRuns.length)} onClose={() => setDatasetComparisonRuns([])} title="数据集对比" width="96vw">
+        {datasetComparisonRows.length > 1 && datasetBaseline && datasetCommonParameters && <Space direction="vertical" size={18} style={{ width: '100%' }}>
+          <Alert type="info" showIcon message={datasetComparisonRuns[0].model_name} description={`评测类别：${evaluationCategoryLabel(datasetComparisonRuns[0].evaluation_categories)}；同一数据集的重复运行已自动计算均值。`} />
+          <Space wrap>
+            <Typography.Text strong>基准数据集</Typography.Text>
+            <Select value={datasetBaseline.key} onChange={setDatasetBaselineKey} style={{ minWidth: 280 }} options={datasetComparisonRows.map((row) => ({ value: row.key, label: row.datasetName }))} />
+          </Space>
+          <Card size="small" title="共同推理配置"><Space wrap>{Object.entries(datasetCommonParameters).map(([key, value]) => <Tag key={key}>{resultParameterLabels[key]}：{value}</Tag>)}</Space></Card>
+          <Table<DatasetComparisonRow>
+            rowKey="key"
+            pagination={false}
+            dataSource={datasetComparisonRows}
+            scroll={{ x: 1900 }}
+            columns={[
+              { title: '基准', width: 70, fixed: 'left', render: (_, row) => <Radio checked={row.key === datasetBaseline.key} onChange={() => setDatasetBaselineKey(row.key)} /> },
+              { title: '数据集', dataIndex: 'datasetName', width: 210, fixed: 'left', render: (value, row) => <Space direction="vertical" size={0}><Typography.Text strong>{value}</Typography.Text><Typography.Text type="secondary">{row.runs.length} 次运行</Typography.Text></Space> },
+              { title: '场景', dataIndex: 'scene', width: 130 },
+              { title: '条件', dataIndex: 'condition', width: 130 },
+              { title: '数据分辨率', dataIndex: 'resolution', width: 130 },
+              { title: 'mAP', width: 110, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text strong>{percent(row.map)}</Typography.Text>{row.key !== datasetBaseline.key && <Typography.Text type="secondary">{mapDelta(row.map, datasetBaseline.map)}</Typography.Text>}</Space> },
+              { title: 'AP50', width: 105, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{percent(row.map50)}</Typography.Text>{row.key !== datasetBaseline.key && <Typography.Text type="secondary">{mapDelta(row.map50, datasetBaseline.map50)}</Typography.Text>}</Space> },
+              { title: 'AP75', width: 105, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{percent(row.map75)}</Typography.Text>{row.key !== datasetBaseline.key && <Typography.Text type="secondary">{mapDelta(row.map75, datasetBaseline.map75)}</Typography.Text>}</Space> },
+              { title: 'Precision', width: 110, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{percent(row.precision)}</Typography.Text>{row.key !== datasetBaseline.key && <Typography.Text type="secondary">{mapDelta(row.precision, datasetBaseline.precision)}</Typography.Text>}</Space> },
+              { title: 'Recall', width: 105, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{percent(row.recall)}</Typography.Text>{row.key !== datasetBaseline.key && <Typography.Text type="secondary">{mapDelta(row.recall, datasetBaseline.recall)}</Typography.Text>}</Space> },
+              { title: 'F1', width: 100, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{percent(row.f1)}</Typography.Text>{row.key !== datasetBaseline.key && <Typography.Text type="secondary">{mapDelta(row.f1, datasetBaseline.f1)}</Typography.Text>}</Space> },
+              { title: '时延P50', width: 115, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{row.latencyP50.toFixed(2)} ms</Typography.Text>{row.key !== datasetBaseline.key && <Typography.Text type="secondary">{relativeDelta(row.latencyP50, datasetBaseline.latencyP50)}</Typography.Text>}</Space> },
+              { title: '时延P95', width: 115, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{row.latencyP95.toFixed(2)} ms</Typography.Text>{row.key !== datasetBaseline.key && <Typography.Text type="secondary">{relativeDelta(row.latencyP95, datasetBaseline.latencyP95)}</Typography.Text>}</Space> },
+              { title: 'FPS', width: 100, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{row.fps.toFixed(2)}</Typography.Text>{row.key !== datasetBaseline.key && <Typography.Text type="secondary">{relativeDelta(row.fps, datasetBaseline.fps)}</Typography.Text>}</Space> },
+              { title: '峰值显存', width: 120, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{row.peakMemory.toFixed(0)} MB</Typography.Text>{row.key !== datasetBaseline.key && <Typography.Text type="secondary">{relativeDelta(row.peakMemory, datasetBaseline.peakMemory)}</Typography.Text>}</Space> },
+            ]}
+          />
+          <Row gutter={[16, 16]}>
+            <Col xs={24} xl={12}><Card title="数据集精度对比"><ReactECharts option={datasetAccuracyOption} style={{ height: 360 }} /></Card></Col>
+            <Col xs={24} xl={12}><Card title="数据集推理效能对比"><ReactECharts option={datasetPerformanceOption} style={{ height: 360 }} /></Card></Col>
+          </Row>
+          <Card title="PR 曲线对比"><PRChart groups={datasetComparisonRows.map((row) => ({ model_name: row.datasetName, curves: row.curves }))} dark={dark} height={380} /></Card>
         </Space>}
       </Drawer>
       <EvaluationVisualizationDrawer group={visualizationGroup} onClose={() => setVisualizationGroup(undefined)} />
