@@ -46,17 +46,21 @@ import {
   FileImageOutlined,
   FullscreenExitOutlined,
   ImportOutlined,
+  LeftOutlined,
   LockOutlined,
   PlayCircleOutlined,
+  PlusOutlined,
   ReloadOutlined,
+  RightOutlined,
   RobotOutlined,
+  SaveOutlined,
   SafetyCertificateOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
 import ReactECharts from 'echarts-for-react'
 import { api, formatBytes, percent, post } from './api'
 import { DemoTag, Gallery, JobProgress, ParetoChart, PRChart, StatusTag } from './components'
-import type { Adapter, BaseGenSceneField, BaseGenSceneOption, BaseGenSceneSchema, Dataset, DatasetSamplePage, EnvironmentStatus, Job, ModelVersion, Overview, ResultGroup, ResultResponse } from './types'
+import type { Adapter, AnnotationCategory, AnnotationSession, BaseGenSceneField, BaseGenSceneOption, BaseGenSceneSchema, Dataset, DatasetSamplePage, DetectionBox, EnvironmentStatus, Job, ModelVersion, Overview, ResultGroup, ResultResponse, SampleAnnotation } from './types'
 
 type RouteKey = 'overview' | 'builder' | 'datasets' | 'registry' | 'evaluation' | 'explorer' | 'tasks' | 'environment'
 interface PageProps { dark: boolean; navigate: (route: RouteKey) => void; refresh: () => void }
@@ -479,10 +483,425 @@ function DatasetBrowser({ dataset, onClose }: { dataset?: Dataset; onClose: () =
   )
 }
 
+type AnnotationAction =
+  | { type: 'draw'; id: string; startX: number; startY: number; before: DetectionBox[] }
+  | { type: 'move'; id: string; startX: number; startY: number; original: DetectionBox; before: DetectionBox[] }
+  | { type: 'resize'; id: string; handle: 'nw' | 'ne' | 'sw' | 'se'; original: DetectionBox; before: DetectionBox[] }
+
+const annotationColors = ['#1677FF', '#13A8A8', '#722ED1', '#EB2F96', '#52C41A', '#FA8C16', '#F5222D', '#2F54EB']
+
+function AnnotationWorkspace({ dataset, onClose, onChanged }: { dataset?: Dataset; onClose: () => void; onChanged: () => void }) {
+  const [session, setSession] = useState<AnnotationSession>()
+  const [sampleIndex, setSampleIndex] = useState(0)
+  const [boxes, setBoxes] = useState<DetectionBox[]>([])
+  const [completed, setCompleted] = useState(false)
+  const [dimensions, setDimensions] = useState({ width: 0, height: 0 })
+  const [selectedBoxId, setSelectedBoxId] = useState<string>()
+  const [selectedCategoryId, setSelectedCategoryId] = useState(1)
+  const [newCategoryName, setNewCategoryName] = useState('')
+  const [zoom, setZoom] = useState(1)
+  const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [savedAt, setSavedAt] = useState('')
+  const svgRef = useRef<SVGSVGElement>(null)
+  const boxesRef = useRef<DetectionBox[]>([])
+  const completedRef = useRef(false)
+  const dimensionsRef = useRef({ width: 0, height: 0 })
+  const dirtyRef = useRef(false)
+  const actionRef = useRef<AnnotationAction>()
+
+  const currentSample = session?.samples[sampleIndex]
+  const editable = Boolean(dataset && !dataset.frozen)
+  const selectedBox = boxes.find((box) => box.id === selectedBoxId)
+
+  const setBoxState = (next: DetectionBox[]) => {
+    boxesRef.current = next
+    setBoxes(next)
+  }
+
+  const markChanged = (next: DetectionBox[]) => {
+    setBoxState(next)
+    if (completedRef.current) {
+      completedRef.current = false
+      setCompleted(false)
+    }
+    dirtyRef.current = true
+  }
+
+  const loadSession = useCallback(async (datasetId: string) => {
+    const next = await api<AnnotationSession>(`/api/datasets/${datasetId}/annotations`)
+    setSession(next)
+    setSelectedCategoryId((current) => next.categories.some((category) => category.id === current) ? current : next.categories[0]?.id || 1)
+  }, [])
+
+  useEffect(() => {
+    setSession(undefined)
+    setSampleIndex(0)
+    setSavedAt('')
+    if (dataset) loadSession(dataset.id).catch((error) => message.error(error.message))
+  }, [dataset?.id, loadSession])
+
+  useEffect(() => {
+    if (!dataset || !currentSample) return
+    let active = true
+    setLoading(true)
+    setSelectedBoxId(undefined)
+    setZoom(1)
+    setBoxState([])
+    setCompleted(false)
+    completedRef.current = false
+    dimensionsRef.current = { width: 0, height: 0 }
+    setDimensions({ width: 0, height: 0 })
+    dirtyRef.current = false
+    api<SampleAnnotation>(`/api/datasets/${dataset.id}/samples/${encodeURIComponent(currentSample.name)}/annotations`)
+      .then((annotation) => {
+        if (!active) return
+        setBoxState(annotation.boxes)
+        completedRef.current = annotation.completed
+        setCompleted(annotation.completed)
+        if (annotation.width && annotation.height) {
+          dimensionsRef.current = { width: annotation.width, height: annotation.height }
+          setDimensions(dimensionsRef.current)
+        }
+        dirtyRef.current = false
+      })
+      .catch((error) => active && message.error(error.message))
+      .finally(() => active && setLoading(false))
+    return () => { active = false }
+  }, [dataset?.id, currentSample?.name])
+
+  const updateSummary = (sampleName: string, savedBoxes: DetectionBox[], isCompleted: boolean) => {
+    setSession((current) => {
+      if (!current) return current
+      const samples = current.samples.map((sample) => sample.name === sampleName
+        ? { ...sample, completed: isCompleted, box_count: savedBoxes.length }
+        : sample)
+      return {
+        ...current,
+        samples,
+        progress: {
+          total: samples.length,
+          completed: samples.filter((sample) => sample.completed).length,
+        },
+      }
+    })
+  }
+
+  const persist = async (forceCompleted?: boolean) => {
+    if (!dataset || !currentSample || !editable) return true
+    if (forceCompleted !== undefined && forceCompleted !== completedRef.current) {
+      completedRef.current = forceCompleted
+      setCompleted(forceCompleted)
+      dirtyRef.current = true
+    }
+    if (!dirtyRef.current) return true
+    const size = dimensionsRef.current
+    if (!size.width || !size.height) {
+      message.warning('图片尺寸尚未加载完成')
+      return false
+    }
+    const savedBoxes = boxesRef.current.map((box) => ({
+      ...box,
+      x: Number(box.x.toFixed(2)),
+      y: Number(box.y.toFixed(2)),
+      width: Number(box.width.toFixed(2)),
+      height: Number(box.height.toFixed(2)),
+    }))
+    const savedCompleted = completedRef.current
+    dirtyRef.current = false
+    setSaving(true)
+    try {
+      await api<SampleAnnotation>(`/api/datasets/${dataset.id}/samples/${encodeURIComponent(currentSample.name)}/annotations`, {
+        method: 'PUT',
+        body: JSON.stringify({ ...size, boxes: savedBoxes, completed: savedCompleted }),
+      })
+      updateSummary(currentSample.name, savedBoxes, savedCompleted)
+      setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour12: false }))
+      if (dataset.annotation_status !== 'ANNOTATING') onChanged()
+      return true
+    } catch (error) {
+      dirtyRef.current = true
+      message.error((error as Error).message)
+      return false
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const goToSample = async (next: number) => {
+    if (!session || next < 0 || next >= session.samples.length) return
+    if (!await persist()) return
+    setSampleIndex(next)
+  }
+
+  const imagePoint = (event: React.PointerEvent<SVGSVGElement | SVGElement>) => {
+    const svg = svgRef.current
+    const matrix = svg?.getScreenCTM()
+    if (!svg || !matrix) return undefined
+    const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(matrix.inverse())
+    return {
+      x: Math.max(0, Math.min(dimensionsRef.current.width, point.x)),
+      y: Math.max(0, Math.min(dimensionsRef.current.height, point.y)),
+    }
+  }
+
+  const beginDraw = (event: React.PointerEvent<SVGSVGElement>) => {
+    if (!editable || event.button !== 0 || !dimensions.width || !session?.categories.length) return
+    const point = imagePoint(event)
+    if (!point) return
+    const id = `box_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
+    const before = boxesRef.current
+    setSelectedBoxId(id)
+    setBoxState([...before, { id, category_id: selectedCategoryId, x: point.x, y: point.y, width: 0.01, height: 0.01 }])
+    actionRef.current = { type: 'draw', id, startX: point.x, startY: point.y, before }
+    svgRef.current?.setPointerCapture(event.pointerId)
+  }
+
+  const beginMove = (event: React.PointerEvent<SVGRectElement>, box: DetectionBox) => {
+    event.stopPropagation()
+    setSelectedBoxId(box.id)
+    setSelectedCategoryId(box.category_id)
+    if (!editable || event.button !== 0) return
+    const point = imagePoint(event)
+    if (!point) return
+    actionRef.current = { type: 'move', id: box.id, startX: point.x, startY: point.y, original: box, before: boxesRef.current }
+    svgRef.current?.setPointerCapture(event.pointerId)
+  }
+
+  const beginResize = (event: React.PointerEvent<SVGRectElement>, box: DetectionBox, handle: 'nw' | 'ne' | 'sw' | 'se') => {
+    event.stopPropagation()
+    if (!editable || event.button !== 0) return
+    const point = imagePoint(event)
+    if (!point) return
+    actionRef.current = { type: 'resize', id: box.id, handle, original: box, before: boxesRef.current }
+    svgRef.current?.setPointerCapture(event.pointerId)
+  }
+
+  const movePointer = (event: React.PointerEvent<SVGSVGElement>) => {
+    const action = actionRef.current
+    const point = imagePoint(event)
+    if (!action || !point) return
+    if (action.type === 'draw') {
+      setBoxState(boxesRef.current.map((box) => box.id === action.id ? {
+        ...box,
+        x: Math.min(action.startX, point.x),
+        y: Math.min(action.startY, point.y),
+        width: Math.abs(point.x - action.startX),
+        height: Math.abs(point.y - action.startY),
+      } : box))
+      return
+    }
+    if (action.type === 'move') {
+      const x = Math.max(0, Math.min(dimensions.width - action.original.width, action.original.x + point.x - action.startX))
+      const y = Math.max(0, Math.min(dimensions.height - action.original.height, action.original.y + point.y - action.startY))
+      setBoxState(boxesRef.current.map((box) => box.id === action.id ? { ...box, x, y } : box))
+      return
+    }
+    const original = action.original
+    const left = action.handle.includes('w') ? point.x : original.x
+    const right = action.handle.includes('e') ? point.x : original.x + original.width
+    const top = action.handle.includes('n') ? point.y : original.y
+    const bottom = action.handle.includes('s') ? point.y : original.y + original.height
+    setBoxState(boxesRef.current.map((box) => box.id === action.id ? {
+      ...box,
+      x: Math.min(left, right),
+      y: Math.min(top, bottom),
+      width: Math.abs(right - left),
+      height: Math.abs(bottom - top),
+    } : box))
+  }
+
+  const endPointer = (event: React.PointerEvent<SVGSVGElement>) => {
+    const action = actionRef.current
+    if (!action) return
+    actionRef.current = undefined
+    if (svgRef.current?.hasPointerCapture(event.pointerId)) svgRef.current.releasePointerCapture(event.pointerId)
+    const next = boxesRef.current.filter((box) => box.width >= 2 && box.height >= 2)
+    const changed = JSON.stringify(next) !== JSON.stringify(action.before)
+    if (!changed) {
+      setBoxState(action.before)
+      return
+    }
+    markChanged(next)
+    void persist()
+  }
+
+  const deleteSelected = () => {
+    if (!editable || !selectedBoxId) return
+    const next = boxesRef.current.filter((box) => box.id !== selectedBoxId)
+    setSelectedBoxId(undefined)
+    markChanged(next)
+    void persist()
+  }
+
+  const changeSelectedCategory = (categoryId: number) => {
+    setSelectedCategoryId(categoryId)
+    if (!editable || !selectedBoxId) return
+    const next = boxesRef.current.map((box) => box.id === selectedBoxId ? { ...box, category_id: categoryId } : box)
+    markChanged(next)
+    void persist()
+  }
+
+  const saveCategories = async (categories: AnnotationCategory[]) => {
+    if (!dataset) return
+    try {
+      const result = await api<{ categories: AnnotationCategory[] }>(`/api/datasets/${dataset.id}/annotation-schema`, {
+        method: 'PUT',
+        body: JSON.stringify({ categories }),
+      })
+      setSession((current) => current ? { ...current, categories: result.categories } : current)
+      if (!result.categories.some((category) => category.id === selectedCategoryId)) setSelectedCategoryId(result.categories[0].id)
+      setNewCategoryName('')
+    } catch (error) { message.error((error as Error).message) }
+  }
+
+  const addCategory = () => {
+    if (!session || !newCategoryName.trim()) return
+    const id = Math.max(0, ...session.categories.map((category) => category.id)) + 1
+    void saveCategories([...session.categories, {
+      id,
+      name: newCategoryName.trim(),
+      color: annotationColors[(id - 1) % annotationColors.length],
+    }])
+  }
+
+  const markCompleteAndNext = async () => {
+    if (!await persist(true)) return
+    if (session && sampleIndex < session.samples.length - 1) setSampleIndex(sampleIndex + 1)
+  }
+
+  const submitAnnotations = async () => {
+    if (!dataset || !await persist()) return
+    try {
+      const result = await post<{ images: number; annotations: number }>(`/api/datasets/${dataset.id}/annotations/complete`)
+      message.success(`已导出 COCO：${result.images} 张图片，${result.annotations} 个目标框`)
+      await loadSession(dataset.id)
+      onChanged()
+    } catch (error) { message.error((error as Error).message) }
+  }
+
+  const keyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const tag = (event.target as HTMLElement).tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+      event.preventDefault()
+      void persist()
+    } else if (event.key === 'Delete' || event.key === 'Backspace') {
+      event.preventDefault()
+      deleteSelected()
+    } else if (event.key.toLowerCase() === 'a') {
+      void goToSample(sampleIndex - 1)
+    } else if (event.key.toLowerCase() === 'd') {
+      void goToSample(sampleIndex + 1)
+    }
+  }
+
+  const handleSize = Math.max(6, Math.min(dimensions.width || 1000, dimensions.height || 1000) / 90)
+  return (
+    <Drawer
+      open={Boolean(dataset)}
+      width="100vw"
+      title={dataset ? `${editable ? '目标检测标注' : '只读标注'} · ${dataset.name}` : '目标检测标注'}
+      onClose={onClose}
+      destroyOnClose
+      extra={session && <Space><Tag color="blue">{session.progress.completed} / {session.progress.total} 已完成</Tag>{saving ? <Tag color="processing">保存中</Tag> : savedAt && <Tag color="success">已保存 {savedAt}</Tag>}</Space>}
+    >
+      {!session ? <div className="annotation-loading"><Spin /><Typography.Text type="secondary">正在加载标注工作区…</Typography.Text></div> : (
+        <div className="annotation-workspace" tabIndex={0} onKeyDown={keyDown}>
+          <aside className="annotation-samples">
+            <div className="annotation-panel-heading"><strong>图片</strong><Progress percent={session.progress.total ? Math.round(session.progress.completed / session.progress.total * 100) : 0} size="small" /></div>
+            <div className="annotation-sample-list">
+              {session.samples.map((sample, index) => (
+                <button key={sample.name} type="button" className={`annotation-sample ${index === sampleIndex ? 'active' : ''}`} onClick={() => void goToSample(index)}>
+                  <img src={sample.url} alt="" loading="lazy" />
+                  <span><b>{index + 1}. {sample.name}</b><small>{sample.completed ? '已完成' : '待确认'} · {sample.box_count} 框</small></span>
+                  <i className={sample.completed ? 'done' : ''} />
+                </button>
+              ))}
+            </div>
+          </aside>
+          <main className="annotation-main">
+            <div className="annotation-toolbar">
+              <Space>
+                <Button icon={<LeftOutlined />} disabled={sampleIndex === 0} onClick={() => void goToSample(sampleIndex - 1)}>上一张</Button>
+                <Button icon={<RightOutlined />} disabled={sampleIndex >= session.samples.length - 1} onClick={() => void goToSample(sampleIndex + 1)}>下一张</Button>
+                <Typography.Text type="secondary">{currentSample?.name}</Typography.Text>
+              </Space>
+              <Space>
+                <Typography.Text type="secondary">滚轮缩放</Typography.Text>
+                <Slider min={0.5} max={4} step={0.1} value={zoom} onChange={setZoom} style={{ width: 130 }} />
+                <Tag>{Math.round(zoom * 100)}%</Tag>
+                {editable && <Button icon={<SaveOutlined />} loading={saving} onClick={() => void persist()}>保存</Button>}
+              </Space>
+            </div>
+            <div className="annotation-canvas-scroll" onWheel={(event) => { event.preventDefault(); setZoom((value) => Math.max(0.5, Math.min(4, value + (event.deltaY < 0 ? 0.1 : -0.1)))) }}>
+              {loading || !dimensions.width ? <Spin /> : (
+                <svg
+                  ref={svgRef}
+                  className="annotation-canvas"
+                  viewBox={`0 0 ${dimensions.width} ${dimensions.height}`}
+                  style={{ width: `${zoom * 100}%`, height: 'auto', aspectRatio: `${dimensions.width} / ${dimensions.height}` }}
+                  onPointerDown={beginDraw}
+                  onPointerMove={movePointer}
+                  onPointerUp={endPointer}
+                >
+                  <image href={currentSample?.url} width={dimensions.width} height={dimensions.height} pointerEvents="none" />
+                  {boxes.map((box) => {
+                    const category = session.categories.find((item) => item.id === box.category_id)
+                    const selected = box.id === selectedBoxId
+                    return <g key={box.id}>
+                      <rect x={box.x} y={box.y} width={box.width} height={box.height} fill={`${category?.color || '#1677FF'}20`} stroke={category?.color || '#1677FF'} strokeWidth={selected ? 4 : 2} vectorEffect="non-scaling-stroke" onPointerDown={(event) => beginMove(event, box)} />
+                      <text x={box.x + 3} y={Math.max(14, box.y + 15)} fill="#fff" stroke="#000" strokeWidth={3} paintOrder="stroke" fontSize={14} pointerEvents="none">{category?.name || box.category_id}</text>
+                      {selected && editable && (['nw', 'ne', 'sw', 'se'] as const).map((handle) => {
+                        const x = handle.includes('w') ? box.x : box.x + box.width
+                        const y = handle.includes('n') ? box.y : box.y + box.height
+                        return <rect key={handle} x={x - handleSize / 2} y={y - handleSize / 2} width={handleSize} height={handleSize} fill="#fff" stroke={category?.color || '#1677FF'} strokeWidth={2} vectorEffect="non-scaling-stroke" onPointerDown={(event) => beginResize(event, box, handle)} />
+                      })}
+                    </g>
+                  })}
+                </svg>
+              )}
+              {currentSample && <img className="annotation-image-probe" src={currentSample.url} alt="" onLoad={(event) => {
+                if (!dimensionsRef.current.width) {
+                  dimensionsRef.current = { width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight }
+                  setDimensions(dimensionsRef.current)
+                }
+              }} />}
+            </div>
+            <div className="annotation-footer">
+              <Typography.Text type="secondary">在图片上拖拽创建框；拖动框可移动，拖动四角可缩放。快捷键：A/D 切图，Delete 删除，Ctrl+S 保存。</Typography.Text>
+              {editable && <Space><Checkbox checked={completed} onChange={(event) => { completedRef.current = event.target.checked; setCompleted(event.target.checked); dirtyRef.current = true; void persist() }}>本图已确认（允许零目标）</Checkbox><Button type="primary" onClick={() => void markCompleteAndNext()}>完成并下一张</Button></Space>}
+            </div>
+          </main>
+          <aside className="annotation-categories">
+            <div className="annotation-panel-heading"><strong>目标类别</strong>{selectedBox && editable && <Button danger type="text" size="small" icon={<DeleteOutlined />} onClick={deleteSelected}>删除框</Button>}</div>
+            <div className="annotation-category-list">
+              {session.categories.map((category) => (
+                <div key={category.id} className={`annotation-category ${selectedCategoryId === category.id ? 'active' : ''}`} onClick={() => changeSelectedCategory(category.id)}>
+                  <span className="annotation-color" style={{ background: category.color }} />
+                  <b>{category.name}</b>
+                  <small>{boxes.filter((box) => box.category_id === category.id).length}</small>
+                  {editable && session.categories.length > 1 && <Popconfirm title="删除这个类别？" description="已被任意目标框使用的类别不能删除。" onConfirm={() => void saveCategories(session.categories.filter((item) => item.id !== category.id))}><Button danger type="text" size="small" icon={<DeleteOutlined />} onClick={(event) => event.stopPropagation()} /></Popconfirm>}
+                </div>
+              ))}
+            </div>
+            {editable && <Space.Compact block className="annotation-category-add"><Input value={newCategoryName} maxLength={64} placeholder="新增类别名称" onChange={(event) => setNewCategoryName(event.target.value)} onPressEnter={addCategory} /><Button icon={<PlusOutlined />} onClick={addCategory} /></Space.Compact>}
+            <Divider />
+            <Alert type={editable ? 'info' : 'warning'} showIcon message={editable ? '标注规则' : '数据集已冻结'} description={editable ? '每张图片都需要确认；无目标图片也需勾选“本图已确认”。修改已完成图片会自动恢复为待确认。' : '当前只允许查看目标框，不能修改类别或标注。'} />
+            {editable && <Button block type="primary" className="top-gap" disabled={!session.progress.total || session.progress.completed !== session.progress.total} onClick={() => void submitAnnotations()}>完成标注并导出 COCO</Button>}
+            {editable && session.progress.completed !== session.progress.total && <Typography.Paragraph type="secondary" style={{ marginTop: 10 }}>还有 {session.progress.total - session.progress.completed} 张图片未确认，完成后才能提交。</Typography.Paragraph>}
+          </aside>
+        </div>
+      )}
+    </Drawer>
+  )
+}
+
 export function DatasetsPage(_: PageProps) {
   const { data, loading, reload } = useResource<Dataset[]>('/api/datasets', [])
   const [selected, setSelected] = useState<Dataset>()
   const [browserDataset, setBrowserDataset] = useState<Dataset>()
+  const [annotationDataset, setAnnotationDataset] = useState<Dataset>()
   const freeze = async (dataset: Dataset) => {
     try { await post(`/api/datasets/${dataset.id}/freeze`); message.success('数据版本已冻结'); reload() } catch (error) { message.error((error as Error).message) }
   }
@@ -491,6 +910,7 @@ export function DatasetsPage(_: PageProps) {
       await api(`/api/datasets/${dataset.id}`, { method: 'DELETE' })
       if (selected?.id === dataset.id) setSelected(undefined)
       if (browserDataset?.id === dataset.id) setBrowserDataset(undefined)
+      if (annotationDataset?.id === dataset.id) setAnnotationDataset(undefined)
       message.success('数据集已移入回收站')
       reload()
     } catch (error) { message.error((error as Error).message) }
@@ -502,8 +922,8 @@ export function DatasetsPage(_: PageProps) {
     { title: '分辨率', dataIndex: 'resolution' }, { title: '样本', dataIndex: 'sample_count' },
     { title: '真值', dataIndex: 'annotation_status', render: (value) => <StatusTag status={value} /> },
     { title: '版本', render: (_, row) => row.frozen ? <Tag icon={<LockOutlined />} color="success">{row.version} 已冻结</Tag> : <Tag>草稿</Tag> },
-    { title: '操作', render: (_, row) => <Space><Button type="link" onClick={() => setSelected(row)}>查看</Button><Button type="link" icon={<FileImageOutlined />} onClick={() => setBrowserDataset(row)}>浏览全部</Button>{!row.frozen && <Button type="link" onClick={() => freeze(row)}>冻结</Button>}{!row.frozen && <Popconfirm title="确认删除这个数据集？" description={`${row.name} · ${row.sample_count} 个样本将移入回收站。`} okText="移入回收站" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => remove(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm>}</Space> },
-  ]} /></Card><Drawer open={Boolean(selected)} width={760} title={selected?.name} onClose={() => setSelected(undefined)}>{selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Gallery images={selected.preview_images} height={140} /><Button block icon={<FileImageOutlined />} onClick={() => { setSelected(undefined); setBrowserDataset(selected) }}>浏览全部图片</Button><Descriptions bordered column={2} items={[{ key: 'source', label: '来源', children: selected.source_type }, { key: 'scene', label: '场景', children: selected.scene_domain }, { key: 'weather', label: '天气', children: selected.weather }, { key: 'resolution', label: '分辨率', children: selected.resolution }, { key: 'truth', label: '真值', children: <StatusTag status={selected.annotation_status} /> }, { key: 'frozen', label: '不可变', children: selected.frozen ? '是' : '否' }]} /><Alert type="info" showIcon message="数据谱系" description="所有样本均记录来源、条件、seed、Adapter 版本和文件摘要。流程样例不会被标记为正式生成数据。" /></Space>}</Drawer><DatasetBrowser dataset={browserDataset} onClose={() => setBrowserDataset(undefined)} /></>
+    { title: '操作', render: (_, row) => <Space><Button type="link" onClick={() => setSelected(row)}>查看</Button><Button type="link" icon={<FileImageOutlined />} onClick={() => setBrowserDataset(row)}>浏览全部</Button><Button type="link" onClick={() => setAnnotationDataset(row)}>{row.frozen ? '查看标注' : '目标标注'}</Button>{!row.frozen && <Button type="link" onClick={() => freeze(row)}>冻结</Button>}{!row.frozen && <Popconfirm title="确认删除这个数据集？" description={`${row.name} · ${row.sample_count} 个样本将移入回收站。`} okText="移入回收站" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => remove(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm>}</Space> },
+  ]} /></Card><Drawer open={Boolean(selected)} width={760} title={selected?.name} onClose={() => setSelected(undefined)}>{selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Gallery images={selected.preview_images} height={140} /><Button block icon={<FileImageOutlined />} onClick={() => { setSelected(undefined); setBrowserDataset(selected) }}>浏览全部图片</Button><Button block onClick={() => { setSelected(undefined); setAnnotationDataset(selected) }}>{selected.frozen ? '查看目标检测标注' : '开始目标检测标注'}</Button><Descriptions bordered column={2} items={[{ key: 'source', label: '来源', children: selected.source_type }, { key: 'scene', label: '场景', children: selected.scene_domain }, { key: 'weather', label: '天气', children: selected.weather }, { key: 'resolution', label: '分辨率', children: selected.resolution }, { key: 'truth', label: '真值', children: <StatusTag status={selected.annotation_status} /> }, { key: 'frozen', label: '不可变', children: selected.frozen ? '是' : '否' }]} /><Alert type="info" showIcon message="数据谱系" description="所有样本均记录来源、条件、seed、Adapter 版本和文件摘要。流程样例不会被标记为正式生成数据。" /></Space>}</Drawer><DatasetBrowser dataset={browserDataset} onClose={() => setBrowserDataset(undefined)} /><AnnotationWorkspace dataset={annotationDataset} onClose={() => setAnnotationDataset(undefined)} onChanged={reload} /></>
 }
 
 export function RegistryPage(_: PageProps) {

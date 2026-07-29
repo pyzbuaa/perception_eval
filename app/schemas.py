@@ -25,6 +25,32 @@ class DatasetImportRequest(BaseModel):
     scene_domain: str = "未分类"
 
 
+class AnnotationCategory(BaseModel):
+    id: int = Field(ge=1)
+    name: str = Field(min_length=1, max_length=64)
+    color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+
+
+class AnnotationSchemaUpdate(BaseModel):
+    categories: list[AnnotationCategory] = Field(min_length=1, max_length=100)
+
+
+class DetectionBox(BaseModel):
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    category_id: int = Field(ge=1)
+    x: float = Field(ge=0)
+    y: float = Field(ge=0)
+    width: float = Field(gt=0)
+    height: float = Field(gt=0)
+
+
+class SampleAnnotationUpdate(BaseModel):
+    width: int = Field(ge=1, le=100000)
+    height: int = Field(ge=1, le=100000)
+    boxes: list[DetectionBox] = Field(default_factory=list, max_length=5000)
+    completed: bool = False
+
+
 class ModelCreateRequest(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     family: str

@@ -169,6 +169,45 @@ curl http://127.0.0.1:18080/api/runs/<job-id>
 `PERCEPTION_EVAL_ADAPTER_TIMEOUT_SECONDS` 调整。如果 Adapter 需要新增依赖，应先克隆到
 `.runtime/envs/adapters/<adapter-version>`，不得修改原环境。
 
+## 目标检测标注
+
+未冻结的数据集可以在“数据集”页面点击“目标标注”，进入全屏人工标注工作区：
+
+1. 在右侧选择目标类别；默认提供 `car`、`truck`、`bus`、`pedestrian`、`bicycle`
+   和 `motorcycle`，也可以新增类别。
+2. 在图片上拖拽创建矩形框；拖动矩形框可移动，拖动四角可改变大小，鼠标滚轮可缩放
+   图片。
+3. 每张图片完成后点击“完成并下一张”。没有目标的图片也需要勾选“本图已确认”。
+4. 所有图片确认后，点击“完成标注并导出 COCO”。
+5. 数据集进入 `CANDIDATE` 后可以校核并冻结；冻结后标注和类别均为只读。
+
+创建、移动、缩放、删除目标框以及改变类别后都会自动保存。快捷键包括：
+
+```text
+A / D       上一张 / 下一张
+Delete      删除选中的目标框
+Ctrl+S      立即保存
+```
+
+标注编辑状态保存在 SQLite，提交后同时导出标准 COCO 检测标注：
+
+```text
+data/artifacts/<dataset-artifact>/annotations/instances.json
+```
+
+对应 API 为：
+
+```text
+GET  /api/datasets/<dataset-id>/annotations
+PUT  /api/datasets/<dataset-id>/annotation-schema
+GET  /api/datasets/<dataset-id>/samples/<sample-name>/annotations
+PUT  /api/datasets/<dataset-id>/samples/<sample-name>/annotations
+POST /api/datasets/<dataset-id>/annotations/complete
+```
+
+标注状态按 `UNLABELED → ANNOTATING → CANDIDATE → VERIFIED/FROZEN` 流转。修改一张已经
+确认的图片时，该图片会自动恢复为待确认，防止修改后未经复核就提交。
+
 ## 浏览数据集图片
 
 数据集列表和详情中的 6 张图片是快速预览。点击“浏览全部”会打开滚轮浏览抽屉，并在接近

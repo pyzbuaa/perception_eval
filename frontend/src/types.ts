@@ -45,6 +45,43 @@ export interface DatasetSamplePage {
   items: Array<{ name: string; url: string }>
 }
 
+export interface AnnotationCategory {
+  id: number
+  name: string
+  color: string
+}
+
+export interface DetectionBox {
+  id: string
+  category_id: number
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface AnnotationSession {
+  dataset: Dataset
+  categories: AnnotationCategory[]
+  progress: { completed: number; total: number }
+  samples: Array<{
+    name: string
+    url: string
+    completed: boolean
+    box_count: number
+  }>
+}
+
+export interface SampleAnnotation {
+  dataset_id: string
+  sample_name: string
+  width: number
+  height: number
+  boxes: DetectionBox[]
+  completed: boolean
+  updated_at?: string
+}
+
 export interface ModelVersion {
   id: string
   name: string

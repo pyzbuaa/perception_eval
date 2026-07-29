@@ -468,6 +468,21 @@ CREATE TABLE IF NOT EXISTS datasets (
     artifact_path TEXT,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS dataset_annotation_schemas (
+    dataset_id TEXT PRIMARY KEY REFERENCES datasets(id) ON DELETE CASCADE,
+    categories TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sample_annotations (
+    dataset_id TEXT NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+    sample_name TEXT NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    boxes TEXT NOT NULL DEFAULT '[]',
+    completed INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (dataset_id, sample_name)
+);
 CREATE TABLE IF NOT EXISTS models (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -540,6 +555,8 @@ CREATE TABLE IF NOT EXISTS results (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_sample_annotations_progress
+ON sample_annotations(dataset_id, completed);
 CREATE INDEX IF NOT EXISTS idx_runs_dataset_model ON runs(dataset_id, model_id);
 CREATE INDEX IF NOT EXISTS idx_results_map ON results(map DESC);
 """

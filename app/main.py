@@ -18,19 +18,25 @@ from app.db import db, json_dump, new_id, utc_now
 from app.schemas import (
     AcquisitionRequest,
     AdapterRegistrationRequest,
+    AnnotationSchemaUpdate,
     DatasetImportRequest,
     EvaluationPlanRequest,
     ModelCreateRequest,
+    SampleAnnotationUpdate,
 )
 from app.services import (
     BaseGenCatalogError,
+    DatasetAnnotationError,
     DatasetArtifactError,
     DatasetDeletionError,
     adapter_health,
+    complete_dataset_annotations,
     delete_dataset,
     environment_status,
+    get_annotation_session,
     get_basegen_scene_schema,
     get_job,
+    get_sample_annotation,
     list_adapters,
     list_dataset_samples,
     list_datasets,
@@ -40,6 +46,8 @@ from app.services import (
     preview_basegen_plan,
     query_results,
     queue_job,
+    save_sample_annotation,
+    update_annotation_schema,
 )
 from app.worker import JobAgent
 
@@ -145,6 +153,75 @@ def get_dataset_samples(
     try:
         result = list_dataset_samples(dataset_id, offset, limit)
     except DatasetArtifactError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    return result
+
+
+@app.get("/api/datasets/{dataset_id}/annotations")
+def get_annotations(dataset_id: str) -> dict[str, Any]:
+    try:
+        result = get_annotation_session(dataset_id)
+    except DatasetArtifactError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    return result
+
+
+@app.put("/api/datasets/{dataset_id}/annotation-schema")
+def put_annotation_schema(
+    dataset_id: str,
+    request: AnnotationSchemaUpdate,
+) -> dict[str, Any]:
+    try:
+        result = update_annotation_schema(
+            dataset_id,
+            [category.model_dump() for category in request.categories],
+        )
+    except DatasetAnnotationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    return result
+
+
+@app.get("/api/datasets/{dataset_id}/samples/{sample_name}/annotations")
+def get_image_annotations(dataset_id: str, sample_name: str) -> dict[str, Any]:
+    try:
+        result = get_sample_annotation(dataset_id, sample_name)
+    except DatasetArtifactError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="数据集或图片不存在")
+    return result
+
+
+@app.put("/api/datasets/{dataset_id}/samples/{sample_name}/annotations")
+def put_image_annotations(
+    dataset_id: str,
+    sample_name: str,
+    request: SampleAnnotationUpdate,
+) -> dict[str, Any]:
+    try:
+        result = save_sample_annotation(
+            dataset_id,
+            sample_name,
+            request.model_dump(),
+        )
+    except (DatasetAnnotationError, DatasetArtifactError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="数据集或图片不存在")
+    return result
+
+
+@app.post("/api/datasets/{dataset_id}/annotations/complete")
+def complete_annotations(dataset_id: str) -> dict[str, Any]:
+    try:
+        result = complete_dataset_annotations(dataset_id)
+    except (DatasetAnnotationError, DatasetArtifactError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not result:
         raise HTTPException(status_code=404, detail="数据集不存在")

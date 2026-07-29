@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -10,13 +11,19 @@ from adapters.basegen_generator import prepare_plan
 from app.config import ROOT_DIR, Settings
 from app.db import Database, json_dump, utc_now
 from app.services import (
+    DatasetAnnotationError,
     DatasetDeletionError,
+    complete_dataset_annotations,
     delete_dataset,
+    get_annotation_session,
     get_basegen_scene_schema,
+    get_sample_annotation,
     list_dataset_samples,
     preview_basegen_plan,
     query_results,
     queue_job,
+    save_sample_annotation,
+    update_annotation_schema,
 )
 from app.worker import JobAgent
 
@@ -397,6 +404,129 @@ def test_dataset_samples_are_paginated_from_artifact_directory(
         "/imports/browse-test/sample-1.jpg"
     )
     assert list_dataset_samples("missing", 0, 48, database) is None
+
+
+def test_detection_annotations_persist_and_export_coco(tmp_path: Path) -> None:
+    database, app_settings = make_database(tmp_path)
+    artifact_directory = app_settings.artifact_dir / "imports" / "annotation-test"
+    artifact_directory.mkdir(parents=True)
+    for name in ("first.png", "second.png"):
+        Image.new("RGB", (64, 40), (38, 120, 180)).save(
+            artifact_directory / name
+        )
+    database.execute(
+        """
+        INSERT INTO datasets
+        (id,name,version,source_type,scene_domain,weather,sensor_conditions,resolution,
+         sample_count,annotation_status,frozen,artifact_path,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "dataset_annotation_test",
+            "目标检测标注数据集",
+            "v1",
+            "GENERATIVE",
+            "低空无人机",
+            "随机",
+            "{}",
+            "64×40",
+            2,
+            "UNLABELED",
+            0,
+            "imports/annotation-test",
+            utc_now(),
+        ),
+    )
+    session = get_annotation_session("dataset_annotation_test", database)
+    assert session
+    assert session["progress"] == {"completed": 0, "total": 2}
+    assert len(session["categories"]) == 6
+
+    categories = [
+        {"id": 1, "name": "vehicle", "color": "#1677FF"},
+        {"id": 2, "name": "person", "color": "#EB2F96"},
+    ]
+    update_annotation_schema("dataset_annotation_test", categories, database)
+    first = save_sample_annotation(
+        "dataset_annotation_test",
+        "first.png",
+        {
+            "width": 64,
+            "height": 40,
+            "boxes": [
+                {
+                    "id": "box_1",
+                    "category_id": 1,
+                    "x": 10,
+                    "y": 5,
+                    "width": 20,
+                    "height": 15,
+                }
+            ],
+            "completed": True,
+        },
+        database,
+    )
+    assert first and first["completed"]
+    assert get_sample_annotation(
+        "dataset_annotation_test", "first.png", database
+    )["boxes"][0]["category_id"] == 1
+    assert database.row(
+        "SELECT annotation_status FROM datasets WHERE id='dataset_annotation_test'"
+    )["annotation_status"] == "ANNOTATING"
+
+    with pytest.raises(DatasetAnnotationError, match="已被目标框使用"):
+        update_annotation_schema(
+            "dataset_annotation_test",
+            [categories[1]],
+            database,
+        )
+    with pytest.raises(DatasetAnnotationError, match="1 张"):
+        complete_dataset_annotations("dataset_annotation_test", database)
+
+    save_sample_annotation(
+        "dataset_annotation_test",
+        "second.png",
+        {
+            "width": 64,
+            "height": 40,
+            "boxes": [],
+            "completed": True,
+        },
+        database,
+    )
+    result = complete_dataset_annotations("dataset_annotation_test", database)
+    assert result
+    assert result["images"] == 2
+    assert result["annotations"] == 1
+    coco = json.loads(
+        (artifact_directory / "annotations" / "instances.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [image["file_name"] for image in coco["images"]] == [
+        "first.png",
+        "second.png",
+    ]
+    assert coco["annotations"][0]["bbox"] == [10, 5, 20, 15]
+    assert coco["categories"] == [
+        {"id": 1, "name": "vehicle"},
+        {"id": 2, "name": "person"},
+    ]
+    assert database.row(
+        "SELECT annotation_status FROM datasets WHERE id='dataset_annotation_test'"
+    )["annotation_status"] == "CANDIDATE"
+
+    database.execute(
+        "UPDATE datasets SET frozen=1 WHERE id='dataset_annotation_test'"
+    )
+    with pytest.raises(DatasetAnnotationError, match="冻结"):
+        save_sample_annotation(
+            "dataset_annotation_test",
+            "second.png",
+            {"width": 64, "height": 40, "boxes": [], "completed": True},
+            database,
+        )
 
 
 def test_delete_dataset_rejects_frozen_and_run_referenced_data(tmp_path: Path) -> None:

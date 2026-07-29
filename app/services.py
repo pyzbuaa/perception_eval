@@ -41,6 +41,15 @@ BASEGEN_FIELD_LABELS = {
     "custom": "自定义描述",
 }
 
+DEFAULT_ANNOTATION_CATEGORIES = [
+    {"id": 1, "name": "car", "color": "#1677FF"},
+    {"id": 2, "name": "truck", "color": "#13A8A8"},
+    {"id": 3, "name": "bus", "color": "#722ED1"},
+    {"id": 4, "name": "pedestrian", "color": "#EB2F96"},
+    {"id": 5, "name": "bicycle", "color": "#52C41A"},
+    {"id": 6, "name": "motorcycle", "color": "#FA8C16"},
+]
+
 
 def decode_row(row: dict[str, Any]) -> dict[str, Any]:
     output = dict(row)
@@ -86,6 +95,10 @@ class DatasetArtifactError(ValueError):
 
 
 class BaseGenCatalogError(ValueError):
+    pass
+
+
+class DatasetAnnotationError(ValueError):
     pass
 
 
@@ -217,6 +230,312 @@ def list_dataset_samples(
     }
 
 
+def _dataset_images(
+    dataset_id: str,
+    database: Database,
+) -> tuple[dict[str, Any], Path | None, list[Path]] | None:
+    dataset = database.row("SELECT * FROM datasets WHERE id=?", (dataset_id,))
+    if not dataset:
+        return None
+    artifact_path = dataset.get("artifact_path")
+    if not artifact_path:
+        return dataset, None, []
+    artifact_root = database.settings.artifact_dir.resolve()
+    directory = (artifact_root / artifact_path).resolve()
+    if directory == artifact_root or not directory.is_relative_to(artifact_root):
+        raise DatasetArtifactError("数据集 Artifact 路径超出受控目录")
+    files = []
+    if directory.is_dir():
+        files = [
+            path
+            for path in sorted(directory.iterdir())
+            if path.is_file()
+            and path.suffix.lower() in {".svg", ".png", ".jpg", ".jpeg", ".webp"}
+        ]
+    return dataset, directory, files
+
+
+def _annotation_categories(
+    dataset_id: str,
+    database: Database,
+) -> list[dict[str, Any]]:
+    row = database.row(
+        "SELECT categories FROM dataset_annotation_schemas WHERE dataset_id=?",
+        (dataset_id,),
+    )
+    return json_load(row["categories"]) if row else [
+        dict(category) for category in DEFAULT_ANNOTATION_CATEGORIES
+    ]
+
+
+def get_annotation_session(
+    dataset_id: str,
+    database: Database = db,
+) -> dict[str, Any] | None:
+    resolved = _dataset_images(dataset_id, database)
+    if not resolved:
+        return None
+    dataset, _, files = resolved
+    rows = {
+        row["sample_name"]: row
+        for row in database.rows(
+            """
+            SELECT sample_name,completed,boxes,updated_at
+            FROM sample_annotations WHERE dataset_id=?
+            """,
+            (dataset_id,),
+        )
+    }
+    completed = sum(
+        bool(rows[path.name]["completed"])
+        for path in files
+        if path.name in rows
+    )
+    artifact_root = database.settings.artifact_dir.resolve()
+    return {
+        "dataset": decode_row(dataset),
+        "categories": _annotation_categories(dataset_id, database),
+        "progress": {"completed": completed, "total": len(files)},
+        "samples": [
+            {
+                "name": path.name,
+                "url": (
+                    f"/artifacts/{quote(path.resolve().relative_to(artifact_root).as_posix(), safe='/')}"
+                ),
+                "completed": bool(rows.get(path.name, {}).get("completed")),
+                "box_count": len(json_load(rows.get(path.name, {}).get("boxes"), [])),
+            }
+            for path in files
+        ],
+    }
+
+
+def get_sample_annotation(
+    dataset_id: str,
+    sample_name: str,
+    database: Database = db,
+) -> dict[str, Any] | None:
+    resolved = _dataset_images(dataset_id, database)
+    if not resolved:
+        return None
+    _, _, files = resolved
+    if sample_name not in {path.name for path in files}:
+        return None
+    row = database.row(
+        """
+        SELECT width,height,boxes,completed,updated_at
+        FROM sample_annotations WHERE dataset_id=? AND sample_name=?
+        """,
+        (dataset_id, sample_name),
+    )
+    return {
+        "dataset_id": dataset_id,
+        "sample_name": sample_name,
+        "width": row["width"] if row else 0,
+        "height": row["height"] if row else 0,
+        "boxes": json_load(row["boxes"], []) if row else [],
+        "completed": bool(row["completed"]) if row else False,
+        "updated_at": row["updated_at"] if row else None,
+    }
+
+
+def update_annotation_schema(
+    dataset_id: str,
+    categories: list[dict[str, Any]],
+    database: Database = db,
+) -> dict[str, Any] | None:
+    dataset = database.row("SELECT * FROM datasets WHERE id=?", (dataset_id,))
+    if not dataset:
+        return None
+    if dataset["frozen"]:
+        raise DatasetAnnotationError("冻结数据集的标注类别不可修改")
+    normalized = [
+        {
+            "id": int(category["id"]),
+            "name": str(category["name"]).strip(),
+            "color": str(category["color"]).upper(),
+        }
+        for category in categories
+    ]
+    ids = [category["id"] for category in normalized]
+    names = [category["name"].casefold() for category in normalized]
+    if any(not category["name"] for category in normalized):
+        raise DatasetAnnotationError("类别名称不能为空")
+    if len(ids) != len(set(ids)) or len(names) != len(set(names)):
+        raise DatasetAnnotationError("类别 ID 和名称必须唯一")
+    used_ids = {
+        int(box["category_id"])
+        for row in database.rows(
+            "SELECT boxes FROM sample_annotations WHERE dataset_id=?",
+            (dataset_id,),
+        )
+        for box in json_load(row["boxes"], [])
+    }
+    missing = used_ids - set(ids)
+    if missing:
+        raise DatasetAnnotationError("不能删除已被目标框使用的类别")
+    database.execute(
+        """
+        INSERT INTO dataset_annotation_schemas(dataset_id,categories,updated_at)
+        VALUES (?,?,?)
+        ON CONFLICT(dataset_id) DO UPDATE
+        SET categories=excluded.categories,updated_at=excluded.updated_at
+        """,
+        (dataset_id, json_dump(normalized), utc_now()),
+    )
+    return {"dataset_id": dataset_id, "categories": normalized}
+
+
+def save_sample_annotation(
+    dataset_id: str,
+    sample_name: str,
+    payload: dict[str, Any],
+    database: Database = db,
+) -> dict[str, Any] | None:
+    resolved = _dataset_images(dataset_id, database)
+    if not resolved:
+        return None
+    dataset, _, files = resolved
+    if dataset["frozen"]:
+        raise DatasetAnnotationError("冻结数据集的标注不可修改")
+    if sample_name not in {path.name for path in files}:
+        return None
+    width = int(payload["width"])
+    height = int(payload["height"])
+    boxes = payload.get("boxes", [])
+    categories = {
+        category["id"] for category in _annotation_categories(dataset_id, database)
+    }
+    box_ids = [box["id"] for box in boxes]
+    if len(box_ids) != len(set(box_ids)):
+        raise DatasetAnnotationError("同一图片中的目标框 ID 必须唯一")
+    for box in boxes:
+        if box["category_id"] not in categories:
+            raise DatasetAnnotationError(f"目标框引用了不存在的类别 {box['category_id']}")
+        if box["x"] + box["width"] > width or box["y"] + box["height"] > height:
+            raise DatasetAnnotationError("目标框超出图像边界")
+    now = utc_now()
+    with database.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO sample_annotations
+            (dataset_id,sample_name,width,height,boxes,completed,updated_at)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(dataset_id,sample_name) DO UPDATE SET
+              width=excluded.width,height=excluded.height,boxes=excluded.boxes,
+              completed=excluded.completed,updated_at=excluded.updated_at
+            """,
+            (
+                dataset_id,
+                sample_name,
+                width,
+                height,
+                json_dump(boxes),
+                int(bool(payload.get("completed"))),
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE datasets SET annotation_status='ANNOTATING'
+            WHERE id=? AND annotation_status!='ANNOTATING'
+            """,
+            (dataset_id,),
+        )
+    return get_sample_annotation(dataset_id, sample_name, database)
+
+
+def complete_dataset_annotations(
+    dataset_id: str,
+    database: Database = db,
+) -> dict[str, Any] | None:
+    resolved = _dataset_images(dataset_id, database)
+    if not resolved:
+        return None
+    dataset, directory, files = resolved
+    if dataset["frozen"]:
+        raise DatasetAnnotationError("冻结数据集不能重新提交标注")
+    if not directory or not files:
+        raise DatasetAnnotationError("数据集没有可标注的图片")
+    rows = {
+        row["sample_name"]: row
+        for row in database.rows(
+            """
+            SELECT sample_name,width,height,boxes,completed
+            FROM sample_annotations WHERE dataset_id=?
+            """,
+            (dataset_id,),
+        )
+    }
+    incomplete = [
+        path.name
+        for path in files
+        if path.name not in rows or not rows[path.name]["completed"]
+    ]
+    if incomplete:
+        raise DatasetAnnotationError(
+            f"还有 {len(incomplete)} 张图片未确认完成"
+        )
+    categories = _annotation_categories(dataset_id, database)
+    images = []
+    annotations = []
+    annotation_id = 1
+    for image_id, path in enumerate(files, start=1):
+        row = rows[path.name]
+        images.append(
+            {
+                "id": image_id,
+                "file_name": path.name,
+                "width": row["width"],
+                "height": row["height"],
+            }
+        )
+        for box in json_load(row["boxes"], []):
+            annotations.append(
+                {
+                    "id": annotation_id,
+                    "image_id": image_id,
+                    "category_id": box["category_id"],
+                    "bbox": [box["x"], box["y"], box["width"], box["height"]],
+                    "area": box["width"] * box["height"],
+                    "iscrowd": 0,
+                }
+            )
+            annotation_id += 1
+    coco = {
+        "info": {
+            "description": dataset["name"],
+            "version": dataset["version"],
+        },
+        "images": images,
+        "annotations": annotations,
+        "categories": [
+            {"id": category["id"], "name": category["name"]}
+            for category in categories
+        ],
+    }
+    annotation_directory = directory / "annotations"
+    annotation_directory.mkdir(parents=True, exist_ok=True)
+    output = annotation_directory / "instances.json"
+    temporary = annotation_directory / "instances.json.tmp"
+    temporary.write_text(
+        json.dumps(coco, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    database.execute(
+        "UPDATE datasets SET annotation_status='CANDIDATE' WHERE id=?",
+        (dataset_id,),
+    )
+    return {
+        "dataset_id": dataset_id,
+        "annotation_status": "CANDIDATE",
+        "images": len(images),
+        "annotations": len(annotations),
+        "path": output.relative_to(database.settings.artifact_dir).as_posix(),
+    }
+
+
 def delete_dataset(dataset_id: str, database: Database = db) -> dict[str, Any] | None:
     artifact_root = database.settings.artifact_dir.resolve()
     trash_directory = (
@@ -274,8 +593,32 @@ def delete_dataset(dataset_id: str, database: Database = db) -> dict[str, Any] |
                 raise DatasetDeletionError(f"回收站目标已存在: {trash_directory}")
             trash_directory.mkdir(parents=True)
             trash_created = True
+            manifest_payload = {
+                **dataset,
+                "annotation_schema": connection.execute(
+                    """
+                    SELECT categories,updated_at FROM dataset_annotation_schemas
+                    WHERE dataset_id=?
+                    """,
+                    (dataset_id,),
+                ).fetchone(),
+                "sample_annotations": [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT sample_name,width,height,boxes,completed,updated_at
+                        FROM sample_annotations WHERE dataset_id=?
+                        """,
+                        (dataset_id,),
+                    ).fetchall()
+                ],
+            }
+            if manifest_payload["annotation_schema"]:
+                manifest_payload["annotation_schema"] = dict(
+                    manifest_payload["annotation_schema"]
+                )
             manifest.write_text(
-                json.dumps(dataset, ensure_ascii=False, indent=2) + "\n",
+                json.dumps(manifest_payload, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
             if source and source.exists():
