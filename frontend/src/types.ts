@@ -34,6 +34,17 @@ export interface Dataset {
   created_at: string
 }
 
+export interface DatasetSamplePage {
+  dataset_id: string
+  dataset_name: string
+  declared_count: number
+  total: number
+  offset: number
+  limit: number
+  has_more: boolean
+  items: Array<{ name: string; url: string }>
+}
+
 export interface ModelVersion {
   id: string
   name: string
@@ -115,4 +126,3 @@ export interface EnvironmentStatus {
   }
   disk: { total: number; used: number; free: number }
 }
-

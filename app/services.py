@@ -10,6 +10,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from app.config import settings
 from app.db import Database, db, json_dump, json_load, new_id, utc_now
@@ -61,6 +62,143 @@ def list_datasets(database: Database = db) -> list[dict[str, Any]]:
                     if path.suffix.lower() in {".svg", ".png", ".jpg", ".jpeg", ".webp"}
                 ][:6]
         yield row
+
+
+class DatasetDeletionError(ValueError):
+    pass
+
+
+class DatasetArtifactError(ValueError):
+    pass
+
+
+def list_dataset_samples(
+    dataset_id: str,
+    offset: int,
+    limit: int,
+    database: Database = db,
+) -> dict[str, Any] | None:
+    dataset = database.row("SELECT * FROM datasets WHERE id=?", (dataset_id,))
+    if not dataset:
+        return None
+    artifact_path = dataset.get("artifact_path")
+    files: list[Path] = []
+    if artifact_path:
+        artifact_root = database.settings.artifact_dir.resolve()
+        directory = (artifact_root / artifact_path).resolve()
+        if directory == artifact_root or not directory.is_relative_to(artifact_root):
+            raise DatasetArtifactError("数据集 Artifact 路径超出受控目录")
+        if directory.is_dir():
+            files = [
+                path
+                for path in sorted(directory.iterdir())
+                if path.is_file()
+                and path.suffix.lower() in {".svg", ".png", ".jpg", ".jpeg", ".webp"}
+            ]
+    page = files[offset : offset + limit]
+    return {
+        "dataset_id": dataset_id,
+        "dataset_name": dataset["name"],
+        "declared_count": dataset["sample_count"],
+        "total": len(files),
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(page) < len(files),
+        "items": [
+            {
+                "name": path.name,
+                "url": f"/artifacts/{quote(path.resolve().relative_to(database.settings.artifact_dir.resolve()).as_posix(), safe='/')}",
+            }
+            for path in page
+        ],
+    }
+
+
+def delete_dataset(dataset_id: str, database: Database = db) -> dict[str, Any] | None:
+    artifact_root = database.settings.artifact_dir.resolve()
+    trash_directory = (
+        database.settings.data_dir / "trash" / "datasets" / dataset_id
+    ).resolve()
+    source: Path | None = None
+    trash_artifact = trash_directory / "artifact"
+    manifest = trash_directory / "dataset.json"
+    moved = False
+    trash_created = False
+    dataset: dict[str, Any] | None = None
+    try:
+        with database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM datasets WHERE id=?", (dataset_id,)
+            ).fetchone()
+            if not row:
+                return None
+            dataset = dict(row)
+            if dataset["frozen"]:
+                raise DatasetDeletionError("冻结数据集受保护，不能删除")
+            run_count = connection.execute(
+                "SELECT COUNT(*) FROM runs WHERE dataset_id=?", (dataset_id,)
+            ).fetchone()[0]
+            if run_count:
+                raise DatasetDeletionError(
+                    f"数据集已被 {run_count} 个评测运行引用，不能删除"
+                )
+            referenced_plans = [
+                plan["id"]
+                for plan in connection.execute(
+                    "SELECT id,dataset_ids FROM evaluation_plans"
+                ).fetchall()
+                if dataset_id in json_load(plan["dataset_ids"], [])
+            ]
+            if referenced_plans:
+                raise DatasetDeletionError(
+                    f"数据集已被评测方案 {referenced_plans[0]} 引用，不能删除"
+                )
+
+            artifact_path = dataset.get("artifact_path")
+            if artifact_path:
+                shared_count = connection.execute(
+                    "SELECT COUNT(*) FROM datasets WHERE artifact_path=?",
+                    (artifact_path,),
+                ).fetchone()[0]
+                if shared_count > 1:
+                    raise DatasetDeletionError("Artifact 目录被多个数据集共享，不能删除")
+                source = (artifact_root / artifact_path).resolve()
+                if source == artifact_root or not source.is_relative_to(artifact_root):
+                    raise DatasetDeletionError("数据集 Artifact 路径超出受控目录")
+
+            if trash_directory.exists():
+                raise DatasetDeletionError(f"回收站目标已存在: {trash_directory}")
+            trash_directory.mkdir(parents=True)
+            trash_created = True
+            manifest.write_text(
+                json.dumps(dataset, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            if source and source.exists():
+                shutil.move(str(source), str(trash_artifact))
+                moved = True
+            connection.execute("DELETE FROM datasets WHERE id=?", (dataset_id,))
+    except BaseException:
+        if moved and source and trash_artifact.exists() and not source.exists():
+            source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(trash_artifact), str(source))
+        if trash_created and manifest.exists():
+            manifest.unlink()
+        if trash_created and trash_directory.exists():
+            try:
+                trash_directory.rmdir()
+            except OSError:
+                pass
+        raise
+    assert dataset is not None
+    return {
+        "id": dataset_id,
+        "name": dataset["name"],
+        "deleted": True,
+        "artifact_moved": moved,
+        "trash_path": str(trash_directory),
+    }
 
 
 def list_models(database: Database = db) -> list[dict[str, Any]]:
@@ -288,13 +426,48 @@ def adapter_health(adapter_id: str, database: Database = db) -> dict[str, Any] |
     elif adapter["runtime_kind"] in {"conda_external", "conda_clone"}:
         prefix = Path(adapter.get("runtime_prefix") or "")
         history = prefix / "conda-meta" / "history"
+        entrypoint_value = adapter.get("entrypoint") or ""
+        entrypoint = Path(entrypoint_value)
+        if not entrypoint.is_absolute():
+            entrypoint = settings.root_dir / entrypoint
         checks.extend(
             [
                 {"name": "环境目录", "ok": prefix.is_dir(), "detail": str(prefix)},
                 {"name": "Python解释器", "ok": (prefix / "bin" / "python").is_file(), "detail": str(prefix / "bin/python")},
+                {"name": "入口脚本", "ok": entrypoint.is_file(), "detail": str(entrypoint)},
                 {"name": "只读策略", "ok": adapter["policy"] == "read_only", "detail": adapter["policy"]},
             ]
         )
+        if adapter["id"] == "adapter_basegen":
+            checks.append(
+                {
+                    "name": "BaseGen项目",
+                    "ok": (settings.basegen_root / "zimage_gen" / "runner.py").is_file(),
+                    "detail": str(settings.basegen_root),
+                }
+            )
+            try:
+                result = subprocess.run(
+                    [
+                        str(prefix / "bin" / "python"),
+                        "-c",
+                        "import torch,diffusers,transformers; print(torch.__version__,diffusers.__version__,transformers.__version__)",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                checks.append(
+                    {
+                        "name": "生成依赖",
+                        "ok": result.returncode == 0,
+                        "detail": (result.stdout or result.stderr).strip()[-300:],
+                    }
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                checks.append(
+                    {"name": "生成依赖", "ok": False, "detail": str(exc)}
+                )
         if history.exists():
             checks.append({"name": "环境指纹", "ok": True, "detail": file_sha256(history)[:16]})
     else:

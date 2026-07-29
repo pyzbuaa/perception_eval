@@ -12,6 +12,15 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 class Settings:
     root_dir: Path = ROOT_DIR
     data_dir: Path = Path(os.environ.get("PERCEPTION_EVAL_DATA_DIR", ROOT_DIR / "data"))
+    basegen_root: Path = Path(
+        os.environ.get("BASEGEN_ROOT", ROOT_DIR.parent / "BaseGen")
+    )
+    basegen_conda_prefix: Path = Path(
+        os.environ.get("BASEGEN_CONDA_PREFIX", "/home/yons/miniforge3/envs/gen")
+    )
+    adapter_timeout_seconds: int = int(
+        os.environ.get("PERCEPTION_EVAL_ADAPTER_TIMEOUT_SECONDS", "7200")
+    )
 
     @property
     def database_path(self) -> Path:
@@ -39,4 +48,3 @@ class Settings:
 
 
 settings = Settings()
-

@@ -23,10 +23,14 @@ from app.schemas import (
     ModelCreateRequest,
 )
 from app.services import (
+    DatasetArtifactError,
+    DatasetDeletionError,
     adapter_health,
+    delete_dataset,
     environment_status,
     get_job,
     list_adapters,
+    list_dataset_samples,
     list_datasets,
     list_jobs,
     list_models,
@@ -111,6 +115,21 @@ def get_datasets() -> list[dict[str, Any]]:
     return list(list_datasets())
 
 
+@app.get("/api/datasets/{dataset_id}/samples")
+def get_dataset_samples(
+    dataset_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=48, ge=1, le=200),
+) -> dict[str, Any]:
+    try:
+        result = list_dataset_samples(dataset_id, offset, limit)
+    except DatasetArtifactError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    return result
+
+
 @app.post("/api/datasets/import", status_code=202)
 def import_dataset(request: DatasetImportRequest) -> dict[str, Any]:
     return queue_job("DATASET_IMPORT", request.model_dump())
@@ -127,6 +146,17 @@ def freeze_dataset(dataset_id: str) -> dict[str, Any]:
         "UPDATE datasets SET frozen=1,annotation_status='VERIFIED' WHERE id=?", (dataset_id,)
     )
     return {"id": dataset_id, "frozen": True, "annotation_status": "VERIFIED"}
+
+
+@app.delete("/api/datasets/{dataset_id}")
+def remove_dataset(dataset_id: str) -> dict[str, Any]:
+    try:
+        result = delete_dataset(dataset_id)
+    except DatasetDeletionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    return result
 
 
 @app.post("/api/acquisition-jobs", status_code=202)
@@ -284,4 +314,3 @@ else:
         return JSONResponse(
             {"name": "视觉感知效能评估平台", "version": __version__, "frontend": "not built", "docs": "/docs"}
         )
-

@@ -70,6 +70,21 @@ class Database:
             now = utc_now()
             adapters = [
                 (
+                    "adapter_basegen",
+                    "Z-Image-Turbo 生成器",
+                    "GENERATOR",
+                    "1.0.0",
+                    "EXPERIMENTAL",
+                    "conda_external",
+                    str(self.settings.basegen_conda_prefix),
+                    "read_only",
+                    "adapters/basegen_generator.py",
+                    1,
+                    "REGISTERED",
+                    "通过独立 gen 环境调用 BaseGen；输出为未标注的真实生成图像。",
+                    json_dump(BASEGEN_SCHEMA),
+                ),
+                (
                     "adapter_replay",
                     "回放生成器",
                     "GENERATOR",
@@ -137,6 +152,15 @@ class Database:
                 WHERE id='adapter_replay' AND entrypoint!='adapters/replay_generator.py'
                 """,
                 (now,),
+            )
+            connection.execute(
+                """
+                UPDATE adapters
+                SET runtime_kind='conda_external',runtime_prefix=?,policy='read_only',
+                    entrypoint='adapters/basegen_generator.py',requires_gpu=1,updated_at=?
+                WHERE id='adapter_basegen'
+                """,
+                (str(self.settings.basegen_conda_prefix), now),
             )
             models = [
                 (
@@ -388,6 +412,24 @@ CONDITION_SCHEMA = {
         "motion_blur": {"type": "number", "minimum": 0, "maximum": 1},
         "fog_density": {"type": "number", "minimum": 0, "maximum": 1},
         "noise_level": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+}
+
+BASEGEN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "steps": {"type": "integer", "minimum": 1, "default": 9},
+        "guidance_scale": {"type": "number", "default": 0},
+        "device_policy": {
+            "type": "string",
+            "enum": ["cuda", "cpu-offload"],
+            "default": "cuda",
+        },
+        "model_path": {
+            "type": "string",
+            "default": "Tongyi-MAI/Z-Image-Turbo",
+        },
+        "local_files_only": {"type": "boolean", "default": False},
     },
 }
 

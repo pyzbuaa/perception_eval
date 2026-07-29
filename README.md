@@ -56,10 +56,105 @@ API 文档位于 [http://127.0.0.1:18080/docs](http://127.0.0.1:18080/docs)。
 
 ## 接入实际生成模型
 
-生成模型通过 `AdapterManifest + TaskRequest + TaskResult` 接入，不允许直接写平台数据库。已有环境以绝对路径注册为 `conda_external/read_only`，执行方式为：
+已接入同级目录下的 BaseGen `Z-Image-Turbo`。生成模型通过
+`AdapterManifest + TaskRequest + TaskResult` 接入，不允许直接写平台数据库。平台使用
+BaseGen 已有的 `gen` Conda 环境启动独立 Python 子进程，不会向该环境安装或升级依赖。
 
 ```text
-conda run --prefix <existing-env> python -B <adapter-script>
+/home/yons/miniforge3/envs/gen/bin/python -B adapters/basegen_generator.py ...
 ```
 
-如果 Adapter 需要新增依赖，应先克隆到 `.runtime/envs/adapters/<adapter-version>`，不得修改原环境。参考协议实现见 `adapters/replay_generator.py`。
+默认路径为：
+
+```text
+BaseGen 项目：/home/yons/ws/project_generator/BaseGen
+Conda 环境： /home/yons/miniforge3/envs/gen
+```
+
+路径不同时，在启动平台前覆盖：
+
+```bash
+export BASEGEN_ROOT=/absolute/path/to/BaseGen
+export BASEGEN_CONDA_PREFIX=/absolute/path/to/conda/env
+./scripts/start.sh
+```
+
+在“数据构建”中选择 `Z-Image-Turbo`，配置场景域、天气、输出数量、分辨率、起始 seed、
+推理步数和设备策略，然后提交。一个任务只加载一次模型；任务内图片使用从起始 seed
+开始的连续整数。首个任务可能需要将模型权重下载到 `.runtime/cache/huggingface`。
+可以先在“模型 / Adapter”页面执行健康检查，或调用：
+
+```bash
+curl -X POST http://127.0.0.1:18080/api/adapters/adapter_basegen/health-check
+```
+
+生成结果保存在：
+
+```text
+data/artifacts/generated/<job-id>/
+data/task_workspaces/<job-id>/request.json
+data/task_workspaces/<job-id>/result.json
+data/logs/<job-id>.log
+```
+
+BaseGen 是纯文本条件生成器，不产生目标框或分割真值，因此生成的数据集状态为
+`UNLABELED`，完成标注前不能冻结或进入正式评测。
+
+也可以直接调用 API：
+
+```bash
+curl -X POST http://127.0.0.1:18080/api/acquisition-jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "无人机薄雾生成",
+    "adapter_id": "adapter_basegen",
+    "source_type": "GENERATIVE",
+    "sample_count": 4,
+    "seeds": [1001],
+    "conditions": {
+      "scene": {"domain": "无人机航拍", "weather": "雾"},
+      "sensor": {"resolution": "1024×1024"}
+    },
+    "model_parameters": {
+      "steps": 9,
+      "guidance_scale": 0,
+      "device_policy": "cuda",
+      "local_files_only": false
+    }
+  }'
+```
+
+使用返回的任务 ID 查询进度：
+
+```bash
+curl http://127.0.0.1:18080/api/runs/<job-id>
+```
+
+默认单任务超时为 7200 秒，可以在启动前通过
+`PERCEPTION_EVAL_ADAPTER_TIMEOUT_SECONDS` 调整。如果 Adapter 需要新增依赖，应先克隆到
+`.runtime/envs/adapters/<adapter-version>`，不得修改原环境。
+
+## 浏览数据集图片
+
+数据集列表和详情中的 6 张图片是快速预览。点击“浏览全部”会打开滚轮浏览抽屉，并在接近
+底部时每次加载 48 张图片，适用于包含大量图片的数据集。分页 API 为：
+
+```text
+GET /api/datasets/<dataset-id>/samples?offset=0&limit=48
+```
+
+## 删除数据集
+
+“数据集版本”页面允许删除未冻结且未被评测方案或评测运行引用的数据集。删除采用可恢复
+策略：数据库中的活动记录会删除，Artifact 目录及删除前的数据集记录会移动到：
+
+```text
+data/trash/datasets/<dataset-id>/artifact/
+data/trash/datasets/<dataset-id>/dataset.json
+```
+
+冻结数据集和已有评测引用的数据集受保护，不能删除。也可以调用 API：
+
+```bash
+curl -X DELETE http://127.0.0.1:18080/api/datasets/<dataset-id>
+```

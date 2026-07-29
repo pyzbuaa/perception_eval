@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
+import signal
 import shutil
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -135,38 +138,66 @@ class JobAgent:
         adapter = self.db.row("SELECT * FROM adapters WHERE id=?", (payload["adapter_id"],))
         if not adapter:
             raise ValueError("适配器不存在")
-        entrypoint = self.settings.root_dir / adapter["entrypoint"]
+        entrypoint_value = adapter.get("entrypoint")
+        if not entrypoint_value:
+            raise ValueError("适配器没有配置入口脚本")
+        entrypoint = Path(entrypoint_value)
+        if not entrypoint.is_absolute():
+            entrypoint = self.settings.root_dir / entrypoint
         if not entrypoint.is_file():
             raise FileNotFoundError(f"适配器入口不存在: {entrypoint}")
         environment = os.environ.copy()
         environment.update(self._isolated_cache_environment(job_dir))
-        command = [sys.executable, "-B", str(entrypoint), "run", "--request", str(request_path), "--result", str(result_path)]
-        self._progress(job["id"], 25, "生成流程验证图像")
-        completed = subprocess.run(
-            command,
-            cwd=job_dir,
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=180,
+        environment.update(
+            {
+                "BASEGEN_ROOT": str(self.settings.basegen_root),
+                "PYTHONUNBUFFERED": "1",
+            }
         )
-        (self.settings.log_dir / f"{job['id']}.log").write_text(
-            completed.stdout + "\n" + completed.stderr, encoding="utf-8"
+        command = self._adapter_command(
+            adapter, entrypoint, request_path, result_path
         )
-        if completed.returncode != 0:
-            raise RuntimeError(f"适配器退出码 {completed.returncode}: {completed.stderr[-500:]}")
+        self._progress(job["id"], 25, "启动生成适配器")
+        returncode, log_tail = self._run_adapter_process(
+            job["id"], command, job_dir, environment
+        )
+        if returncode != 0:
+            raise RuntimeError(
+                f"适配器退出码 {returncode}: {log_tail[-500:]}"
+            )
         self._progress(job["id"], 75, "验证输出文件与元数据")
+        if not result_path.is_file():
+            raise FileNotFoundError("适配器没有生成 result.json")
         result = json.loads(result_path.read_text(encoding="utf-8"))
+        if result.get("protocol_version") != "1.0":
+            raise ValueError("适配器结果协议版本不受支持")
+        if result.get("job_id") != job["id"]:
+            raise ValueError("适配器结果 job_id 与请求不一致")
+        if result.get("status") != "succeeded":
+            raise ValueError(f"适配器返回失败状态: {result.get('status')}")
         samples = result.get("samples", [])
         if len(samples) != request["sample_count"]:
             raise ValueError("适配器输出样本数与请求不一致")
         for sample in samples:
-            path = artifact_dir / sample["image_path"]
+            image_relative = Path(sample["image_path"])
+            if image_relative.is_absolute() or ".." in image_relative.parts:
+                raise ValueError(f"生成文件路径必须位于 Artifact 目录内: {image_relative}")
+            path = artifact_dir / image_relative
             if not path.is_file():
                 raise FileNotFoundError(f"缺少生成文件: {sample['image_path']}")
             expected = hashlib.sha256(path.read_bytes()).hexdigest()
             if expected != sample["sha256"]:
                 raise ValueError(f"文件摘要不一致: {sample['image_path']}")
+            if sample.get("metadata_path"):
+                metadata_relative = Path(sample["metadata_path"])
+                if metadata_relative.is_absolute() or ".." in metadata_relative.parts:
+                    raise ValueError(
+                        f"元数据路径必须位于 Artifact 目录内: {metadata_relative}"
+                    )
+                if not (artifact_dir / metadata_relative).is_file():
+                    raise FileNotFoundError(
+                        f"缺少生成元数据: {sample['metadata_path']}"
+                    )
         dataset_id = new_id("dataset")
         sensor = payload.get("conditions", {}).get("sensor", {})
         scene = payload.get("conditions", {}).get("scene", {})
@@ -200,6 +231,116 @@ class JobAgent:
         )
         self._progress(job["id"], 95, "创建数据集草稿")
         return {"dataset_id": dataset_id, "samples": len(samples), "annotation_status": annotation_status}
+
+    def _adapter_command(
+        self,
+        adapter: dict[str, Any],
+        entrypoint: Path,
+        request_path: Path,
+        result_path: Path,
+    ) -> list[str]:
+        runtime_kind = adapter["runtime_kind"]
+        if runtime_kind == "platform":
+            python = Path(sys.executable)
+        elif runtime_kind in {"conda_external", "conda_clone"}:
+            prefix = Path(adapter.get("runtime_prefix") or "")
+            python = prefix / "bin" / "python"
+            if not python.is_file():
+                raise FileNotFoundError(f"外部环境 Python 不存在: {python}")
+        else:
+            raise ValueError(f"尚不支持的适配器运行方式: {runtime_kind}")
+        return [
+            str(python),
+            "-B",
+            str(entrypoint),
+            "run",
+            "--request",
+            str(request_path),
+            "--result",
+            str(result_path),
+        ]
+
+    def _run_adapter_process(
+        self,
+        job_id: str,
+        command: list[str],
+        cwd: Path,
+        environment: dict[str, str],
+    ) -> tuple[int, str]:
+        output_queue: queue.Queue[str | None] = queue.Queue()
+        tail: deque[str] = deque(maxlen=80)
+        log_path = self.settings.log_dir / f"{job_id}.log"
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+
+        def read_output() -> None:
+            assert process.stdout is not None
+            for line in process.stdout:
+                output_queue.put(line)
+            output_queue.put(None)
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        started = time.monotonic()
+        output_finished = False
+        try:
+            with log_path.open("w", encoding="utf-8") as log:
+                while process.poll() is None or not output_finished:
+                    try:
+                        line = output_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        line = ""
+                    if line is None:
+                        output_finished = True
+                    elif line:
+                        log.write(line)
+                        log.flush()
+                        tail.append(line)
+                        self._handle_adapter_progress(job_id, line)
+                    self._check_cancelled(job_id)
+                    if time.monotonic() - started > self.settings.adapter_timeout_seconds:
+                        raise TimeoutError(
+                            f"适配器执行超过 {self.settings.adapter_timeout_seconds} 秒"
+                        )
+        except BaseException:
+            self._terminate_process(process)
+            raise
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            reader.join(timeout=1)
+        return process.wait(), "".join(tail)
+
+    def _handle_adapter_progress(self, job_id: str, line: str) -> None:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if event.get("type") != "progress":
+            return
+        current = int(event.get("current", 0))
+        total = max(1, int(event.get("total", 1)))
+        progress = 25 + 48 * current / total
+        self._progress(job_id, progress, f"生成图像 {current}/{total}")
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
 
     def _run_import(self, job: dict[str, Any]) -> dict[str, Any]:
         payload = job["payload"]

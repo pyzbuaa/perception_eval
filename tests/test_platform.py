@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
+from adapters.basegen_generator import prepare_plan
 from app.config import ROOT_DIR, Settings
-from app.db import Database
-from app.services import query_results, queue_job
+from app.db import Database, json_dump, utc_now
+from app.services import (
+    DatasetDeletionError,
+    delete_dataset,
+    list_dataset_samples,
+    query_results,
+    queue_job,
+)
 from app.worker import JobAgent
 
 
@@ -23,6 +32,10 @@ def test_database_seeds_traceable_demo_data(tmp_path: Path) -> None:
     assert database.row("SELECT COUNT(*) AS n FROM models")["n"] == 3
     assert database.row("SELECT COUNT(*) AS n FROM results")["n"] == 27
     assert database.row("SELECT COUNT(*) AS n FROM results WHERE is_official=1")["n"] == 0
+    adapter = database.row("SELECT * FROM adapters WHERE id='adapter_basegen'")
+    assert adapter
+    assert adapter["runtime_kind"] == "conda_external"
+    assert adapter["requires_gpu"] == 1
 
 
 def test_result_query_keeps_resolution_as_group_dimension(tmp_path: Path) -> None:
@@ -59,6 +72,204 @@ def test_replay_adapter_job_creates_dataset_draft(tmp_path: Path) -> None:
     assert dataset["sample_count"] == 4
     assert dataset["annotation_status"] == "CANDIDATE"
     assert dataset["frozen"] == 0
+
+
+def test_external_conda_adapter_uses_registered_python(tmp_path: Path) -> None:
+    database, app_settings = make_database(tmp_path)
+    runtime_prefix = Path(sys.executable).parent.parent
+    now = utc_now()
+    database.execute(
+        """
+        INSERT INTO adapters
+        (id,name,kind,version,maturity,runtime_kind,runtime_prefix,policy,entrypoint,
+         requires_gpu,status,description,parameter_schema,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "adapter_external_test",
+            "外部环境测试",
+            "GENERATOR",
+            "1.0",
+            "CONTRACT_OK",
+            "conda_external",
+            str(runtime_prefix),
+            "read_only",
+            "adapters/replay_generator.py",
+            0,
+            "HEALTHY",
+            "",
+            json_dump({}),
+            now,
+            now,
+        ),
+    )
+    job = queue_job(
+        "ACQUISITION",
+        {
+            "name": "外部环境生成",
+            "adapter_id": "adapter_external_test",
+            "source_type": "REPLAY_FIXTURE",
+            "sample_count": 2,
+            "seeds": [7],
+            "conditions": {
+                "scene": {"domain": "城市驾驶", "weather": "晴朗"},
+                "sensor": {"resolution": "960×540"},
+            },
+            "model_parameters": {},
+        },
+        database,
+    )
+    assert JobAgent(database, app_settings).process_one()
+    completed = database.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
+    assert completed["status"] == "SUCCEEDED"
+
+
+def test_basegen_adapter_prepares_reproducible_batch(tmp_path: Path) -> None:
+    request = {
+        "protocol_version": "1.0",
+        "sample_count": 3,
+        "seeds": [1001],
+        "output_directory": str(tmp_path),
+        "conditions": {
+            "scene": {"domain": "无人机航拍", "weather": "雾"},
+            "sensor": {"resolution": "1024×1024"},
+        },
+        "model_parameters": {"steps": 9, "device_policy": "cuda"},
+    }
+    plan, config = prepare_plan(request, ROOT_DIR.parent / "BaseGen")
+    assert [item["seed"] for item in plan] == [1001, 1002, 1003]
+    assert {item["domain"] for item in plan} == {"low-altitude-uav"}
+    assert {item["scene"]["weather"] for item in plan} == {"fog"}
+    assert {(item["width"], item["height"]) for item in plan} == {(1024, 1024)}
+    assert config["model_path"] == "Tongyi-MAI/Z-Image-Turbo"
+
+
+def test_delete_dataset_moves_artifacts_to_trash(tmp_path: Path) -> None:
+    database, app_settings = make_database(tmp_path)
+    artifact_directory = app_settings.artifact_dir / "imports" / "delete-test"
+    artifact_directory.mkdir(parents=True)
+    (artifact_directory / "sample.jpg").write_bytes(b"sample")
+    database.execute(
+        """
+        INSERT INTO datasets
+        (id,name,version,source_type,scene_domain,weather,sensor_conditions,resolution,
+         sample_count,annotation_status,frozen,artifact_path,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "dataset_delete_test",
+            "待删除数据集",
+            "v1",
+            "REAL",
+            "无人机航拍",
+            "晴朗",
+            "{}",
+            "原始分辨率",
+            1,
+            "UNLABELED",
+            0,
+            "imports/delete-test",
+            utc_now(),
+        ),
+    )
+    result = delete_dataset("dataset_delete_test", database)
+    assert result and result["deleted"]
+    assert database.row(
+        "SELECT id FROM datasets WHERE id='dataset_delete_test'"
+    ) is None
+    assert not artifact_directory.exists()
+    trash = app_settings.data_dir / "trash" / "datasets" / "dataset_delete_test"
+    assert (trash / "artifact" / "sample.jpg").read_bytes() == b"sample"
+    assert (trash / "dataset.json").is_file()
+
+
+def test_dataset_samples_are_paginated_from_artifact_directory(
+    tmp_path: Path,
+) -> None:
+    database, app_settings = make_database(tmp_path)
+    artifact_directory = app_settings.artifact_dir / "imports" / "browse-test"
+    artifact_directory.mkdir(parents=True)
+    for index in range(5):
+        (artifact_directory / f"sample-{index}.jpg").write_bytes(b"sample")
+    (artifact_directory / "metadata.json").write_text("{}", encoding="utf-8")
+    database.execute(
+        """
+        INSERT INTO datasets
+        (id,name,version,source_type,scene_domain,weather,sensor_conditions,resolution,
+         sample_count,annotation_status,frozen,artifact_path,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "dataset_browse_test",
+            "分页浏览数据集",
+            "v1",
+            "REAL",
+            "无人机航拍",
+            "晴朗",
+            "{}",
+            "原始分辨率",
+            5,
+            "UNLABELED",
+            0,
+            "imports/browse-test",
+            utc_now(),
+        ),
+    )
+    page = list_dataset_samples("dataset_browse_test", 1, 2, database)
+    assert page
+    assert page["total"] == 5
+    assert page["declared_count"] == 5
+    assert page["has_more"]
+    assert [item["name"] for item in page["items"]] == [
+        "sample-1.jpg",
+        "sample-2.jpg",
+    ]
+    assert page["items"][0]["url"].endswith(
+        "/imports/browse-test/sample-1.jpg"
+    )
+    assert list_dataset_samples("missing", 0, 48, database) is None
+
+
+def test_delete_dataset_rejects_frozen_and_run_referenced_data(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    with pytest.raises(DatasetDeletionError, match="冻结"):
+        delete_dataset("dataset_aerial_clean", database)
+    database.execute(
+        "UPDATE datasets SET frozen=0 WHERE id='dataset_aerial_clean'"
+    )
+    with pytest.raises(DatasetDeletionError, match="评测运行"):
+        delete_dataset("dataset_aerial_clean", database)
+    assert database.row(
+        "SELECT id FROM datasets WHERE id='dataset_aerial_clean'"
+    )
+
+
+def test_delete_dataset_rejects_evaluation_plan_reference(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    database.execute(
+        "UPDATE datasets SET frozen=0 WHERE id='dataset_aerial_clean'"
+    )
+    database.execute("DELETE FROM results")
+    database.execute("DELETE FROM runs")
+    database.execute(
+        """
+        INSERT INTO evaluation_plans
+        (id,name,dataset_ids,model_ids,seeds,blur_levels,protocol,created_at)
+        VALUES (?,?,?,?,?,?,?,?)
+        """,
+        (
+            "plan_delete_guard",
+            "删除保护",
+            json_dump(["dataset_aerial_clean"]),
+            json_dump(["model_yolov5s_demo"]),
+            json_dump([1001]),
+            json_dump([0]),
+            json_dump({}),
+            utc_now(),
+        ),
+    )
+    with pytest.raises(DatasetDeletionError, match="评测方案"):
+        delete_dataset("dataset_aerial_clean", database)
 
 
 def test_evaluation_rejects_unfrozen_dataset(tmp_path: Path) -> None:
