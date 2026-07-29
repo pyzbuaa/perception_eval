@@ -12,7 +12,9 @@ from app.db import Database, json_dump, utc_now
 from app.services import (
     DatasetDeletionError,
     delete_dataset,
+    get_basegen_scene_schema,
     list_dataset_samples,
+    preview_basegen_plan,
     query_results,
     queue_job,
 )
@@ -142,6 +144,173 @@ def test_basegen_adapter_prepares_reproducible_batch(tmp_path: Path) -> None:
     assert {item["scene"]["weather"] for item in plan} == {"fog"}
     assert {(item["width"], item["height"]) for item in plan} == {(1024, 1024)}
     assert config["model_path"] == "Tongyi-MAI/Z-Image-Turbo"
+
+
+def test_basegen_scene_schema_exposes_domain_specific_ui_fields() -> None:
+    schema = get_basegen_scene_schema()
+    assert [domain["value"] for domain in schema["domains"]] == [
+        "autonomous-driving",
+        "low-altitude-uav",
+        "offroad-autonomous-driving",
+    ]
+    uav = next(
+        domain
+        for domain in schema["domains"]
+        if domain["value"] == "low-altitude-uav"
+    )
+    assert {field["name"] for field in uav["fields"]} >= {
+        "region",
+        "camera_height",
+        "viewpoint",
+        "field_of_view",
+        "environment",
+        "weather",
+        "elements",
+    }
+    assert "prompt_en" not in json_dump(schema)
+
+
+def test_basegen_mixed_fixed_and_random_fields_obey_constraints(
+    tmp_path: Path,
+) -> None:
+    request = {
+        "protocol_version": "1.0",
+        "sample_count": 4,
+        "seeds": [2201],
+        "output_directory": str(tmp_path),
+        "conditions": {
+            "scene": {
+                "domain": "low-altitude-uav",
+                "fields": {
+                    "region": {"mode": "fixed", "value": "north_china"},
+                    "camera_height": {
+                        "mode": "fixed",
+                        "value": "ultra_low",
+                    },
+                    "environment": {"mode": "random"},
+                    "time_of_day": {"mode": "fixed", "value": "night"},
+                    "elements": {
+                        "mode": "fixed",
+                        "values": ["warehouses"],
+                    },
+                },
+                "custom": "Blue delivery trucks are visible",
+            },
+            "sensor": {"resolution": "1024×1024"},
+        },
+        "model_parameters": {"steps": 9, "device_policy": "cuda"},
+    }
+    first, _ = prepare_plan(request, ROOT_DIR.parent / "BaseGen")
+    second, _ = prepare_plan(request, ROOT_DIR.parent / "BaseGen")
+    assert [item["scene"] for item in first] == [
+        item["scene"] for item in second
+    ]
+    assert {item["scene"]["environment"] for item in first} == {
+        "suburban_district"
+    }
+    assert {item["scene"]["camera_height"] for item in first} == {
+        "ultra_low"
+    }
+    assert {item["scene"]["region"] for item in first} == {"north_china"}
+    assert all(item["scene"]["elements"] == ["warehouses"] for item in first)
+    assert all(
+        item["scene"]["custom"] == "Blue delivery trucks are visible"
+        for item in first
+    )
+
+
+def test_basegen_rejects_incompatible_fixed_scene_fields(tmp_path: Path) -> None:
+    request = {
+        "protocol_version": "1.0",
+        "sample_count": 1,
+        "seeds": [42],
+        "output_directory": str(tmp_path),
+        "conditions": {
+            "scene": {
+                "domain": "low-altitude-uav",
+                "fields": {
+                    "environment": {
+                        "mode": "fixed",
+                        "value": "farmland",
+                    },
+                    "elements": {
+                        "mode": "fixed",
+                        "values": ["warehouses"],
+                    },
+                },
+            },
+            "sensor": {"resolution": "1024×1024"},
+        },
+        "model_parameters": {},
+    }
+    with pytest.raises(ValueError, match="不兼容"):
+        prepare_plan(request, ROOT_DIR.parent / "BaseGen")
+
+
+def test_basegen_random_fields_work_for_every_domain(tmp_path: Path) -> None:
+    for domain in get_basegen_scene_schema()["domains"]:
+        fields = {
+            field["name"]: {"mode": "random"}
+            for field in domain["fields"]
+            if field["kind"] != "text"
+        }
+        plan, _ = prepare_plan(
+            {
+                "protocol_version": "1.0",
+                "sample_count": 6,
+                "seeds": [2901],
+                "output_directory": str(tmp_path),
+                "conditions": {
+                    "scene": {
+                        "domain": domain["value"],
+                        "fields": fields,
+                    },
+                    "sensor": {
+                        "resolution": domain["default_resolution"],
+                    },
+                },
+                "model_parameters": {},
+            },
+            ROOT_DIR.parent / "BaseGen",
+        )
+        assert len(plan) == 6
+        assert {item["scene"]["domain"] for item in plan} == {
+            domain["value"]
+        }
+
+
+def test_basegen_preview_resolves_three_scenes_without_generation() -> None:
+    preview = preview_basegen_plan(
+        {
+            "sample_count": 8,
+            "seeds": [3101],
+            "conditions": {
+                "scene": {
+                    "domain": "autonomous-driving",
+                    "fields": {
+                        "viewpoint": {
+                            "mode": "fixed",
+                            "value": "front_vehicle",
+                        },
+                        "weather": {"mode": "random"},
+                        "elements": {"mode": "random"},
+                    },
+                },
+                "sensor": {"resolution": "1024×576"},
+            },
+            "model_parameters": {"steps": 9, "device_policy": "cuda"},
+        }
+    )
+    assert len(preview["images"]) == 3
+    assert [item["seed"] for item in preview["images"]] == [
+        3101,
+        3102,
+        3103,
+    ]
+    assert {
+        item["scene"]["viewpoint"] for item in preview["images"]
+    } == {"front_vehicle"}
+    assert all(item["prompt"] for item in preview["images"])
 
 
 def test_delete_dataset_moves_artifacts_to_trash(tmp_path: Path) -> None:

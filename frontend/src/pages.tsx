@@ -56,7 +56,7 @@ import {
 import ReactECharts from 'echarts-for-react'
 import { api, formatBytes, percent, post } from './api'
 import { DemoTag, Gallery, JobProgress, ParetoChart, PRChart, StatusTag } from './components'
-import type { Adapter, Dataset, DatasetSamplePage, EnvironmentStatus, Job, ModelVersion, Overview, ResultGroup, ResultResponse } from './types'
+import type { Adapter, BaseGenSceneField, BaseGenSceneOption, BaseGenSceneSchema, Dataset, DatasetSamplePage, EnvironmentStatus, Job, ModelVersion, Overview, ResultGroup, ResultResponse } from './types'
 
 type RouteKey = 'overview' | 'builder' | 'datasets' | 'registry' | 'evaluation' | 'explorer' | 'tasks' | 'environment'
 interface PageProps { dark: boolean; navigate: (route: RouteKey) => void; refresh: () => void }
@@ -144,6 +144,26 @@ const sourceCards = [
   { id: 'airsim-future', source: 'SIMULATOR', icon: <CodeOutlined />, title: 'AirSim / UE', status: '计划接入', description: '通过独立 RPC Adapter 采集图像与真值。', disabled: true },
 ]
 
+type BaseGenSelection =
+  | { mode: 'random' }
+  | { mode: 'fixed'; value: string }
+  | { mode: 'fixed'; values: string[] }
+
+const RANDOM_VALUE = '__random__'
+
+interface BaseGenPreview {
+  model_path: string
+  device_policy: string
+  images: Array<{
+    seed: number
+    scene: Record<string, string | string[]>
+    template_id: string
+    prompt: string
+    width: number
+    height: number
+  }>
+}
+
 export function DataBuilderPage({ navigate, refresh }: PageProps) {
   const [step, setStep] = useState(0)
   const [source, setSource] = useState(sourceCards[0])
@@ -156,41 +176,156 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
   const [generatorSeed, setGeneratorSeed] = useState(1001)
   const [generatorSteps, setGeneratorSteps] = useState(9)
   const [devicePolicy, setDevicePolicy] = useState('cuda')
+  const [basegenSelections, setBasegenSelections] = useState<Record<string, BaseGenSelection>>({})
+  const [basegenCustom, setBasegenCustom] = useState('')
   const [inputDatasetId, setInputDatasetId] = useState<string>()
   const [localDirectory, setLocalDirectory] = useState('')
   const [annotationPath, setAnnotationPath] = useState('')
   const [jobId, setJobId] = useState<string>()
   const [finishedJob, setFinishedJob] = useState<Job>()
   const [submitting, setSubmitting] = useState(false)
+  const [previewing, setPreviewing] = useState(false)
+  const [basegenPreview, setBasegenPreview] = useState<BaseGenPreview>()
   const datasets = useResource<Dataset[]>('/api/datasets', [])
+  const basegenSchema = useResource<BaseGenSceneSchema>(
+    '/api/adapters/adapter_basegen/scene-schema',
+    { version: '1.0', domains: [] },
+  )
 
   const isBaseGen = source.id === 'adapter_basegen'
+  const currentBasegenDomain = basegenSchema.data.domains.find((item) => item.label_zh === domain)
   const domainOptions = isBaseGen
-    ? ['无人机航拍', '城市驾驶', '野外自动驾驶']
+    ? basegenSchema.data.domains.map((item) => item.label_zh)
     : ['无人机航拍', '卫星遥感', '城市驾驶']
   const resolutionOptions = isBaseGen
     ? ['1024×1024', '1024×576']
     : ['1920×1080', '1280×720', '640×640']
-  const weatherOptions = isBaseGen
-    ? ['晴朗', '阴天', '雾', '雨', '雪', '夜间']
-    : ['晴朗', '雾', '雨', '夜间']
+  const weatherOptions = ['晴朗', '雾', '雨', '夜间']
   const combinationCount = isBaseGen ? 1 : seeds.length
+
+  useEffect(() => {
+    if (!isBaseGen || !currentBasegenDomain) return
+    setBasegenSelections((current) => Object.fromEntries(
+      currentBasegenDomain.fields
+        .filter((field) => field.kind !== 'text')
+        .map((field) => {
+          const selection = current[field.name]
+          if (!selection || selection.mode === 'random') return [field.name, { mode: 'random' }]
+          const allowed = new Set(field.options.map((option) => option.value))
+          const values = 'values' in selection ? selection.values : [selection.value]
+          return [field.name, values.every((value) => allowed.has(value)) ? selection : { mode: 'random' }]
+        }),
+    ))
+  }, [isBaseGen, currentBasegenDomain?.value])
+
+  const optionFor = (field: BaseGenSceneField, value: string) =>
+    field.options.find((option) => option.value === value)
+
+  const fixedValues = (selection?: BaseGenSelection): string[] => {
+    if (!selection || selection.mode === 'random') return []
+    return 'values' in selection ? selection.values : [selection.value]
+  }
+
+  const optionDisabled = (field: BaseGenSceneField, option: BaseGenSceneOption) => {
+    if (!currentBasegenDomain) return false
+    const environmentSelection = basegenSelections.environment
+    const fixedEnvironment = fixedValues(environmentSelection)[0]
+    if (field.name !== 'environment') {
+      return Boolean(fixedEnvironment && option.environments && !option.environments.includes(fixedEnvironment))
+    }
+    return currentBasegenDomain.fields.some((dependentField) => {
+      if (dependentField.name === 'environment' || dependentField.kind === 'text') return false
+      return fixedValues(basegenSelections[dependentField.name]).some((value) => {
+        const selectedOption = optionFor(dependentField, value)
+        return Boolean(selectedOption?.environments && !selectedOption.environments.includes(option.value))
+      })
+    })
+  }
+
+  const changeBasegenSelection = (field: BaseGenSceneField, selection: BaseGenSelection) => {
+    const next = { ...basegenSelections, [field.name]: selection }
+    let adjusted = false
+    if (field.name === 'environment' && selection.mode === 'fixed' && 'value' in selection && currentBasegenDomain) {
+      for (const dependentField of currentBasegenDomain.fields) {
+        if (dependentField.name === 'environment' || dependentField.kind === 'text') continue
+        const current = next[dependentField.name]
+        if (!current || current.mode === 'random') continue
+        const compatible = fixedValues(current).filter((value) => {
+          const selectedOption = optionFor(dependentField, value)
+          return !selectedOption?.environments || selectedOption.environments.includes(selection.value)
+        })
+        if (compatible.length === fixedValues(current).length) continue
+        next[dependentField.name] = dependentField.kind === 'multi' && compatible.length
+          ? { mode: 'fixed', values: compatible }
+          : { mode: 'random' }
+        adjusted = true
+      }
+    }
+    setBasegenSelections(next)
+    if (adjusted) message.info('与新环境不兼容的场景选项已切换为随机')
+  }
+
+  const weatherSummary = (() => {
+    if (!currentBasegenDomain) return '随机'
+    const field = currentBasegenDomain.fields.find((item) => item.name === 'weather')
+    const values = fixedValues(basegenSelections.weather)
+    return values.length && field ? optionFor(field, values[0])?.label_zh || values[0] : '随机'
+  })()
+
+  const basegenSceneSummary = currentBasegenDomain?.fields
+    .filter((field) => field.kind !== 'text')
+    .map((field) => {
+      const values = fixedValues(basegenSelections[field.name])
+      const value = values.length
+        ? values.map((item) => optionFor(field, item)?.label_zh || item).join('、')
+        : field.weighted ? '随机（按权重）' : '随机'
+      return `${field.label_zh}：${value}`
+    }) || []
+
   const selectSource = (item: typeof sourceCards[number]) => {
     if (item.disabled) return
     setSource(item)
     if (item.id === 'adapter_basegen') {
-      const nextDomain = domain === '卫星遥感' ? '无人机航拍' : domain
+      const available = basegenSchema.data.domains.map((entry) => entry.label_zh)
+      const preferred = basegenSchema.data.domains.find((entry) => entry.value === 'low-altitude-uav')
+      const nextDomain = available.includes(domain) ? domain : preferred?.label_zh || available[0] || '低空无人机'
       setDomain(nextDomain)
-      setResolution(nextDomain === '无人机航拍' ? '1024×1024' : '1024×576')
+      setResolution(basegenSchema.data.domains.find((entry) => entry.label_zh === nextDomain)?.default_resolution || '1024×1024')
     } else {
-      if (domain === '野外自动驾驶') setDomain('无人机航拍')
-      if (weather === '阴天' || weather === '雪') setWeather('晴朗')
+      if (!['无人机航拍', '卫星遥感', '城市驾驶'].includes(domain)) setDomain('无人机航拍')
       setResolution('1920×1080')
     }
   }
   const selectDomain = (value: string) => {
     setDomain(value)
-    if (isBaseGen) setResolution(value === '无人机航拍' ? '1024×1024' : '1024×576')
+    if (isBaseGen) {
+      setResolution(basegenSchema.data.domains.find((entry) => entry.label_zh === value)?.default_resolution || '1024×576')
+    }
+  }
+  const acquisitionPayload = () => ({
+    name: `${domain} · ${source.title} · ${new Date().toLocaleDateString('zh-CN')}`,
+    adapter_id: source.id,
+    source_type: source.source,
+    sample_count: samples,
+    seeds: isBaseGen ? [generatorSeed] : seeds,
+    conditions: {
+      scene: isBaseGen ? {
+        domain: currentBasegenDomain?.value,
+        domain_label: currentBasegenDomain?.label_zh,
+        weather: weatherSummary,
+        fields: basegenSelections,
+        custom: basegenCustom,
+      } : { domain, weather },
+      sensor: isBaseGen ? { resolution } : { resolution, motion_blur: blur, fog_density: weather === '雾' ? 0.4 : 0 },
+    },
+    model_parameters: isBaseGen ? { steps: generatorSteps, guidance_scale: 0, device_policy: devicePolicy, local_files_only: false } : {},
+    input_dataset_id: source.id === 'adapter_condition' ? inputDatasetId : null,
+  })
+  const previewBasegen = async () => {
+    setPreviewing(true)
+    try {
+      setBasegenPreview(await post<BaseGenPreview>('/api/adapters/adapter_basegen/preview', acquisitionPayload()))
+    } catch (error) { message.error((error as Error).message) } finally { setPreviewing(false) }
   }
   const submit = async () => {
     setSubmitting(true)
@@ -202,19 +337,7 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
             annotation_path: annotationPath || null,
             scene_domain: domain,
           })
-        : await post<Job>('/api/acquisition-jobs', {
-            name: `${domain} · ${source.title} · ${new Date().toLocaleDateString('zh-CN')}`,
-            adapter_id: source.id,
-            source_type: source.source,
-            sample_count: samples,
-            seeds: isBaseGen ? [generatorSeed] : seeds,
-            conditions: {
-              scene: { domain, weather },
-              sensor: isBaseGen ? { resolution } : { resolution, motion_blur: blur, fog_density: weather === '雾' ? 0.4 : 0 },
-            },
-            model_parameters: isBaseGen ? { steps: generatorSteps, guidance_scale: 0, device_policy: devicePolicy, local_files_only: false } : {},
-            input_dataset_id: source.id === 'adapter_condition' ? inputDatasetId : null,
-          })
+        : await post<Job>('/api/acquisition-jobs', acquisitionPayload())
       setJobId(job.id)
       setStep(3)
       refresh()
@@ -235,16 +358,54 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
         <div className="wizard-actions"><Button type="primary" onClick={() => setStep(1)}>下一步：配置条件 <ArrowRightOutlined /></Button></div>
       </Card>}
       {step === 1 && <Row gutter={16}>
-        <Col xs={24} xl={12}><Card title={source.id === 'local-import' ? '本地数据路径' : '场景条件'}><Form layout="vertical">{source.id === 'local-import' && <><Form.Item label="图像目录" required><Input value={localDirectory} onChange={(event) => setLocalDirectory(event.target.value)} placeholder="例如 /data/aerial/images" prefix={<DatabaseOutlined />} /></Form.Item><Form.Item label="标注文件（可选）"><Input value={annotationPath} onChange={(event) => setAnnotationPath(event.target.value)} placeholder="COCO JSON 或 YOLO 标签入口" /></Form.Item></>}<Form.Item label="场景域"><Select value={domain} onChange={selectDomain} options={domainOptions.map((value) => ({ value }))} /></Form.Item>{source.id !== 'local-import' && <><Form.Item label="天气 / 环境"><Segmented block value={weather} onChange={(value) => setWeather(String(value))} options={weatherOptions} /></Form.Item><Form.Item label="输出数量"><InputNumber value={samples} onChange={(value) => setSamples(value || 1)} min={1} max={1000} addonAfter="张" style={{ width: '100%' }} /></Form.Item></>}</Form></Card></Col>
+        <Col xs={24} xl={12}>
+          <Card title={source.id === 'local-import' ? '本地数据路径' : '场景条件'}>
+            <Form layout="vertical">
+              {source.id === 'local-import' && <>
+                <Form.Item label="图像目录" required><Input value={localDirectory} onChange={(event) => setLocalDirectory(event.target.value)} placeholder="例如 /data/aerial/images" prefix={<DatabaseOutlined />} /></Form.Item>
+                <Form.Item label="标注文件（可选）"><Input value={annotationPath} onChange={(event) => setAnnotationPath(event.target.value)} placeholder="COCO JSON 或 YOLO 标签入口" /></Form.Item>
+              </>}
+              <Form.Item label="场景域"><Select loading={isBaseGen && basegenSchema.loading} value={domain} onChange={selectDomain} options={domainOptions.map((value) => ({ value }))} /></Form.Item>
+              {isBaseGen && !basegenSchema.loading && !currentBasegenDomain && <Alert type="error" showIcon message="未找到当前领域的 BaseGen 场景目录" />}
+              {isBaseGen && currentBasegenDomain?.fields.map((field) => {
+                if (field.kind === 'text') {
+                  return <Form.Item key={field.name} label={field.label_zh} extra={field.description_zh}><Input.TextArea value={basegenCustom} onChange={(event) => setBasegenCustom(event.target.value)} rows={3} maxLength={500} showCount placeholder="可选；建议使用英文描述" /></Form.Item>
+                }
+                const selection = basegenSelections[field.name] || { mode: 'random' }
+                if (field.kind === 'multi') {
+                  const values = fixedValues(selection)
+                  return (
+                    <Form.Item key={field.name} label={field.label_zh} extra={field.description_zh}>
+                      <Space direction="vertical" style={{ width: '100%' }}>
+                        <Segmented block value={selection.mode} options={[{ value: 'random', label: field.weighted ? '随机组合（按权重）' : '随机组合' }, { value: 'fixed', label: '手动选择' }]} onChange={(value) => changeBasegenSelection(field, value === 'random' ? { mode: 'random' } : { mode: 'fixed', values })} />
+                        {selection.mode === 'fixed' && <Select mode="multiple" allowClear value={values} maxTagCount="responsive" placeholder="最多选择四项" onChange={(next) => changeBasegenSelection(field, { mode: 'fixed', values: next.slice(0, 4) })} options={field.options.map((option) => ({ value: option.value, label: option.label_zh, disabled: optionDisabled(field, option) }))} />}
+                      </Space>
+                    </Form.Item>
+                  )
+                }
+                const value = fixedValues(selection)[0] || RANDOM_VALUE
+                return (
+                  <Form.Item key={field.name} label={field.label_zh} extra={field.description_zh}>
+                    <Select value={value} onChange={(next) => changeBasegenSelection(field, next === RANDOM_VALUE ? { mode: 'random' } : { mode: 'fixed', value: next })} options={[{ value: RANDOM_VALUE, label: field.weighted ? '随机（按 BaseGen 权重）' : '随机' }, ...field.options.map((option) => ({ value: option.value, label: option.label_zh, disabled: optionDisabled(field, option) }))]} />
+                  </Form.Item>
+                )
+              })}
+              {source.id !== 'local-import' && !isBaseGen && <Form.Item label="天气 / 环境"><Segmented block value={weather} onChange={(value) => setWeather(String(value))} options={weatherOptions} /></Form.Item>}
+              {source.id !== 'local-import' && <Form.Item label="输出数量"><InputNumber value={samples} onChange={(value) => setSamples(value || 1)} min={1} max={1000} addonAfter="张" style={{ width: '100%' }} /></Form.Item>}
+            </Form>
+          </Card>
+        </Col>
         <Col xs={24} xl={12}>{source.id === 'local-import' ? <Card title="导入校验"><Timeline items={[{ color: 'blue', children: '扫描 PNG、JPEG、WebP 和 SVG 图像' }, { color: 'blue', children: '复制到内容受控的 Artifact 目录' }, { color: 'blue', children: '标注作为候选真值导入并等待校核' }, { color: 'green', children: '原始目录保持不变，平台不会原地修改图像' }]} /><Alert type="info" showIcon message="本地目录只读" description="平台将图像复制到工作区，不在源目录创建缓存或转换文件。" /></Card> : <Card title={isBaseGen ? '生成参数' : '传感器与成像条件'}><Form layout="vertical"><Form.Item label="图像分辨率"><Select value={resolution} onChange={setResolution} options={resolutionOptions.map((value) => ({ value }))} /></Form.Item>{isBaseGen ? <><Form.Item label="起始随机种子"><InputNumber value={generatorSeed} onChange={(value) => setGeneratorSeed(value || 0)} min={0} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="推理步数"><InputNumber value={generatorSteps} onChange={(value) => setGeneratorSteps(value || 1)} min={1} max={100} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="设备策略"><Select value={devicePolicy} onChange={setDevicePolicy} options={[{ value: 'cuda', label: '全量 CUDA（推荐）' }, { value: 'cpu-offload', label: 'CPU Offload（节省显存）' }]} /></Form.Item></> : <><Form.Item label={`运动模糊强度 ${blur.toFixed(1)}`}><Slider value={blur} onChange={setBlur} min={0} max={1} step={0.1} marks={{ 0: '清洁', 0.5: '中等', 1: '严重' }} /></Form.Item><Form.Item label="固定随机种子"><Checkbox.Group options={[1001, 1002, 1003, 1004].map((value) => ({ label: value, value }))} value={seeds} onChange={(values) => setSeeds(values as number[])} /></Form.Item></>}</Form></Card>}</Col>
         {source.id === 'adapter_condition' && <Col span={24}><Card title="选择退化输入数据集"><Select value={inputDatasetId} onChange={setInputDatasetId} style={{ width: '100%' }} placeholder="选择已导入的 PNG/JPEG/WebP 数据集" options={datasets.data.filter((item) => item.source_type === 'REAL').map((item) => ({ value: item.id, label: `${item.name} · ${item.sample_count} 张` }))} /><Typography.Paragraph type="secondary" style={{ marginTop: 10, marginBottom: 0 }}>条件算子保持几何位置不变，但输出真值仍需抽查后冻结。</Typography.Paragraph></Card></Col>}
-        <Col span={24}><div className="wizard-actions"><Button onClick={() => setStep(0)}>上一步</Button><Button type="primary" disabled={source.id === 'local-import' ? !localDirectory : isBaseGen ? generatorSeed < 0 || generatorSteps < 1 : source.id === 'adapter_condition' ? !inputDatasetId || !seeds.length : !seeds.length} onClick={() => setStep(2)}>下一步：组合预览</Button></div></Col>
+        <Col span={24}><div className="wizard-actions"><Button onClick={() => setStep(0)}>上一步</Button><Button type="primary" disabled={source.id === 'local-import' ? !localDirectory : isBaseGen ? !currentBasegenDomain || generatorSeed < 0 || generatorSteps < 1 : source.id === 'adapter_condition' ? !inputDatasetId || !seeds.length : !seeds.length} onClick={() => setStep(2)}>下一步：组合预览</Button></div></Col>
       </Row>}
       {step === 2 && <Card title="提交前确认" extra={isBaseGen ? <Tag color="purple">Z-Image-Turbo</Tag> : <DemoTag />}>
         <Row gutter={[16, 16]}><Col xs={24} md={8}><Statistic title={source.id === 'local-import' ? '导入任务' : '配置单元'} value={source.id === 'local-import' ? 1 : combinationCount} suffix="个" /></Col><Col xs={24} md={8}><Statistic title="输出样本" value={source.id === 'local-import' ? '目录内图像' : samples} suffix={source.id === 'local-import' ? undefined : '张'} /></Col><Col xs={24} md={8}><Statistic title="真值入口" value={source.id === 'local-import' ? (annotationPath ? '已提供' : '未提供') : isBaseGen ? '未标注' : '候选框'} /></Col></Row><Divider />
-        <Descriptions column={{ xs: 1, md: 2 }} bordered size="small" items={[{ key: 'source', label: '来源', children: source.title }, { key: 'scene', label: '场景', children: source.id === 'local-import' ? domain : `${domain} / ${weather}` }, { key: 'sensor', label: source.id === 'local-import' ? '输入目录' : isBaseGen ? '生成参数' : '成像条件', children: source.id === 'local-import' ? localDirectory : isBaseGen ? `${resolution} / ${generatorSteps} 步 / ${devicePolicy}` : `${resolution} / 模糊 ${blur}` }, { key: 'seed', label: '随机种子', children: source.id === 'local-import' ? '不适用' : isBaseGen ? `${generatorSeed} 起连续 ${samples} 个` : seeds.join(', ') }, { key: 'truth', label: '真值策略', children: source.id === 'local-import' ? (annotationPath ? '导入后作为候选真值' : '未提供') : isBaseGen ? '未标注，需另行标注后评测' : '候选框，完成后需校核冻结' }, { key: 'official', label: '结果性质', children: source.id === 'local-import' ? <Tag color="blue">真实采集数据</Tag> : isBaseGen ? <Tag color="purple">真实模型生成</Tag> : <DemoTag /> }]} />
+        <Descriptions column={{ xs: 1, md: 2 }} bordered size="small" items={[{ key: 'source', label: '来源', children: source.title }, { key: 'scene', label: '场景', children: source.id === 'local-import' || isBaseGen ? domain : `${domain} / ${weather}` }, { key: 'sensor', label: source.id === 'local-import' ? '输入目录' : isBaseGen ? '生成参数' : '成像条件', children: source.id === 'local-import' ? localDirectory : isBaseGen ? `${resolution} / ${generatorSteps} 步 / ${devicePolicy}` : `${resolution} / 模糊 ${blur}` }, { key: 'seed', label: '随机种子', children: source.id === 'local-import' ? '不适用' : isBaseGen ? `${generatorSeed} 起连续 ${samples} 个` : seeds.join(', ') }, { key: 'truth', label: '真值策略', children: source.id === 'local-import' ? (annotationPath ? '导入后作为候选真值' : '未提供') : isBaseGen ? '未标注，需另行标注后评测' : '候选框，完成后需校核冻结' }, { key: 'official', label: '结果性质', children: source.id === 'local-import' ? <Tag color="blue">真实采集数据</Tag> : isBaseGen ? <Tag color="purple">真实模型生成</Tag> : <DemoTag /> }]} />
+        {isBaseGen && <Card size="small" title="场景字段规则" className="top-gap"><Space wrap>{basegenSceneSummary.map((item) => <Tag key={item}>{item}</Tag>)}{basegenCustom && <Tag color="blue">自定义：{basegenCustom}</Tag>}</Space></Card>}
+        {isBaseGen && basegenPreview && <Card size="small" title="随机计划预览（不加载模型）" className="top-gap"><List dataSource={basegenPreview.images} renderItem={(item) => <List.Item><Space direction="vertical" style={{ width: '100%' }}><Space wrap><Tag color="blue">seed {item.seed}</Tag><Tag>{item.width}×{item.height}</Tag>{currentBasegenDomain?.fields.filter((field) => field.kind !== 'text').map((field) => { const raw = item.scene[field.name]; const values = Array.isArray(raw) ? raw : [raw]; return <Tag key={field.name}>{field.label_zh}：{values.map((value) => optionFor(field, value)?.label_zh || value).join('、')}</Tag> })}</Space><Typography.Paragraph copyable={{ text: item.prompt }} ellipsis={{ rows: 3, expandable: true, symbol: '展开 prompt' }} style={{ marginBottom: 0 }}>{item.prompt}</Typography.Paragraph></Space></List.Item>} /></Card>}
         {source.id !== 'local-import' && <Alert className="inline-alert" type={isBaseGen ? 'info' : 'warning'} showIcon message={isBaseGen ? '本任务将调用 BaseGen 真实生成图像' : source.id === 'adapter_condition' ? '本任务将创建真实图像的条件退化版本' : '本任务使用流程验证 Adapter'} description={isBaseGen ? '模型在独立 gen 环境中运行；纯文本生成不提供目标框等真值。' : source.id === 'adapter_condition' ? '输出记录原数据集和退化参数，正式冻结前仍需抽查真值。' : '输出会保留完整数据谱系，但不能作为生成模型能力结论。'} />}
-        <div className="wizard-actions"><Button onClick={() => setStep(1)}>上一步</Button><Button type="primary" loading={submitting} icon={<PlayCircleOutlined />} onClick={submit}>提交构建任务</Button></div>
+        <div className="wizard-actions"><Button onClick={() => { setBasegenPreview(undefined); setStep(1) }}>上一步</Button>{isBaseGen && <Button loading={previewing} onClick={previewBasegen}>预览 3 个随机场景</Button>}<Button type="primary" loading={submitting} icon={<PlayCircleOutlined />} onClick={submit}>提交构建任务</Button></div>
       </Card>}
       {step === 3 && <Space direction="vertical" size={16} style={{ width: '100%' }}><JobProgress jobId={jobId} onFinish={finish} />{finishedJob?.status === 'SUCCEEDED' && <Card><Result status="success" title={source.id === 'local-import' ? '本地图像已导入' : '数据构建任务已完成'} subTitle={finishedJob.result?.annotation_status === 'UNLABELED' ? '当前没有真值，需进入数据集完成标注后才能正式评测。' : '输出当前仍是候选真值，冻结前不会进入正式评测。'} extra={finishedJob.result?.annotation_status === 'UNLABELED' ? [<Button key="datasets" type="primary" onClick={() => navigate('datasets')}>打开数据集</Button>] : [<Button key="freeze" type="primary" icon={<LockOutlined />} onClick={freeze}>校核并冻结数据版本</Button>, <Button key="datasets" onClick={() => navigate('datasets')}>打开数据集</Button>]} /></Card>}</Space>}
       {step === 4 && <Card><Result status="success" title="数据版本已冻结" subTitle="该版本不可变；后续修改真值需要创建新版本。" extra={[<Button type="primary" key="eval" onClick={() => navigate('evaluation')}>进入评测中心</Button>, <Button key="again" onClick={() => { setStep(0); setJobId(undefined); setFinishedJob(undefined) }}>继续构建数据</Button>]} /></Card>}

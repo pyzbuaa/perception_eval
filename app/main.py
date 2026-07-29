@@ -23,11 +23,13 @@ from app.schemas import (
     ModelCreateRequest,
 )
 from app.services import (
+    BaseGenCatalogError,
     DatasetArtifactError,
     DatasetDeletionError,
     adapter_health,
     delete_dataset,
     environment_status,
+    get_basegen_scene_schema,
     get_job,
     list_adapters,
     list_dataset_samples,
@@ -35,6 +37,7 @@ from app.services import (
     list_jobs,
     list_models,
     overview,
+    preview_basegen_plan,
     query_results,
     queue_job,
 )
@@ -108,6 +111,24 @@ def check_adapter(adapter_id: str) -> dict[str, Any]:
     if not result:
         raise HTTPException(status_code=404, detail="适配器不存在")
     return result
+
+
+@app.get("/api/adapters/adapter_basegen/scene-schema")
+def basegen_scene_schema() -> dict[str, Any]:
+    try:
+        return get_basegen_scene_schema()
+    except BaseGenCatalogError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/adapters/adapter_basegen/preview")
+def preview_basegen(request: AcquisitionRequest) -> dict[str, Any]:
+    if request.adapter_id != "adapter_basegen":
+        raise HTTPException(status_code=422, detail="预览请求必须使用 adapter_basegen")
+    try:
+        return preview_basegen_plan(request.model_dump())
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/datasets")

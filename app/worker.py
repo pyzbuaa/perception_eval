@@ -218,7 +218,7 @@ class JobAgent:
                 payload["name"],
                 "v1",
                 payload.get("source_type", "REPLAY_FIXTURE"),
-                scene.get("domain", "无人机航拍"),
+                scene.get("domain_label", scene.get("domain", "无人机航拍")),
                 scene.get("weather", "晴朗"),
                 json_dump(sensor),
                 resolution,

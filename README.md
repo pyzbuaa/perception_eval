@@ -79,9 +79,18 @@ export BASEGEN_CONDA_PREFIX=/absolute/path/to/conda/env
 ./scripts/start.sh
 ```
 
-在“数据构建”中选择 `Z-Image-Turbo`，配置场景域、天气、输出数量、分辨率、起始 seed、
-推理步数和设备策略，然后提交。一个任务只加载一次模型；任务内图片使用从起始 seed
-开始的连续整数。首个任务可能需要将模型权重下载到 `.runtime/cache/huggingface`。
+在“数据构建”中选择 `Z-Image-Turbo` 后，页面会读取 BaseGen 当前的场景目录，并根据
+场景域动态显示区域、相机高度、视角、环境、时间、天气、活动密度和关键元素等字段。
+每个单选字段都可以选择一个固定值或“随机”；关键元素可以随机组合，也可以手动选择
+最多四项。页面会禁用与当前环境不兼容的选项，改变环境时也会把不再兼容的固定项恢复
+为随机。
+
+配置输出数量、分辨率、起始 seed、推理步数和设备策略后，可先进入“组合预览”，点击
+“预览 3 个随机场景”。预览只解析场景和最终 prompt，不加载生成模型、不生成图片。
+确认后再提交任务。一个任务只加载一次模型；任务内图片使用从起始 seed 开始的连续
+整数。同一份字段规则和起始 seed 会得到相同的场景组合。首个任务可能需要将模型权重
+下载到 `.runtime/cache/huggingface`。
+
 可以先在“模型 / Adapter”页面执行健康检查，或调用：
 
 ```bash
@@ -106,13 +115,28 @@ BaseGen 是纯文本条件生成器，不产生目标框或分割真值，因此
 curl -X POST http://127.0.0.1:18080/api/acquisition-jobs \
   -H 'Content-Type: application/json' \
   -d '{
-    "name": "无人机薄雾生成",
+    "name": "低空无人机混合场景生成",
     "adapter_id": "adapter_basegen",
     "source_type": "GENERATIVE",
     "sample_count": 4,
     "seeds": [1001],
     "conditions": {
-      "scene": {"domain": "无人机航拍", "weather": "雾"},
+      "scene": {
+        "domain": "low-altitude-uav",
+        "domain_label": "低空无人机",
+        "fields": {
+          "region": {"mode": "random"},
+          "camera_height": {"mode": "fixed", "value": "low"},
+          "viewpoint": {"mode": "random"},
+          "field_of_view": {"mode": "random"},
+          "environment": {"mode": "random"},
+          "time_of_day": {"mode": "fixed", "value": "day"},
+          "weather": {"mode": "random"},
+          "activity_level": {"mode": "random"},
+          "elements": {"mode": "fixed", "values": ["small_vehicles"]}
+        },
+        "custom": "Blue delivery trucks are visible"
+      },
       "sensor": {"resolution": "1024×1024"}
     },
     "model_parameters": {
@@ -123,6 +147,17 @@ curl -X POST http://127.0.0.1:18080/api/acquisition-jobs \
     }
   }'
 ```
+
+页面使用的场景字段目录和无生成预览也可以直接调用：
+
+```text
+GET  /api/adapters/adapter_basegen/scene-schema
+POST /api/adapters/adapter_basegen/preview
+```
+
+`random` 会在当前环境兼容的候选中采样；BaseGen 目录提供权重时按权重采样。所有固定
+字段会先共同约束环境，若组合没有交集，预览或提交会返回“不兼容”错误，而不会静默
+替换用户的固定选择。
 
 使用返回的任务 ID 查询进度：
 

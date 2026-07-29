@@ -72,6 +72,33 @@ export interface Adapter {
   parameter_schema: Record<string, unknown>
 }
 
+export interface BaseGenSceneOption {
+  value: string
+  label_zh: string
+  environments?: string[]
+}
+
+export interface BaseGenSceneField {
+  name: string
+  label_zh: string
+  description_zh: string
+  kind: 'single' | 'multi' | 'text'
+  weighted: boolean
+  options: BaseGenSceneOption[]
+}
+
+export interface BaseGenSceneDomain {
+  value: string
+  label_zh: string
+  default_resolution: string
+  fields: BaseGenSceneField[]
+}
+
+export interface BaseGenSceneSchema {
+  version: string
+  domains: BaseGenSceneDomain[]
+}
+
 export interface ResultGroup {
   dataset_id: string
   dataset_name: string

@@ -71,6 +71,152 @@ def parse_resolution(value: Any, domain: str) -> tuple[int, int]:
     return width, height
 
 
+def _selection(
+    selections: dict[str, Any], field: str, multi: bool = False
+) -> dict[str, Any]:
+    selection = selections.get(field, {"mode": "random"})
+    if not isinstance(selection, dict):
+        raise ValueError(f"{field} 的选择规则必须是对象")
+    mode = selection.get("mode")
+    if mode == "random":
+        return {"mode": "random"}
+    if mode != "fixed":
+        raise ValueError(f"{field} 的 mode 必须是 random 或 fixed")
+    key = "values" if multi else "value"
+    value = selection.get(key)
+    if multi:
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise ValueError(f"{field}.values 必须是字符串数组")
+        if len(value) > 4:
+            raise ValueError("elements 最多选择四项")
+    elif not isinstance(value, str):
+        raise ValueError(f"{field}.value 必须是字符串")
+    return {"mode": "fixed", key: value}
+
+
+def _weighted_choice(
+    values: list[str], options: dict[str, Any], rng: random.Random
+) -> str:
+    if not values:
+        raise ValueError("没有满足固定条件的随机候选值")
+    weights = [options[value].get("weight", 1) for value in values]
+    return rng.choices(values, weights=weights, k=1)[0]
+
+
+def _option(
+    domain_catalog: dict[str, Any], field: str, value: str
+) -> dict[str, Any]:
+    options = domain_catalog["fields"][field]["options"]
+    if value not in options:
+        raise ValueError(f"{field} 的固定值无效: {value}")
+    return options[value]
+
+
+def resolve_scene(
+    domain: str,
+    catalog: dict[str, Any],
+    rng: random.Random,
+    index: int,
+    selections: dict[str, Any],
+    custom: str,
+    validate_scene,
+) -> dict[str, Any]:
+    domain_catalog = catalog["domains"][domain]
+    field_names = set(domain_catalog["fields"])
+    unknown = set(selections) - field_names
+    if unknown:
+        raise ValueError(f"未知场景字段: {', '.join(sorted(unknown))}")
+    if not isinstance(custom, str):
+        raise ValueError("custom 必须是字符串")
+
+    scalar_fields = [
+        field
+        for field in domain_catalog["fields"]
+        if field not in {"elements", "custom"}
+    ]
+    rules = {
+        field: _selection(selections, field)
+        for field in scalar_fields
+    }
+    element_rule = _selection(selections, "elements", multi=True)
+    environment_options = domain_catalog["fields"]["environment"]["options"]
+    environment_rule = rules["environment"]
+    if environment_rule["mode"] == "fixed":
+        _option(domain_catalog, "environment", environment_rule["value"])
+        environments = [environment_rule["value"]]
+    else:
+        environments = list(environment_options)
+
+    for field, rule in rules.items():
+        if field == "environment" or rule["mode"] == "random":
+            continue
+        option = _option(domain_catalog, field, rule["value"])
+        allowed = option.get("environments")
+        if allowed is not None:
+            environments = [
+                environment for environment in environments if environment in allowed
+            ]
+    if element_rule["mode"] == "fixed":
+        for value in element_rule["values"]:
+            option = _option(domain_catalog, "elements", value)
+            allowed = option.get("environments")
+            if allowed is not None:
+                environments = [
+                    environment
+                    for environment in environments
+                    if environment in allowed
+                ]
+    if not environments:
+        raise ValueError("固定场景字段之间不兼容，没有可用的 environment")
+
+    environment = (
+        environments[0]
+        if environment_rule["mode"] == "fixed"
+        else _weighted_choice(environments, environment_options, rng)
+    )
+    sampled_fields: dict[str, str] = {"environment": environment}
+    for field in scalar_fields:
+        if field == "environment":
+            continue
+        rule = rules[field]
+        options = domain_catalog["fields"][field]["options"]
+        if rule["mode"] == "fixed":
+            sampled_fields[field] = rule["value"]
+            continue
+        values = [
+            value
+            for value, option in options.items()
+            if "environments" not in option
+            or environment in option["environments"]
+        ]
+        sampled_fields[field] = _weighted_choice(values, options, rng)
+
+    element_options = domain_catalog["fields"]["elements"]["options"]
+    if element_rule["mode"] == "fixed":
+        elements = element_rule["values"]
+    else:
+        element_values = [
+            value
+            for value, option in element_options.items()
+            if "environments" not in option
+            or environment in option["environments"]
+        ]
+        count = rng.randint(1, min(3, len(element_values)))
+        elements = rng.sample(element_values, count)
+    scene = {
+        "version": "1.0",
+        "scene_id": f"{domain}-configured-{index:04d}",
+        "domain": domain,
+        **sampled_fields,
+        "elements": elements,
+        "custom": custom,
+    }
+    validate_scene(scene, catalog)
+    return scene
+
+
 def prepare_plan(
     request: dict[str, Any], root: Path
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -110,18 +256,33 @@ def prepare_plan(
     output_directory = Path(request["output_directory"]).resolve()
     plan = []
     requested_weather = scene_conditions.get("weather", "晴朗")
+    selections = scene_conditions.get("fields")
+    if selections is not None and not isinstance(selections, dict):
+        raise ValueError("scene.fields 必须是对象")
+    custom = scene_conditions.get("custom", "")
     for index in range(count):
         seed = start_seed + index
         rng = random.Random(seed)
-        scene = sample_scene(domain, catalog, rng, index + 1)
-        if requested_weather == "夜间":
-            scene["time_of_day"] = "night"
-            scene["weather"] = "clear"
+        if selections is not None:
+            scene = resolve_scene(
+                domain,
+                catalog,
+                rng,
+                index + 1,
+                selections,
+                custom,
+                validate_scene,
+            )
         else:
-            if requested_weather not in WEATHER_MAP:
-                raise ValueError(f"BaseGen 不支持天气条件: {requested_weather}")
-            scene["weather"] = WEATHER_MAP[requested_weather]
-        validate_scene(scene, catalog)
+            scene = sample_scene(domain, catalog, rng, index + 1)
+            if requested_weather == "夜间":
+                scene["time_of_day"] = "night"
+                scene["weather"] = "clear"
+            else:
+                if requested_weather not in WEATHER_MAP:
+                    raise ValueError(f"BaseGen 不支持天气条件: {requested_weather}")
+                scene["weather"] = WEATHER_MAP[requested_weather]
+            validate_scene(scene, catalog)
         prompt, template_id = compile_prompt(scene, catalog, rng)
         plan.append(
             {
@@ -137,6 +298,7 @@ def prepare_plan(
                 "height": height,
                 "steps": steps,
                 "guidance_scale": guidance_scale,
+                "selection_rules": selections,
             }
         )
     config = {

@@ -28,6 +28,19 @@ JSON_FIELDS = {
     "curves",
 }
 
+BASEGEN_FIELD_LABELS = {
+    "region": "中国区域",
+    "camera_height": "相机高度",
+    "viewpoint": "观察视角",
+    "field_of_view": "视场角",
+    "environment": "场景环境",
+    "time_of_day": "时间",
+    "weather": "天气",
+    "activity_level": "活动密度",
+    "elements": "关键元素",
+    "custom": "自定义描述",
+}
+
 
 def decode_row(row: dict[str, Any]) -> dict[str, Any]:
     output = dict(row)
@@ -70,6 +83,96 @@ class DatasetDeletionError(ValueError):
 
 class DatasetArtifactError(ValueError):
     pass
+
+
+class BaseGenCatalogError(ValueError):
+    pass
+
+
+def get_basegen_scene_schema() -> dict[str, Any]:
+    catalog_directory = settings.basegen_root / "configs" / "field_options"
+    filenames = (
+        "autonomous_driving.json",
+        "low_altitude_uav.json",
+        "offroad_autonomous_driving.json",
+    )
+    domains = []
+    for filename in filenames:
+        path = catalog_directory / filename
+        try:
+            catalog = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BaseGenCatalogError(f"无法读取 BaseGen 场景目录 {path}: {exc}") from exc
+        fields = []
+        for name, field in catalog.get("fields", {}).items():
+            options = field.get("options", {})
+            fields.append(
+                {
+                    "name": name,
+                    "label_zh": BASEGEN_FIELD_LABELS.get(name, name),
+                    "description_zh": field.get("description_zh", ""),
+                    "kind": "text" if name == "custom" else "multi" if name == "elements" else "single",
+                    "weighted": any("weight" in option for option in options.values()),
+                    "options": [
+                        {
+                            "value": value,
+                            "label_zh": option.get("label_zh", value),
+                            **(
+                                {"environments": option["environments"]}
+                                if "environments" in option
+                                else {}
+                            ),
+                        }
+                        for value, option in options.items()
+                    ],
+                }
+            )
+        domains.append(
+            {
+                "value": catalog["domain"],
+                "label_zh": catalog.get("label_zh", catalog["domain"]),
+                "default_resolution": (
+                    "1024×1024"
+                    if catalog["domain"] == "low-altitude-uav"
+                    else "1024×576"
+                ),
+                "fields": fields,
+            }
+        )
+    return {"version": "1.0", "domains": domains}
+
+
+def preview_basegen_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    from adapters.basegen_generator import prepare_plan
+
+    request = {
+        "protocol_version": "1.0",
+        "job_id": "preview",
+        "adapter_id": "adapter_basegen",
+        "seed": payload.get("seeds", [1001])[0],
+        "seeds": payload.get("seeds", [1001]),
+        "sample_count": min(int(payload.get("sample_count", 1)), 3),
+        "conditions": payload.get("conditions", {}),
+        "model_parameters": payload.get("model_parameters", {}),
+        "source_type": "GENERATIVE",
+        "output_directory": str(settings.task_dir / "preview"),
+    }
+    plan, config = prepare_plan(request, settings.basegen_root)
+    return {
+        "model_path": config["model_path"],
+        "device_policy": config["device_policy"],
+        "images": [
+            {
+                "seed": item["seed"],
+                "scene": item["scene"],
+                "template_id": item["template_id"],
+                "prompt": item["prompt"],
+                "width": item["width"],
+                "height": item["height"],
+            }
+            for item in plan
+        ],
+    }
 
 
 def list_dataset_samples(
