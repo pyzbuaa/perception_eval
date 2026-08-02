@@ -1,27 +1,40 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
 import pytest
+from fastapi import UploadFile
 from PIL import Image
 
+import app.main as main_module
 from adapters.basegen_generator import prepare_plan
+from adapters.dronedets_detector import category_mapping
+from app.command_protocol import CommandTemplateError, validate_command_arguments
 from app.config import ROOT_DIR, Settings
 from app.db import Database, json_dump, utc_now
+from app.detection_metrics import evaluate_coco_predictions
 from app.services import (
     DatasetAnnotationError,
     DatasetDeletionError,
+    LocalModelRegistrationError,
+    ModelDeletionError,
     complete_dataset_annotations,
     delete_dataset,
+    delete_model,
     get_annotation_session,
     get_basegen_scene_schema,
     get_sample_annotation,
     list_dataset_samples,
+    list_local_model_resources,
     preview_basegen_plan,
     query_results,
     queue_job,
+    register_local_detector_model,
     save_sample_annotation,
     update_annotation_schema,
 )
@@ -38,13 +51,379 @@ def make_database(tmp_path: Path) -> tuple[Database, Settings]:
 def test_database_seeds_traceable_demo_data(tmp_path: Path) -> None:
     database, _ = make_database(tmp_path)
     assert database.row("SELECT COUNT(*) AS n FROM datasets")["n"] == 3
-    assert database.row("SELECT COUNT(*) AS n FROM models")["n"] == 3
+    assert database.row("SELECT COUNT(*) AS n FROM models")["n"] == 4
     assert database.row("SELECT COUNT(*) AS n FROM results")["n"] == 27
     assert database.row("SELECT COUNT(*) AS n FROM results WHERE is_official=1")["n"] == 0
     adapter = database.row("SELECT * FROM adapters WHERE id='adapter_basegen'")
     assert adapter
     assert adapter["runtime_kind"] == "conda_external"
     assert adapter["requires_gpu"] == 1
+    detector = database.row(
+        "SELECT * FROM adapters WHERE id='adapter_dronedets_yolov8m'"
+    )
+    assert detector and detector["runtime_prefix"].endswith("DroneDets/.venv")
+    detector_model = database.row(
+        "SELECT weight_path FROM models "
+        "WHERE id='model_dronedets_yolov8m_visdrone'"
+    )
+    if detector_model["weight_path"]:
+        assert Path(detector_model["weight_path"]).suffix == ".pt"
+
+
+def test_model_metadata_migration_preserves_legacy_rows() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("CREATE TABLE models (id TEXT PRIMARY KEY)")
+    connection.execute("INSERT INTO models (id) VALUES ('legacy_model')")
+
+    Database._migrate_model_metadata(connection)
+
+    row = connection.execute(
+        "SELECT * FROM models WHERE id='legacy_model'"
+    ).fetchone()
+    assert row["architecture"] == "未记录"
+    assert row["detector_head"] == "未记录"
+    assert row["class_count"] == 0
+    assert row["training_dataset"] == "未记录"
+    assert row["pretrained_dataset"] == "未记录"
+    connection.close()
+
+
+def test_local_detector_model_registration_uses_bounded_resources(
+    tmp_path: Path,
+) -> None:
+    model_root = tmp_path / "models"
+    environment_root = tmp_path / "envs"
+    project = model_root / "custom-detector"
+    runtime = environment_root / "custom"
+    project.mkdir(parents=True)
+    (runtime / "bin").mkdir(parents=True)
+    (project / "platform_adapter.py").write_text(
+        "print('adapter')\n",
+        encoding="utf-8",
+    )
+    (project / "best.pt").write_bytes(b"test-model-weight")
+    (runtime / "bin" / "python").write_text("", encoding="utf-8")
+    (runtime / "bin" / "python").chmod(0o755)
+    app_settings = Settings(
+        root_dir=ROOT_DIR,
+        data_dir=tmp_path / "data",
+        model_library_root=model_root,
+        model_environment_root=environment_root,
+    )
+    database = Database(app_settings)
+    database.initialize()
+
+    listing = list_local_model_resources(
+        str(project),
+        "model",
+        "entrypoint",
+        app_settings,
+    )
+    assert listing["current"] == str(project)
+    assert [item["name"] for item in listing["entries"]] == [
+        "platform_adapter.py"
+    ]
+    with pytest.raises(LocalModelRegistrationError, match="允许范围"):
+        list_local_model_resources(
+            str(tmp_path),
+            "model",
+            "directory",
+            app_settings,
+        )
+
+    model = register_local_detector_model(
+        {
+            "name": "自定义检测模型",
+            "family": "Custom",
+            "architecture": "One-stage",
+            "backbone": "CustomNet",
+            "detector_head": "CustomHead",
+            "class_count": 6,
+            "training_dataset": "Custom Detection v1",
+            "pretrained_dataset": "ImageNet-1K",
+            "version": "v1",
+            "precision": "FP16",
+            "project_directory": str(project),
+            "working_directory": str(project),
+            "runtime_prefix": str(runtime),
+            "command_arguments": [
+                "platform_adapter.py",
+                "--weights",
+                "{weight_path}",
+                "--output",
+                "{predictions_path}",
+            ],
+            "weight_path": str(project / "best.pt"),
+        },
+        database,
+    )
+    assert model["weight_path"] == str(project / "best.pt")
+    assert model["weight_sha256"]
+    assert model["is_demo"] is False
+    assert model["architecture"] == "One-stage"
+    assert model["backbone"] == "CustomNet"
+    assert model["detector_head"] == "CustomHead"
+    assert model["class_count"] == 6
+    assert model["training_dataset"] == "Custom Detection v1"
+    assert model["pretrained_dataset"] == "ImageNet-1K"
+    adapter = database.row(
+        "SELECT * FROM adapters WHERE id=?", (model["adapter_id"],)
+    )
+    assert adapter["runtime_prefix"] == str(runtime)
+    assert adapter["entrypoint"] == str(runtime / "bin" / "python")
+    schema = json.loads(adapter["parameter_schema"])
+    assert schema["execution"]["mode"] == "command"
+    assert schema["execution"]["arguments"][-1] == "{predictions_path}"
+    with pytest.raises(CommandTemplateError, match="不支持的命令占位符"):
+        validate_command_arguments(["--output", "{unknown_path}"])
+    deleted = delete_model(model["id"], database)
+    assert deleted["deleted"] is True
+    assert deleted["adapter_deleted"] is True
+    assert deleted["files_deleted"] is False
+    assert (project / "best.pt").is_file()
+    assert database.row(
+        "SELECT id FROM models WHERE id=?", (model["id"],)
+    ) is None
+    assert database.row(
+        "SELECT id FROM adapters WHERE id=?", (model["adapter_id"],)
+    ) is None
+
+
+def test_model_deletion_rejects_historical_references(
+    tmp_path: Path,
+) -> None:
+    database, _ = make_database(tmp_path)
+    with pytest.raises(ModelDeletionError, match="历史运行"):
+        delete_model("model_yolov5s_demo", database)
+    assert database.row(
+        "SELECT id FROM models WHERE id='model_yolov5s_demo'"
+    )
+
+
+def test_structured_detector_command_only_requires_coco_predictions(
+    tmp_path: Path,
+) -> None:
+    model_root = tmp_path / "models"
+    project = model_root / "command-detector"
+    project.mkdir(parents=True)
+    script = project / "evaluate.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import argparse, json",
+                "from pathlib import Path",
+                "parser = argparse.ArgumentParser()",
+                "parser.add_argument('--annotation', required=True)",
+                "parser.add_argument('--output', required=True)",
+                "args = parser.parse_args()",
+                "ground_truth = json.loads(Path(args.annotation).read_text())",
+                "annotation = ground_truth['annotations'][0]",
+                "prediction = {",
+                "    'image_id': annotation['image_id'],",
+                "    'category_id': annotation['category_id'],",
+                "    'bbox': annotation['bbox'],",
+                "    'score': 0.99,",
+                "}",
+                "Path(args.output).write_text(json.dumps([prediction]))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    weight = project / "model.pt"
+    weight.write_bytes(b"command-model-weight")
+    runtime_prefix = Path(sys.executable).parent.parent
+    app_settings = Settings(
+        root_dir=ROOT_DIR,
+        data_dir=tmp_path / "data",
+        model_library_root=model_root,
+        model_environment_root=runtime_prefix.parent,
+    )
+    database = Database(app_settings)
+    database.initialize()
+    model = register_local_detector_model(
+        {
+            "name": "命令检测模型",
+            "family": "Command",
+            "architecture": "One-stage",
+            "backbone": "Test",
+            "detector_head": "TestHead",
+            "class_count": 1,
+            "training_dataset": "Test Detection",
+            "pretrained_dataset": "无",
+            "version": "v1",
+            "precision": "FP16",
+            "project_directory": str(project),
+            "working_directory": str(project),
+            "runtime_prefix": str(runtime_prefix),
+            "command_arguments": [
+                "evaluate.py",
+                "--annotation",
+                "{annotation_path}",
+                "--output",
+                "{predictions_path}",
+            ],
+            "weight_path": str(weight),
+        },
+        database,
+    )
+
+    dataset_directory = app_settings.artifact_dir / "command-dataset"
+    annotation_directory = dataset_directory / "annotations"
+    annotation_directory.mkdir(parents=True)
+    Image.new("RGB", (100, 80), (80, 120, 160)).save(
+        dataset_directory / "sample.png"
+    )
+    (annotation_directory / "instances.json").write_text(
+        json.dumps(
+            {
+                "info": {"description": "command detector"},
+                "images": [
+                    {
+                        "id": 1,
+                        "file_name": "sample.png",
+                        "width": 100,
+                        "height": 80,
+                    }
+                ],
+                "categories": [{"id": 1, "name": "car"}],
+                "annotations": [
+                    {
+                        "id": 1,
+                        "image_id": 1,
+                        "category_id": 1,
+                        "bbox": [10, 10, 30, 20],
+                        "area": 600,
+                        "iscrowd": 0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    database.execute(
+        """
+        INSERT INTO datasets
+        (id,name,version,source_type,scene_domain,weather,sensor_conditions,
+         resolution,sample_count,annotation_status,frozen,artifact_path,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "dataset_command_detector",
+            "命令检测数据集",
+            "v1",
+            "REAL",
+            "无人机航拍",
+            "晴朗",
+            "{}",
+            "100×80",
+            1,
+            "VERIFIED",
+            1,
+            "command-dataset",
+            utc_now(),
+        ),
+    )
+    database.execute(
+        """
+        INSERT INTO evaluation_plans
+        (id,name,dataset_ids,model_ids,seeds,blur_levels,protocol,created_at)
+        VALUES (?,?,?,?,?,?,?,?)
+        """,
+        (
+            "plan_command_detector",
+            "命令检测评测",
+            json_dump(["dataset_command_detector"]),
+            json_dump([model["id"]]),
+            json_dump([1001]),
+            json_dump([0]),
+            json_dump({"batch_size": 1, "precision": "FP16", "warmup": 0}),
+            utc_now(),
+        ),
+    )
+    job = queue_job(
+        "EVALUATION",
+        {"plan_id": "plan_command_detector"},
+        database,
+    )
+    assert JobAgent(database, app_settings).process_one()
+    completed = database.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
+    assert completed["status"] == "SUCCEEDED"
+    run = database.row(
+        """
+        SELECT runs.config,results.map,results.latency_p50
+        FROM runs JOIN results ON results.run_id=runs.id
+        WHERE runs.job_id=?
+        """,
+        (job["id"],),
+    )
+    assert run["map"] == pytest.approx(1)
+    assert run["latency_p50"] > 0
+    assert "未生成 result.json" in json.loads(run["config"])["warnings"][0]
+
+
+def test_dronedets_category_mapping_and_coco_metrics(tmp_path: Path) -> None:
+    categories = [
+        {"id": 1, "name": "car"},
+        {"id": 2, "name": "motorcycle"},
+    ]
+    assert category_mapping(categories) == {
+        "car": 1,
+        "motorcycle": 2,
+        "motor": 2,
+    }
+    annotation_path = tmp_path / "instances.json"
+    predictions_path = tmp_path / "predictions.json"
+    annotation_path.write_text(
+        json.dumps(
+            {
+                "info": {"description": "metric test"},
+                "images": [
+                    {"id": 1, "file_name": "sample.png", "width": 100, "height": 80}
+                ],
+                "categories": categories,
+                "annotations": [
+                    {
+                        "id": 1,
+                        "image_id": 1,
+                        "category_id": 1,
+                        "bbox": [10, 10, 30, 20],
+                        "area": 600,
+                        "iscrowd": 0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    predictions_path.write_text(
+        json.dumps(
+            [
+                {
+                    "image_id": 1,
+                    "category_id": 1,
+                    "bbox": [10, 10, 30, 20],
+                    "score": 0.99,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    metrics, curves = evaluate_coco_predictions(
+        annotation_path,
+        predictions_path,
+        {
+            "preprocess_ms": [1],
+            "inference_ms": [8],
+            "postprocess_ms": [1],
+            "peak_memory_mb": 1024,
+        },
+    )
+    assert metrics["map"] == pytest.approx(1)
+    assert metrics["map50"] == pytest.approx(1)
+    assert metrics["latency_p50"] == 10
+    assert metrics["fps"] == 100
+    assert len(curves["recall"]) == len(curves["precision"]) == 101
 
 
 def test_result_query_keeps_resolution_as_group_dimension(tmp_path: Path) -> None:
@@ -406,6 +785,59 @@ def test_dataset_samples_are_paginated_from_artifact_directory(
     assert list_dataset_samples("missing", 0, 48, database) is None
 
 
+def test_dataset_browser_auto_detects_visdrone_annotations(
+    tmp_path: Path,
+) -> None:
+    database, app_settings = make_database(tmp_path)
+    artifact = app_settings.artifact_dir / "imports" / "visdrone-browser"
+    label_directory = artifact / "annotations" / "yolo"
+    label_directory.mkdir(parents=True)
+    Image.new("RGB", (100, 80), (38, 120, 180)).save(
+        artifact / "sample.jpg"
+    )
+    (label_directory / "sample.txt").write_text(
+        "10,20,30,40,1,4,0,0\n",
+        encoding="utf-8",
+    )
+    database.execute(
+        """
+        INSERT INTO datasets
+        (id,name,version,source_type,scene_domain,weather,sensor_conditions,
+         resolution,sample_count,annotation_status,frozen,artifact_path,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "dataset_visdrone_browser",
+            "VisDrone浏览测试",
+            "v1",
+            "REAL",
+            "无人机航拍",
+            "晴朗",
+            "{}",
+            "100×80",
+            1,
+            "CANDIDATE",
+            0,
+            "imports/visdrone-browser",
+            utc_now(),
+        ),
+    )
+    page = list_dataset_samples(
+        "dataset_visdrone_browser", 0, 48, database
+    )
+    assert page
+    item = page["items"][0]
+    assert item["annotation_source"] == "VISDRONE"
+    assert item["boxes"][0] == {
+        "label": "car",
+        "color": "#EB2F96",
+        "x": pytest.approx(0.1),
+        "y": pytest.approx(0.25),
+        "width": pytest.approx(0.3),
+        "height": pytest.approx(0.5),
+    }
+
+
 def test_detection_annotations_persist_and_export_coco(tmp_path: Path) -> None:
     database, app_settings = make_database(tmp_path)
     artifact_directory = app_settings.artifact_dir / "imports" / "annotation-test"
@@ -471,6 +903,24 @@ def test_detection_annotations_persist_and_export_coco(tmp_path: Path) -> None:
     assert get_sample_annotation(
         "dataset_annotation_test", "first.png", database
     )["boxes"][0]["category_id"] == 1
+    browse_page = list_dataset_samples(
+        "dataset_annotation_test", 0, 48, database
+    )
+    assert browse_page
+    first_visualization = next(
+        item
+        for item in browse_page["items"]
+        if item["name"] == "first.png"
+    )
+    assert first_visualization["annotation_source"] == "MANUAL"
+    assert first_visualization["boxes"][0] == {
+        "label": "vehicle",
+        "color": "#1677FF",
+        "x": pytest.approx(10 / 64),
+        "y": pytest.approx(5 / 40),
+        "width": pytest.approx(20 / 64),
+        "height": pytest.approx(15 / 40),
+    }
     assert database.row(
         "SELECT annotation_status FROM datasets WHERE id='dataset_annotation_test'"
     )["annotation_status"] == "ANNOTATING"
@@ -587,6 +1037,156 @@ def test_evaluation_rejects_unfrozen_dataset(tmp_path: Path) -> None:
     assert "尚未冻结" in completed["error"]
 
 
+def test_real_detector_evaluation_converts_visdrone_annotations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, app_settings = make_database(tmp_path)
+    dataset_directory = app_settings.artifact_dir / "real-detector"
+    annotation_directory = dataset_directory / "annotations" / "yolo"
+    annotation_directory.mkdir(parents=True)
+    Image.new("RGB", (100, 80), (80, 120, 160)).save(
+        dataset_directory / "sample.png"
+    )
+    (annotation_directory / "sample.txt").write_text(
+        "10,10,30,20,1,4,0,0\n",
+        encoding="utf-8",
+    )
+    database.execute(
+        """
+        INSERT INTO datasets
+        (id,name,version,source_type,scene_domain,weather,sensor_conditions,
+         resolution,sample_count,annotation_status,frozen,artifact_path,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "dataset_real_detector",
+            "真实检测评测集",
+            "v1",
+            "REAL",
+            "无人机航拍",
+            "晴朗",
+            "{}",
+            "100×80",
+            1,
+            "CANDIDATE",
+            1,
+            "real-detector",
+            utc_now(),
+        ),
+    )
+    fake_weight = tmp_path / "best.pt"
+    fake_weight.write_bytes(b"test-only-weight")
+    database.execute(
+        """
+        UPDATE adapters SET runtime_kind='platform',runtime_prefix=NULL
+        WHERE id='adapter_dronedets_yolov8m'
+        """
+    )
+    database.execute(
+        """
+        UPDATE models SET weight_path=?,weight_sha256='test-sha',status='EXPERIMENTAL'
+        WHERE id='model_dronedets_yolov8m_visdrone'
+        """,
+        (str(fake_weight),),
+    )
+    database.execute(
+        """
+        INSERT INTO evaluation_plans
+        (id,name,dataset_ids,model_ids,seeds,blur_levels,protocol,created_at)
+        VALUES (?,?,?,?,?,?,?,?)
+        """,
+        (
+            "plan_real_detector",
+            "真实检测链路",
+            json_dump(["dataset_real_detector"]),
+            json_dump(["model_dronedets_yolov8m_visdrone"]),
+            json_dump([1001]),
+            json_dump([0]),
+            json_dump({"batch_size": 1, "precision": "FP16", "warmup": 0}),
+            utc_now(),
+        ),
+    )
+    job = queue_job("EVALUATION", {"plan_id": "plan_real_detector"}, database)
+    agent = JobAgent(database, app_settings)
+
+    def fake_adapter_process(
+        job_id: str,
+        command: list[str],
+        job_directory: Path,
+        environment: dict[str, str],
+    ) -> tuple[int, str]:
+        assert job_id == job["id"]
+        assert environment["DRONEDETS_ROOT"].endswith("DroneDets")
+        request_path = Path(command[command.index("--request") + 1])
+        result_path = Path(command[command.index("--result") + 1])
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        converted_annotation = Path(request["dataset"]["annotation_path"])
+        assert converted_annotation != (
+            dataset_directory / "annotations" / "instances.json"
+        )
+        converted = json.loads(
+            converted_annotation.read_text(encoding="utf-8")
+        )
+        assert converted["info"]["source_format"] == "VisDrone"
+        assert converted["annotations"][0]["category_id"] == 4
+        output_directory = Path(request["output_directory"])
+        output_directory.mkdir(parents=True, exist_ok=True)
+        (output_directory / "predictions.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "image_id": 1,
+                        "category_id": 4,
+                        "bbox": [10, 10, 30, 20],
+                        "score": 0.99,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        result_path.write_text(
+            json.dumps(
+                {
+                    "protocol_version": "1.0",
+                    "job_id": request["job_id"],
+                    "run_id": request["run_id"],
+                    "status": "succeeded",
+                    "predictions_path": "predictions.json",
+                    "image_count": 1,
+                    "runtime": {
+                        "preprocess_ms": [1],
+                        "inference_ms": [8],
+                        "postprocess_ms": [1],
+                        "peak_memory_mb": 512,
+                    },
+                    "environment": {"device": "test-gpu"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return 0, ""
+
+    monkeypatch.setattr(agent, "_run_adapter_process", fake_adapter_process)
+    assert agent.process_one()
+    completed = database.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
+    assert completed["status"] == "SUCCEEDED"
+    run = database.row(
+        """
+        SELECT runs.*,results.map,results.latency_p50,results.is_official
+        FROM runs JOIN results ON results.run_id=runs.id
+        WHERE runs.job_id=?
+        """,
+        (job["id"],),
+    )
+    assert run["model_id"] == "model_dronedets_yolov8m_visdrone"
+    assert run["map"] == pytest.approx(1)
+    assert run["latency_p50"] == 10
+    assert run["is_official"] == 0
+    assert json.loads(run["config"])["annotation_conversion"]["images"] == 1
+    assert not (dataset_directory / "annotations" / "instances.json").exists()
+
+
 def test_local_import_can_feed_real_condition_operator(tmp_path: Path) -> None:
     database, app_settings = make_database(tmp_path)
     source_directory = tmp_path / "source-images"
@@ -625,3 +1225,265 @@ def test_local_import_can_feed_real_condition_operator(tmp_path: Path) -> None:
     assert transformed["source_type"] == "REAL_TRANSFORMED"
     outputs = list((app_settings.artifact_dir / transformed["artifact_path"]).glob("*.png"))
     assert len(outputs) == 1
+
+
+def test_resource_picker_upload_imports_and_cleans_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, app_settings = make_database(tmp_path)
+    image_bytes = io.BytesIO()
+    Image.new("RGB", (64, 40), (30, 110, 170)).save(
+        image_bytes,
+        format="PNG",
+    )
+    image_bytes.seek(0)
+    annotation_bytes = io.BytesIO(
+        json.dumps(
+            {
+                "images": [
+                    {
+                        "id": 1,
+                        "file_name": "sample.png",
+                        "width": 64,
+                        "height": 40,
+                    }
+                ],
+                "annotations": [
+                    {
+                        "id": 1,
+                        "image_id": 1,
+                        "category_id": 1,
+                        "bbox": [8, 6, 20, 10],
+                        "area": 200,
+                        "iscrowd": 0,
+                    }
+                ],
+                "categories": [{"id": 1, "name": "car"}],
+            }
+        ).encode()
+    )
+    captured: dict[str, object] = {}
+
+    def capture_job(job_type: str, payload: dict[str, object]) -> dict[str, str]:
+        captured["job_type"] = job_type
+        captured["payload"] = payload
+        return {"id": "job_upload_capture", "status": "QUEUED"}
+
+    monkeypatch.setattr(main_module, "settings", app_settings)
+    monkeypatch.setattr(main_module, "queue_job", capture_job)
+    response = main_module._stage_import_upload(
+        name="资源管理器导入",
+        scene_domain="无人机航拍",
+        annotation_format="COCO",
+        images=[UploadFile(image_bytes, filename="sample.png")],
+        relative_paths=["selected-folder/nested/sample.png"],
+        annotation=UploadFile(annotation_bytes, filename="instances.json"),
+        annotation_files=[],
+        annotation_relative_paths=[],
+    )
+    assert response["status"] == "QUEUED"
+    assert captured["job_type"] == "DATASET_IMPORT"
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    staging_root = Path(str(payload["staged_upload_root"]))
+    assert (staging_root / "images/selected-folder/nested/sample.png").is_file()
+
+    job = queue_job("DATASET_IMPORT", payload, database)
+    assert JobAgent(database, app_settings).process_one()
+    completed = database.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
+    assert completed["status"] == "SUCCEEDED"
+    dataset = database.row(
+        "SELECT * FROM datasets WHERE name='资源管理器导入'"
+    )
+    assert dataset
+    artifact = app_settings.artifact_dir / dataset["artifact_path"]
+    assert len(list(artifact.glob("*.png"))) == 1
+    assert (artifact / "annotations/instances.json").is_file()
+    page = list_dataset_samples(dataset["id"], 0, 48, database)
+    assert page
+    assert page["items"][0]["annotation_source"] == "COCO"
+    assert page["items"][0]["boxes"][0]["label"] == "car"
+    assert page["items"][0]["boxes"][0]["x"] == pytest.approx(8 / 64)
+    assert not staging_root.exists()
+
+
+def test_upload_endpoint_uses_raised_multipart_file_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, int] = {}
+    file_count = 1001
+    upload = UploadFile(io.BytesIO(b"x"), filename="sample.png")
+
+    class FakeForm:
+        fields = {
+            "name": "大目录上传",
+            "scene_domain": "无人机航拍",
+            "relative_paths_json": json.dumps(
+                [f"images/{index}.png" for index in range(file_count)]
+            ),
+            "annotation_relative_paths_json": "[]",
+        }
+
+        def get(self, name: str) -> object | None:
+            return self.fields.get(name)
+
+        def getlist(self, name: str) -> list[UploadFile]:
+            return [upload] * file_count if name == "images" else []
+
+    class FakeRequest:
+        async def form(self, **limits: int) -> FakeForm:
+            captured.update(limits)
+            return FakeForm()
+
+    def capture_upload(**values: object) -> dict[str, str]:
+        captured["images"] = len(values["images"])  # type: ignore[arg-type]
+        captured["paths"] = len(values["relative_paths"])  # type: ignore[arg-type]
+        return {"id": "job_large_upload", "status": "QUEUED"}
+
+    monkeypatch.setattr(main_module, "_stage_import_upload", capture_upload)
+    response = asyncio.run(
+        main_module.import_uploaded_dataset(FakeRequest())  # type: ignore[arg-type]
+    )
+    assert response["status"] == "QUEUED"
+    assert captured == {
+        "max_files": 20001,
+        "max_fields": 20,
+        "max_part_size": 2 * 1024 * 1024,
+        "images": file_count,
+        "paths": file_count,
+    }
+
+
+def test_yolo_annotation_directory_imports_every_label_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database, app_settings = make_database(tmp_path)
+
+    def image_upload(name: str, color: tuple[int, int, int]) -> UploadFile:
+        content = io.BytesIO()
+        Image.new("RGB", (64, 40), color).save(content, format="PNG")
+        content.seek(0)
+        return UploadFile(content, filename=name)
+
+    captured: dict[str, object] = {}
+
+    def capture_job(job_type: str, payload: dict[str, object]) -> dict[str, str]:
+        captured["job_type"] = job_type
+        captured["payload"] = payload
+        return {"id": "job_yolo_capture", "status": "QUEUED"}
+
+    monkeypatch.setattr(main_module, "settings", app_settings)
+    monkeypatch.setattr(main_module, "queue_job", capture_job)
+    response = main_module._stage_import_upload(
+        name="YOLO目录导入",
+        scene_domain="无人机航拍",
+        annotation_format="YOLO",
+        images=[
+            image_upload("first.png", (30, 110, 170)),
+            image_upload("second.png", (90, 60, 130)),
+        ],
+        relative_paths=[
+            "images/first.png",
+            "images/second.png",
+        ],
+        annotation=None,
+        annotation_files=[
+            UploadFile(io.BytesIO(b"0 0.5 0.5 0.2 0.2\n"), filename="first.txt"),
+            UploadFile(io.BytesIO(b"1 0.4 0.4 0.1 0.1\n"), filename="second.txt"),
+        ],
+        annotation_relative_paths=[
+            "labels/first.txt",
+            "labels/nested/second.txt",
+        ],
+    )
+    assert response["status"] == "QUEUED"
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    staging_root = Path(str(payload["staged_upload_root"]))
+    annotation_root = Path(str(payload["annotation_path"]))
+    assert len(list(annotation_root.rglob("*.txt"))) == 2
+
+    job = queue_job("DATASET_IMPORT", payload, database)
+    assert JobAgent(database, app_settings).process_one()
+    completed = database.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
+    assert completed["status"] == "SUCCEEDED"
+    result = json.loads(completed["result"])
+    assert result["annotation_files"] == 2
+    dataset = database.row("SELECT * FROM datasets WHERE name='YOLO目录导入'")
+    assert dataset and dataset["annotation_status"] == "CANDIDATE"
+    artifact = app_settings.artifact_dir / dataset["artifact_path"]
+    assert (artifact / "first.png").is_file()
+    assert (artifact / "second.png").is_file()
+    assert (
+        artifact / "annotations/yolo/labels/first.txt"
+    ).is_file()
+    assert (
+        artifact / "annotations/yolo/labels/nested/second.txt"
+    ).is_file()
+    page = list_dataset_samples(dataset["id"], 0, 48, database)
+    assert page
+    assert [item["annotation_source"] for item in page["items"]] == [
+        "YOLO",
+        "YOLO",
+    ]
+    assert page["items"][0]["boxes"][0] == {
+        "label": "class 0",
+        "color": "#1677FF",
+        "x": pytest.approx(0.4),
+        "y": pytest.approx(0.4),
+        "width": pytest.approx(0.2),
+        "height": pytest.approx(0.2),
+    }
+    assert not staging_root.exists()
+
+
+def test_visdrone_import_creates_committed_coco_annotations(
+    tmp_path: Path,
+) -> None:
+    database, app_settings = make_database(tmp_path)
+    image_directory = tmp_path / "visdrone-images"
+    label_directory = tmp_path / "visdrone-annotations"
+    image_directory.mkdir()
+    label_directory.mkdir()
+    Image.new("RGB", (100, 80), (30, 110, 170)).save(
+        image_directory / "sample.jpg"
+    )
+    (label_directory / "sample.txt").write_text(
+        "\n".join(
+            [
+                "10,20,30,40,1,4,0,0",
+                "1,2,3,4,0,0,0,0",
+                "5,6,7,8,1,11,0,0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    job = queue_job(
+        "DATASET_IMPORT",
+        {
+            "name": "VisDrone目录导入",
+            "directory": str(image_directory),
+            "annotation_path": str(label_directory),
+            "annotation_format": "VISDRONE",
+            "scene_domain": "无人机航拍",
+        },
+        database,
+    )
+    assert JobAgent(database, app_settings).process_one()
+    completed = database.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
+    assert completed["status"] == "SUCCEEDED"
+    dataset = database.row(
+        "SELECT * FROM datasets WHERE name='VisDrone目录导入'"
+    )
+    artifact = app_settings.artifact_dir / dataset["artifact_path"]
+    coco = json.loads(
+        (artifact / "annotations" / "instances.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert coco["info"]["source_format"] == "VisDrone"
+    assert len(coco["images"]) == 1
+    assert [item["category_id"] for item in coco["annotations"]] == [4]
+    assert len(coco["categories"]) == 10

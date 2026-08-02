@@ -10,6 +10,7 @@ const statusColors: Record<string, string> = {
   READY: 'success',
   BENCHMARK_READY: 'success',
   RUNNING: 'processing',
+  CHECKING: 'processing',
   QUEUED: 'default',
   CONTRACT_OK: 'cyan',
   EXPERIMENTAL: 'warning',
@@ -24,7 +25,7 @@ const statusColors: Record<string, string> = {
 }
 
 const statusLabels: Record<string, string> = {
-  SUCCEEDED: '已完成', RUNNING: '运行中', QUEUED: '排队中', FAILED: '失败', CANCELLED: '已取消',
+  SUCCEEDED: '已完成', RUNNING: '运行中', CHECKING: '检查中', QUEUED: '排队中', FAILED: '失败', CANCELLED: '已取消',
   HEALTHY: '健康', UNAVAILABLE: '不可用', READY: '正式可用', BENCHMARK_READY: '可正式评测',
   CONTRACT_OK: '接口已通过', EXPERIMENTAL: '实验性', REGISTERED: '已注册', VERIFIED: '真值已验证',
   ANNOTATING: '标注中', CANDIDATE: '候选真值', UNLABELED: '未标注',

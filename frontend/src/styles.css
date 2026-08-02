@@ -51,9 +51,20 @@ body { overflow-x: auto; }
 .dataset-browser { height: calc(100vh - 112px); overflow-y: auto; padding: 4px 10px 24px 0; }
 .dataset-browser > .ant-alert { margin-bottom: 14px; }
 .dataset-browser-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
-.dataset-browser-grid .ant-image { display: block; width: 100%; border-radius: 8px; overflow: hidden; background: #172033; }
-.dataset-browser-grid .ant-image-img { display: block; width: 100%; height: 160px; object-fit: cover; }
+.dataset-browser-sample { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-bg); }
+.dataset-browser-image { position: relative; width: 100%; min-height: 120px; overflow: hidden; background: #172033; }
+.dataset-browser-image .ant-image { display: block; width: 100%; height: 100%; }
+.dataset-browser-image .ant-image-img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.dataset-browser-boxes { position: absolute; z-index: 2; inset: 0; pointer-events: none; }
+.dataset-browser-box { position: absolute; min-width: 2px; min-height: 2px; border: 2px solid; box-shadow: 0 0 0 1px rgba(0, 0, 0, .42); }
+.dataset-browser-box span { position: absolute; top: 0; left: 0; max-width: 130px; padding: 1px 4px; overflow: hidden; color: #fff; font-size: 10px; line-height: 16px; text-overflow: ellipsis; white-space: nowrap; text-shadow: 0 1px 2px rgba(0, 0, 0, .55); }
+.dataset-browser-caption { min-height: 44px; padding: 7px 9px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.dataset-browser-caption > .ant-typography { min-width: 0; margin: 0; }
+.dataset-browser-caption .ant-tag { flex: none; margin: 0; }
+.dataset-browser-preview-image { position: relative; display: inline-flex; max-width: 90vw; max-height: 82vh; overflow: hidden; line-height: 0; transform-origin: center center; transition: transform .3s cubic-bezier(0, 0, .25, 1); }
+.dataset-browser-preview-image > .ant-image-preview-img { display: block; width: auto; height: auto; max-width: 90vw; max-height: 82vh; object-fit: contain; }
 .dataset-browser-loading { min-height: 80px; display: flex; align-items: center; justify-content: center; gap: 10px; }
+.dataset-browser-load-more { min-height: 84px; display: flex; align-items: center; justify-content: center; }
 .dataset-browser-end { padding: 24px 0 6px; text-align: center; color: var(--muted); }
 
 .annotation-loading { min-height: 55vh; display: flex; align-items: center; justify-content: center; gap: 12px; }
@@ -99,6 +110,8 @@ body { overflow-x: auto; }
 .source-icon { width: 46px; height: 46px; border-radius: 12px; display: grid; place-items: center; color: #fff; font-size: 21px; background: linear-gradient(135deg, #1677ff, #22b8cf); margin-bottom: 18px; }
 .source-card h4 { margin: 8px 0 6px !important; }
 .source-card .ant-typography-secondary { margin-top: 14px; line-height: 1.65; }
+.native-resource-picker { box-sizing: border-box; width: 100%; min-height: 40px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: var(--panel-bg); cursor: pointer; }
+.native-resource-picker::file-selector-button { margin-right: 12px; padding: 5px 12px; border: 1px solid #1677ff; border-radius: 5px; color: #1677ff; background: var(--accent-soft); cursor: pointer; }
 .wizard-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
 .inline-alert, .top-gap { margin-top: 18px; }
 .job-progress-card { border-left: 4px solid #1677ff !important; }

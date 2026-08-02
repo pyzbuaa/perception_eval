@@ -42,7 +42,21 @@ export interface DatasetSamplePage {
   offset: number
   limit: number
   has_more: boolean
-  items: Array<{ name: string; url: string }>
+  items: Array<{
+    name: string
+    url: string
+    width: number
+    height: number
+    annotation_source: 'MANUAL' | 'COCO' | 'YOLO' | 'VISDRONE' | null
+    boxes: Array<{
+      label: string
+      color: string
+      x: number
+      y: number
+      width: number
+      height: number
+    }>
+  }>
 }
 
 export interface AnnotationCategory {
@@ -86,10 +100,17 @@ export interface ModelVersion {
   id: string
   name: string
   family: string
+  architecture: string
   backbone: string
+  detector_head: string
+  class_count: number
+  training_dataset: string
+  pretrained_dataset: string
   version: string
   precision: string
   adapter_id: string
+  weight_path?: string
+  weight_sha256?: string
   is_demo: boolean
   status: string
 }
@@ -149,6 +170,7 @@ export interface ResultGroup {
   sensor_conditions: Record<string, unknown>
   source_type: string
   is_demo: boolean
+  is_official: boolean
   map_mean: number
   map_std: number
   latency_mean: number

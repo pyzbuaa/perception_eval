@@ -18,6 +18,27 @@ class Settings:
     basegen_conda_prefix: Path = Path(
         os.environ.get("BASEGEN_CONDA_PREFIX", "/home/yons/miniforge3/envs/gen")
     )
+    dronedets_root: Path = Path(
+        os.environ.get("DRONEDETS_ROOT", ROOT_DIR.parent / "DroneDets")
+    )
+    dronedets_runtime_prefix: Path = Path(
+        os.environ.get(
+            "DRONEDETS_RUNTIME_PREFIX",
+            ROOT_DIR.parent / "DroneDets" / ".venv",
+        )
+    )
+    model_library_root: Path = Path(
+        os.environ.get(
+            "PERCEPTION_EVAL_MODEL_LIBRARY_ROOT",
+            ROOT_DIR.parent,
+        )
+    )
+    model_environment_root: Path = Path(
+        os.environ.get(
+            "PERCEPTION_EVAL_MODEL_ENVIRONMENT_ROOT",
+            "/home/yons/miniforge3/envs",
+        )
+    )
     adapter_timeout_seconds: int = int(
         os.environ.get("PERCEPTION_EVAL_ADAPTER_TIMEOUT_SECONDS", "7200")
     )

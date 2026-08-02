@@ -12,8 +12,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from PIL import Image
+
+from app.command_protocol import CommandTemplateError, validate_command_arguments
 from app.config import settings
-from app.db import Database, db, json_dump, json_load, new_id, utc_now
+from app.db import (
+    Database,
+    cached_file_sha256,
+    db,
+    json_dump,
+    json_load,
+    new_id,
+    utc_now,
+)
 
 
 JSON_FIELDS = {
@@ -100,6 +111,243 @@ class BaseGenCatalogError(ValueError):
 
 class DatasetAnnotationError(ValueError):
     pass
+
+
+class LocalModelRegistrationError(ValueError):
+    pass
+
+
+class ModelDeletionError(ValueError):
+    pass
+
+
+LOCAL_WEIGHT_SUFFIXES = {
+    ".bin",
+    ".ckpt",
+    ".engine",
+    ".jit",
+    ".onnx",
+    ".plan",
+    ".pt",
+    ".pth",
+    ".safetensors",
+    ".torchscript",
+}
+
+
+def list_local_model_resources(
+    path: str | None,
+    scope: str,
+    kind: str,
+    app_settings=None,
+) -> dict[str, Any]:
+    app_settings = app_settings or settings
+    roots = {
+        "model": app_settings.model_library_root,
+        "environment": app_settings.model_environment_root,
+    }
+    root_value = roots.get(scope)
+    if root_value is None:
+        raise LocalModelRegistrationError(f"不支持的资源范围: {scope}")
+    if kind not in {"directory", "entrypoint", "weight"}:
+        raise LocalModelRegistrationError(f"不支持的资源类型: {kind}")
+    root = root_value.expanduser().resolve()
+    if not root.is_dir():
+        raise LocalModelRegistrationError(f"资源根目录不存在: {root}")
+    current = Path(path).expanduser().resolve() if path else root
+    if not current.is_relative_to(root) or not current.is_dir():
+        raise LocalModelRegistrationError(f"目录超出允许范围: {current}")
+
+    entries = []
+    for child in sorted(
+        current.iterdir(),
+        key=lambda item: (not item.is_dir(), item.name.casefold()),
+    ):
+        try:
+            resolved = child.resolve()
+        except OSError:
+            continue
+        if not resolved.is_relative_to(root):
+            continue
+        if child.is_dir():
+            entries.append(
+                {
+                    "name": child.name,
+                    "path": str(child),
+                    "is_directory": True,
+                }
+            )
+            continue
+        if kind == "entrypoint" and child.suffix.lower() != ".py":
+            continue
+        if kind == "weight" and child.suffix.lower() not in LOCAL_WEIGHT_SUFFIXES:
+            continue
+        if kind != "directory" and child.is_file():
+            entries.append(
+                {
+                    "name": child.name,
+                    "path": str(child),
+                    "is_directory": False,
+                }
+            )
+    return {
+        "scope": scope,
+        "kind": kind,
+        "root": str(root),
+        "current": str(current),
+        "parent": str(current.parent) if current != root else None,
+        "entries": entries,
+    }
+
+
+def register_local_detector_model(
+    values: dict[str, Any],
+    database: Database = db,
+) -> dict[str, Any]:
+    app_settings = database.settings
+    model_root = app_settings.model_library_root.expanduser().resolve()
+    environment_root = (
+        app_settings.model_environment_root.expanduser().resolve()
+    )
+    project_directory = Path(values["project_directory"]).expanduser().resolve()
+    if (
+        not project_directory.is_relative_to(model_root)
+        or not project_directory.is_dir()
+    ):
+        raise LocalModelRegistrationError(
+            f"模型目录必须位于 {model_root} 内"
+        )
+
+    def project_path(value: str) -> Path:
+        path = Path(value).expanduser()
+        return (
+            path.resolve()
+            if path.is_absolute()
+            else (project_directory / path).resolve()
+        )
+
+    working_directory = project_path(values["working_directory"])
+    if (
+        not working_directory.is_relative_to(project_directory)
+        or not working_directory.is_dir()
+    ):
+        raise LocalModelRegistrationError(
+            "命令工作目录必须位于模型项目目录内"
+        )
+
+    weight_path = project_path(values["weight_path"])
+    if (
+        not weight_path.is_relative_to(model_root)
+        or not weight_path.is_file()
+        or weight_path.suffix.lower() not in LOCAL_WEIGHT_SUFFIXES
+    ):
+        raise LocalModelRegistrationError(
+            "权重必须是模型库根目录内受支持的模型文件"
+        )
+
+    runtime_prefix = project_path(values["runtime_prefix"])
+    if not (
+        runtime_prefix.is_relative_to(project_directory)
+        or runtime_prefix.is_relative_to(environment_root)
+    ):
+        raise LocalModelRegistrationError(
+            "Python 环境必须位于模型目录或允许的环境根目录内"
+        )
+    runtime_python = runtime_prefix / "bin" / "python"
+    if not runtime_python.is_file():
+        raise LocalModelRegistrationError(
+            f"Python 解释器不存在: {runtime_python}"
+        )
+
+    executable = runtime_python
+    if not os.access(executable, os.X_OK):
+        raise LocalModelRegistrationError(f"Python 解释器没有执行权限: {executable}")
+    try:
+        validate_command_arguments(values["command_arguments"])
+    except CommandTemplateError as exc:
+        raise LocalModelRegistrationError(str(exc)) from exc
+
+    adapter_id = new_id("adapter")
+    model_id = new_id("model")
+    now = utc_now()
+    parameter_schema = {
+        "type": "object",
+        "properties": {
+            "catalog_model_id": {
+                "type": "string",
+                "const": model_id,
+            },
+            "project_directory": {
+                "type": "string",
+                "const": str(project_directory),
+            },
+        },
+        "execution": {
+            "mode": "command",
+            "working_directory": str(working_directory),
+            "executable": str(executable),
+            "arguments": values["command_arguments"],
+            "predictions_filename": "predictions.json",
+        },
+    }
+    with database.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO adapters
+            (id,name,kind,version,maturity,runtime_kind,runtime_prefix,policy,
+             entrypoint,requires_gpu,status,description,parameter_schema,
+             created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                adapter_id,
+                f"{values['name']} 推理适配器",
+                "DETECTOR",
+                values["version"],
+                "REGISTERED",
+                "conda_external",
+                str(runtime_prefix),
+                "read_only",
+                str(executable),
+                1,
+                "REGISTERED",
+                "本地模型库提供的目标检测评测协议入口。",
+                json_dump(parameter_schema),
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO models
+            (id,name,family,architecture,backbone,detector_head,class_count,
+             training_dataset,pretrained_dataset,version,precision,adapter_id,
+             weight_path,weight_sha256,is_demo,status,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                model_id,
+                values["name"],
+                values["family"],
+                values["architecture"],
+                values["backbone"],
+                values["detector_head"],
+                values["class_count"],
+                values["training_dataset"],
+                values["pretrained_dataset"],
+                values["version"],
+                values["precision"],
+                adapter_id,
+                str(weight_path),
+                cached_file_sha256(str(weight_path)),
+                0,
+                "REGISTERED",
+                now,
+            ),
+        )
+    return next(
+        item for item in list_models(database) if item["id"] == model_id
+    )
 
 
 def get_basegen_scene_schema() -> dict[str, Any]:
@@ -212,6 +460,12 @@ def list_dataset_samples(
                 and path.suffix.lower() in {".svg", ".png", ".jpg", ".jpeg", ".webp"}
             ]
     page = files[offset : offset + limit]
+    visualizations = _sample_visualizations(
+        dataset_id,
+        directory if artifact_path else None,
+        page,
+        database,
+    )
     return {
         "dataset_id": dataset_id,
         "dataset_name": dataset["name"],
@@ -224,10 +478,284 @@ def list_dataset_samples(
             {
                 "name": path.name,
                 "url": f"/artifacts/{quote(path.resolve().relative_to(database.settings.artifact_dir.resolve()).as_posix(), safe='/')}",
+                **visualizations.get(
+                    path.name,
+                    {
+                        "width": 0,
+                        "height": 0,
+                        "boxes": [],
+                        "annotation_source": None,
+                    },
+                ),
             }
             for path in page
         ],
     }
+
+
+def _sample_visualizations(
+    dataset_id: str,
+    directory: Path | None,
+    files: list[Path],
+    database: Database,
+) -> dict[str, dict[str, Any]]:
+    if not files:
+        return {}
+    colors = [
+        "#1677FF",
+        "#13A8A8",
+        "#722ED1",
+        "#EB2F96",
+        "#52C41A",
+        "#FA8C16",
+        "#F5222D",
+        "#2F54EB",
+    ]
+    dimensions: dict[str, tuple[int, int]] = {}
+    output: dict[str, dict[str, Any]] = {}
+    names = {path.name for path in files}
+    for path in files:
+        try:
+            with Image.open(path) as image:
+                dimensions[path.name] = (image.width, image.height)
+        except OSError:
+            dimensions[path.name] = (0, 0)
+
+    categories = {
+        int(category["id"]): {
+            "name": str(category["name"]),
+            "color": str(
+                category.get(
+                    "color",
+                    colors[(int(category["id"]) - 1) % len(colors)],
+                )
+            ),
+        }
+        for category in _annotation_categories(dataset_id, database)
+    }
+    manual_rows = database.rows(
+        """
+        SELECT sample_name,width,height,boxes FROM sample_annotations
+        WHERE dataset_id=?
+        """,
+        (dataset_id,),
+    )
+    for row in manual_rows:
+        if row["sample_name"] not in names:
+            continue
+        width = int(row["width"])
+        height = int(row["height"])
+        boxes = []
+        if width > 0 and height > 0:
+            for box in json_load(row["boxes"], []):
+                category_id = int(box["category_id"])
+                category = categories.get(
+                    category_id,
+                    {
+                        "name": f"class {category_id}",
+                        "color": colors[category_id % len(colors)],
+                    },
+                )
+                boxes.append(
+                    {
+                        "label": category["name"],
+                        "color": category["color"],
+                        "x": float(box["x"]) / width,
+                        "y": float(box["y"]) / height,
+                        "width": float(box["width"]) / width,
+                        "height": float(box["height"]) / height,
+                    }
+                )
+        dimensions[row["sample_name"]] = (width, height)
+        output[row["sample_name"]] = {
+            "width": width,
+            "height": height,
+            "boxes": boxes,
+            "annotation_source": "MANUAL",
+        }
+
+    coco_path = directory / "annotations" / "instances.json" if directory else None
+    if coco_path and coco_path.is_file():
+        try:
+            coco = json.loads(coco_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            coco = {}
+        coco_categories = {
+            int(category["id"]): {
+                "name": str(category["name"]),
+                "color": colors[
+                    (int(category["id"]) - 1) % len(colors)
+                ],
+            }
+            for category in coco.get("categories", [])
+        }
+        images_by_id = {
+            int(image["id"]): image
+            for image in coco.get("images", [])
+            if Path(str(image.get("file_name", ""))).name in names
+        }
+        annotations_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for annotation in coco.get("annotations", []):
+            annotations_by_image[int(annotation["image_id"])].append(annotation)
+        for image_id, image in images_by_id.items():
+            name = Path(str(image["file_name"])).name
+            if name in output:
+                continue
+            width = int(image.get("width") or dimensions.get(name, (0, 0))[0])
+            height = int(image.get("height") or dimensions.get(name, (0, 0))[1])
+            boxes = []
+            if width > 0 and height > 0:
+                for annotation in annotations_by_image.get(image_id, []):
+                    bbox = annotation.get("bbox", [])
+                    if len(bbox) != 4:
+                        continue
+                    category_id = int(annotation["category_id"])
+                    category = coco_categories.get(
+                        category_id,
+                        {
+                            "name": f"class {category_id}",
+                            "color": colors[category_id % len(colors)],
+                        },
+                    )
+                    x, y, box_width, box_height = (
+                        float(value) for value in bbox
+                    )
+                    boxes.append(
+                        {
+                            "label": category["name"],
+                            "color": category["color"],
+                            "x": x / width,
+                            "y": y / height,
+                            "width": box_width / width,
+                            "height": box_height / height,
+                        }
+                    )
+            dimensions[name] = (width, height)
+            output[name] = {
+                "width": width,
+                "height": height,
+                "boxes": boxes,
+                "annotation_source": "COCO",
+            }
+
+    label_roots = (
+        [
+            ("VISDRONE", directory / "annotations" / "visdrone"),
+            ("YOLO", directory / "annotations" / "yolo"),
+        ]
+        if directory
+        else []
+    )
+    label_files: dict[str, tuple[Path, str]] = {}
+    for source, root in label_roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*.txt")):
+            label_files.setdefault(path.stem, (path, source))
+    if label_files:
+        visdrone_categories = {
+            0: "ignored region",
+            1: "pedestrian",
+            2: "people",
+            3: "bicycle",
+            4: "car",
+            5: "van",
+            6: "truck",
+            7: "tricycle",
+            8: "awning-tricycle",
+            9: "bus",
+            10: "motor",
+            11: "others",
+        }
+        for path in files:
+            if path.name in output:
+                continue
+            label_entry = label_files.get(path.stem)
+            if not label_entry:
+                continue
+            label_path, configured_source = label_entry
+            lines = [
+                line.strip()
+                for line in label_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+                if line.strip()
+            ]
+            source = configured_source
+            if lines:
+                fields = lines[0].split(",")
+                if len(fields) >= 8:
+                    source = "VISDRONE"
+            boxes = []
+            width, height = dimensions.get(path.name, (0, 0))
+            for line in lines:
+                if source == "VISDRONE":
+                    fields = line.split(",")
+                    if len(fields) < 8 or width <= 0 or height <= 0:
+                        continue
+                    try:
+                        x, y, box_width, box_height = (
+                            float(value) for value in fields[:4]
+                        )
+                        category_id = int(float(fields[5]))
+                    except ValueError:
+                        continue
+                    boxes.append(
+                        {
+                            "label": visdrone_categories.get(
+                                category_id, f"class {category_id}"
+                            ),
+                            "color": (
+                                "#8C8C8C"
+                                if category_id == 0
+                                else colors[
+                                    (category_id - 1) % len(colors)
+                                ]
+                            ),
+                            "x": x / width,
+                            "y": y / height,
+                            "width": box_width / width,
+                            "height": box_height / height,
+                        }
+                    )
+                    continue
+                fields = line.split()
+                if len(fields) < 5:
+                    continue
+                try:
+                    category_id = int(float(fields[0]))
+                    center_x, center_y, box_width, box_height = (
+                        float(value) for value in fields[1:5]
+                    )
+                except ValueError:
+                    continue
+                boxes.append(
+                    {
+                        "label": f"class {category_id}",
+                        "color": colors[category_id % len(colors)],
+                        "x": center_x - box_width / 2,
+                        "y": center_y - box_height / 2,
+                        "width": box_width,
+                        "height": box_height,
+                    }
+                )
+            output[path.name] = {
+                "width": width,
+                "height": height,
+                "boxes": boxes,
+                "annotation_source": source,
+            }
+
+    for path in files:
+        if path.name not in output:
+            width, height = dimensions.get(path.name, (0, 0))
+            output[path.name] = {
+                "width": width,
+                "height": height,
+                "boxes": [],
+                "annotation_source": None,
+            }
+    return output
 
 
 def _dataset_images(
@@ -651,6 +1179,69 @@ def list_models(database: Database = db) -> list[dict[str, Any]]:
     return [decode_row(row) for row in database.rows("SELECT * FROM models ORDER BY created_at DESC")]
 
 
+def delete_model(
+    model_id: str,
+    database: Database = db,
+) -> dict[str, Any] | None:
+    with database.connect() as connection:
+        model = connection.execute(
+            "SELECT * FROM models WHERE id=?",
+            (model_id,),
+        ).fetchone()
+        if not model:
+            return None
+        run_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM runs WHERE model_id=?",
+                (model_id,),
+            ).fetchone()[0]
+        )
+        plan_references = []
+        for plan in connection.execute(
+            "SELECT id,name,model_ids FROM evaluation_plans"
+        ).fetchall():
+            if model_id in json_load(plan["model_ids"], []):
+                plan_references.append(plan["id"])
+        if run_count or plan_references:
+            details = []
+            if run_count:
+                details.append(f"{run_count} 次历史运行")
+            if plan_references:
+                details.append(f"{len(plan_references)} 个评测方案")
+            raise ModelDeletionError(
+                f"模型仍被{'、'.join(details)}引用，不能删除"
+            )
+
+        adapter_id = model["adapter_id"]
+        connection.execute("DELETE FROM models WHERE id=?", (model_id,))
+        adapter = connection.execute(
+            "SELECT description FROM adapters WHERE id=?",
+            (adapter_id,),
+        ).fetchone()
+        adapter_deleted = False
+        if (
+            adapter
+            and adapter["description"]
+            == "本地模型库提供的目标检测评测协议入口。"
+            and not connection.execute(
+                "SELECT 1 FROM models WHERE adapter_id=? LIMIT 1",
+                (adapter_id,),
+            ).fetchone()
+        ):
+            connection.execute(
+                "DELETE FROM adapters WHERE id=?",
+                (adapter_id,),
+            )
+            adapter_deleted = True
+    return {
+        "id": model_id,
+        "name": model["name"],
+        "deleted": True,
+        "adapter_deleted": adapter_deleted,
+        "files_deleted": False,
+    }
+
+
 def list_jobs(database: Database = db, limit: int = 100) -> list[dict[str, Any]]:
     return [
         decode_row(row)
@@ -772,6 +1363,7 @@ def query_results(
                 "sensor_conditions": first["sensor_conditions"],
                 "source_type": first["source_type"],
                 "is_demo": first["is_demo"],
+                "is_official": all(item["is_official"] for item in values),
                 "map_mean": round(mean, 4),
                 "map_std": round(math.sqrt(variance), 4),
                 "latency_mean": round(sum(latency_values) / len(latency_values), 2),
@@ -865,6 +1457,8 @@ def adapter_health(adapter_id: str, database: Database = db) -> dict[str, Any] |
     if not adapter:
         return None
     adapter = decode_row(adapter)
+    execution = adapter.get("parameter_schema", {}).get("execution", {})
+    command_mode = execution.get("mode") == "command"
     checks: list[dict[str, Any]] = []
     if adapter["runtime_kind"] == "platform":
         entrypoint = settings.root_dir / (adapter.get("entrypoint") or "")
@@ -880,10 +1474,28 @@ def adapter_health(adapter_id: str, database: Database = db) -> dict[str, Any] |
             [
                 {"name": "环境目录", "ok": prefix.is_dir(), "detail": str(prefix)},
                 {"name": "Python解释器", "ok": (prefix / "bin" / "python").is_file(), "detail": str(prefix / "bin/python")},
-                {"name": "入口脚本", "ok": entrypoint.is_file(), "detail": str(entrypoint)},
+                {"name": "可执行程序" if command_mode else "入口脚本", "ok": entrypoint.is_file(), "detail": str(entrypoint)},
                 {"name": "只读策略", "ok": adapter["policy"] == "read_only", "detail": adapter["policy"]},
             ]
         )
+        if command_mode:
+            working_directory = Path(
+                str(execution.get("working_directory", ""))
+            )
+            checks.extend(
+                [
+                    {
+                        "name": "命令工作目录",
+                        "ok": working_directory.is_dir(),
+                        "detail": str(working_directory),
+                    },
+                    {
+                        "name": "命令参数",
+                        "ok": bool(execution.get("arguments")),
+                        "detail": json_dump(execution.get("arguments", [])),
+                    },
+                ]
+            )
         if adapter["id"] == "adapter_basegen":
             checks.append(
                 {
@@ -913,6 +1525,61 @@ def adapter_health(adapter_id: str, database: Database = db) -> dict[str, Any] |
             except (OSError, subprocess.SubprocessError) as exc:
                 checks.append(
                     {"name": "生成依赖", "ok": False, "detail": str(exc)}
+                )
+        if adapter["id"] == "adapter_dronedets_yolov8m":
+            dronedets_root = database.settings.dronedets_root
+            model = database.row(
+                """
+                SELECT weight_path FROM models
+                WHERE adapter_id='adapter_dronedets_yolov8m'
+                ORDER BY created_at DESC LIMIT 1
+                """
+            )
+            weight_path = Path(model["weight_path"]) if model and model["weight_path"] else None
+            checks.append(
+                {
+                    "name": "DroneDets项目",
+                    "ok": (
+                        dronedets_root / "src" / "aerial_det" / "catalog.py"
+                    ).is_file(),
+                    "detail": str(dronedets_root),
+                }
+            )
+            checks.append(
+                {
+                    "name": "模型权重",
+                    "ok": bool(weight_path and weight_path.is_file()),
+                    "detail": str(weight_path) if weight_path else "未配置",
+                }
+            )
+            try:
+                result = subprocess.run(
+                    [
+                        str(prefix / "bin" / "python"),
+                        "-B",
+                        str(entrypoint),
+                        "health",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    env={
+                        **os.environ,
+                        "DRONEDETS_ROOT": str(dronedets_root),
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                )
+                detail = (result.stdout or result.stderr).strip()[-500:]
+                checks.append(
+                    {
+                        "name": "检测依赖与目录",
+                        "ok": result.returncode == 0,
+                        "detail": detail,
+                    }
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                checks.append(
+                    {"name": "检测依赖与目录", "ok": False, "detail": str(exc)}
                 )
         if history.exists():
             checks.append({"name": "环境指纹", "ok": True, "detail": file_sha256(history)[:16]})

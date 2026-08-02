@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { cloneElement, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Button,
@@ -15,6 +15,7 @@ import {
   Input,
   InputNumber,
   List,
+  Modal,
   Popconfirm,
   Progress,
   Radio,
@@ -28,7 +29,6 @@ import {
   Statistic,
   Steps,
   Table,
-  Tabs,
   Tag,
   Timeline,
   Typography,
@@ -107,7 +107,7 @@ export function OverviewPage({ dark, navigate, overview }: PageProps & { overvie
               items={overview.pipeline.map((item, index) => ({
                 color: item.status === 'complete' || item.status === 'ready' ? 'green' : 'blue',
                 dot: item.status === 'active' ? <PlayCircleOutlined /> : undefined,
-                children: <div><Typography.Text strong>{item.name}</Typography.Text><br /><Typography.Text type="secondary">{['数据来源统一接入', 'COCO/YOLO 真值状态', '模型矩阵与三 seed', '条件查询与效能图表'][index]}</Typography.Text></div>,
+                children: <div><Typography.Text strong>{item.name}</Typography.Text><br /><Typography.Text type="secondary">{['数据来源统一接入', 'COCO/YOLO 真值状态', '数据集与模型评测矩阵', '条件查询与效能图表'][index]}</Typography.Text></div>,
               }))}
             />
             <Divider />
@@ -141,11 +141,11 @@ export function OverviewPage({ dark, navigate, overview }: PageProps & { overvie
 }
 
 const sourceCards = [
-  { id: 'local-import', source: 'REAL', icon: <ImportOutlined />, title: '本地数据', status: '正式可用', description: '导入本地 PNG/JPEG/WebP/SVG 及可选 COCO/YOLO 标注。', recommended: true },
-  { id: 'adapter_replay', source: 'REPLAY_FIXTURE', icon: <PlayCircleOutlined />, title: '测试回放', status: '接口已通过', description: '固定样例验证生成任务、标注与评测闭环。', recommended: true },
-  { id: 'adapter_condition', source: 'REAL_TRANSFORMED', icon: <CloudOutlined />, title: '条件退化', status: '正式可用', description: '读取已导入的真实图像，产生模糊、雾化和噪声条件。' },
-  { id: 'adapter_basegen', source: 'GENERATIVE', icon: <RobotOutlined />, title: 'Z-Image-Turbo', status: '实验性', description: '通过独立 gen 环境调用 BaseGen 生成未标注感知图像。' },
-  { id: 'airsim-future', source: 'SIMULATOR', icon: <CodeOutlined />, title: 'AirSim / UE', status: '计划接入', description: '通过独立 RPC Adapter 采集图像与真值。', disabled: true },
+  { id: 'local-import', source: 'REAL', icon: <ImportOutlined />, title: '本地数据', description: '导入本地 PNG/JPEG图像及可选 COCO/YOLO/VisDrone格式标注文件。', recommended: true },
+  { id: 'adapter_replay', source: 'REPLAY_FIXTURE', icon: <PlayCircleOutlined />, title: '测试回放', description: '固定样例验证生成任务、标注与评测闭环。', recommended: true },
+  { id: 'adapter_condition', source: 'REAL_TRANSFORMED', icon: <CloudOutlined />, title: '条件退化', description: '读取已导入的真实图像，产生模糊、雾化和噪声条件。' },
+  { id: 'adapter_basegen', source: 'GENERATIVE', icon: <RobotOutlined />, title: 'Z-Image-Turbo', description: '通过独立 gen 环境调用 BaseGen 生成未标注感知图像。' },
+  { id: 'airsim-future', source: 'SIMULATOR', icon: <CodeOutlined />, title: 'AirSim / UE', description: '通过独立 RPC 服务采集图像与真值。', disabled: true },
 ]
 
 type BaseGenSelection =
@@ -183,14 +183,21 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
   const [basegenSelections, setBasegenSelections] = useState<Record<string, BaseGenSelection>>({})
   const [basegenCustom, setBasegenCustom] = useState('')
   const [inputDatasetId, setInputDatasetId] = useState<string>()
+  const [localDatasetName, setLocalDatasetName] = useState('')
   const [localDirectory, setLocalDirectory] = useState('')
   const [annotationPath, setAnnotationPath] = useState('')
+  const [localImageFiles, setLocalImageFiles] = useState<File[]>([])
+  const [annotationMode, setAnnotationMode] = useState<'coco' | 'yolo' | 'visdrone'>('coco')
+  const [localAnnotationFile, setLocalAnnotationFile] = useState<File>()
+  const [localYoloAnnotationFiles, setLocalYoloAnnotationFiles] = useState<File[]>([])
+  const annotationFileInput = useRef<HTMLInputElement>(null)
   const [jobId, setJobId] = useState<string>()
   const [finishedJob, setFinishedJob] = useState<Job>()
   const [submitting, setSubmitting] = useState(false)
   const [previewing, setPreviewing] = useState(false)
   const [basegenPreview, setBasegenPreview] = useState<BaseGenPreview>()
   const datasets = useResource<Dataset[]>('/api/datasets', [])
+  const sourceRuntimes = useResource<Adapter[]>('/api/adapters', [])
   const basegenSchema = useResource<BaseGenSceneSchema>(
     '/api/adapters/adapter_basegen/scene-schema',
     { version: '1.0', domains: [] },
@@ -300,11 +307,56 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
       setResolution('1920×1080')
     }
   }
+  const healthSource = async (id: string) => {
+    try {
+      const result = await post<{ healthy: boolean }>(`/api/adapters/${id}/health-check`)
+      result.healthy ? message.success('数据来源健康检查通过') : message.warning('数据来源当前不可用')
+      await sourceRuntimes.reload()
+    } catch (error) {
+      message.error((error as Error).message)
+    }
+  }
   const selectDomain = (value: string) => {
     setDomain(value)
     if (isBaseGen) {
       setResolution(basegenSchema.data.domains.find((entry) => entry.label_zh === value)?.default_resolution || '1024×576')
     }
+  }
+  const selectLocalDirectory = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const supported = new Set(['.jpg', '.jpeg', '.png', '.webp', '.svg'])
+    const files = Array.from(event.currentTarget.files || []).filter((file) => {
+      const suffix = file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
+      return supported.has(suffix)
+    })
+    setLocalImageFiles(files)
+    const firstRelative = files[0] ? (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath : ''
+    const directoryName = firstRelative?.split('/')[0] || ''
+    setLocalDirectory(files.length ? `${directoryName || '所选目录'} · ${files.length} 张图像` : '')
+    if (!files.length) message.warning('所选目录中没有 PNG、JPEG、WebP 或 SVG 图像')
+  }
+  const selectLocalAnnotation = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0]
+    setLocalAnnotationFile(file)
+    setAnnotationPath(file?.name || '')
+  }
+  const selectLocalYoloAnnotations = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const supported = new Set(['.txt', '.yaml', '.yml', '.names'])
+    const files = Array.from(event.currentTarget.files || []).filter((file) => {
+      const suffix = file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
+      return supported.has(suffix)
+    })
+    setLocalYoloAnnotationFiles(files)
+    const firstRelative = files[0] ? (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath : ''
+    const directoryName = firstRelative?.split('/')[0] || '所选目录'
+    setAnnotationPath(files.length ? `${directoryName} · ${files.length} 个标注文件` : '')
+    if (!files.length) message.warning('所选目录中没有 TXT、YAML 或 NAMES 标注文件')
+  }
+  const changeAnnotationMode = (value: string | number) => {
+    setAnnotationMode(String(value) as 'coco' | 'yolo' | 'visdrone')
+    setLocalAnnotationFile(undefined)
+    setLocalYoloAnnotationFiles([])
+    setAnnotationPath('')
+    if (annotationFileInput.current) annotationFileInput.current.value = ''
   }
   const acquisitionPayload = () => ({
     name: `${domain} · ${source.title} · ${new Date().toLocaleDateString('zh-CN')}`,
@@ -334,14 +386,35 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
   const submit = async () => {
     setSubmitting(true)
     try {
-      const job = source.id === 'local-import'
-        ? await post<Job>('/api/datasets/import', {
-            name: `${domain} · 本地导入 · ${new Date().toLocaleDateString('zh-CN')}`,
-            directory: localDirectory,
-            annotation_path: annotationPath || null,
-            scene_domain: domain,
-          })
-        : await post<Job>('/api/acquisition-jobs', acquisitionPayload())
+      let job: Job
+      if (source.id === 'local-import') {
+        const body = new FormData()
+        body.append('name', localDatasetName.trim())
+        body.append('scene_domain', domain)
+        body.append('annotation_format', annotationMode.toUpperCase())
+        const imageRelativePaths: string[] = []
+        for (const file of localImageFiles) {
+          const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
+          body.append('images', file, file.name)
+          imageRelativePaths.push(relativePath)
+        }
+        body.append('relative_paths_json', JSON.stringify(imageRelativePaths))
+        if (annotationMode === 'coco' && localAnnotationFile) {
+          body.append('annotation', localAnnotationFile, localAnnotationFile.name)
+        }
+        const annotationRelativePaths: string[] = []
+        if (annotationMode !== 'coco') {
+          for (const file of localYoloAnnotationFiles) {
+            const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
+            body.append('annotation_files', file, file.name)
+            annotationRelativePaths.push(relativePath)
+          }
+        }
+        body.append('annotation_relative_paths_json', JSON.stringify(annotationRelativePaths))
+        job = await api<Job>('/api/datasets/import-upload', { method: 'POST', body })
+      } else {
+        job = await post<Job>('/api/acquisition-jobs', acquisitionPayload())
+      }
       setJobId(job.id)
       setStep(3)
       refresh()
@@ -358,16 +431,49 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
     <Space direction="vertical" size={18} style={{ width: '100%' }}>
       <Steps current={step} items={['选择来源', '配置条件', '组合预览', '执行与浏览', '真值冻结'].map((title) => ({ title }))} />
       {step === 0 && <Card title="选择数据来源" extra={<Tag color="purple">BaseGen 已接入</Tag>}>
-        <Row gutter={[16, 16]}>{sourceCards.map((item) => <Col xs={24} md={12} xl={6} key={item.id}><Card hoverable={!item.disabled} className={`source-card ${source.id === item.id ? 'source-selected' : ''} ${item.disabled ? 'source-disabled' : ''}`} onClick={() => selectSource(item)}><div className="source-icon">{item.icon}</div><Space><Typography.Title level={4}>{item.title}</Typography.Title>{item.recommended && <Tag color="cyan">推荐</Tag>}</Space><StatusTag status={item.status === '正式可用' ? 'READY' : item.status === '接口已通过' ? 'CONTRACT_OK' : item.status === '实验性' ? 'EXPERIMENTAL' : 'REGISTERED'} /><Typography.Paragraph type="secondary">{item.description}</Typography.Paragraph></Card></Col>)}</Row>
+        <Row gutter={[16, 16]}>{sourceCards.map((item) => {
+          const runtime = sourceRuntimes.data.find((entry) => entry.id === item.id)
+          return <Col xs={24} md={12} xl={6} key={item.id}><Card hoverable={!item.disabled} className={`source-card ${source.id === item.id ? 'source-selected' : ''} ${item.disabled ? 'source-disabled' : ''}`} onClick={() => selectSource(item)}><div className="source-icon">{item.icon}</div><Space><Typography.Title level={4}>{item.title}</Typography.Title>{item.recommended && <Tag color="cyan">推荐</Tag>}</Space><Typography.Paragraph type="secondary">{item.description}</Typography.Paragraph><Space wrap>{item.id === 'local-import' ? <StatusTag status="HEALTHY" /> : item.disabled ? <Tag>未接入</Tag> : <><StatusTag status={runtime?.status || (sourceRuntimes.loading ? 'CHECKING' : 'UNAVAILABLE')} /><Button size="small" onClick={(event) => { event.stopPropagation(); healthSource(item.id) }}>健康检查</Button></>}</Space></Card></Col>
+        })}</Row>
         <div className="wizard-actions"><Button type="primary" onClick={() => setStep(1)}>下一步：配置条件 <ArrowRightOutlined /></Button></div>
       </Card>}
       {step === 1 && <Row gutter={16}>
         <Col xs={24} xl={12}>
-          <Card title={source.id === 'local-import' ? '本地数据路径' : '场景条件'}>
+          <Card title={source.id === 'local-import' ? '选择本地数据' : '场景条件'}>
             <Form layout="vertical">
               {source.id === 'local-import' && <>
-                <Form.Item label="图像目录" required><Input value={localDirectory} onChange={(event) => setLocalDirectory(event.target.value)} placeholder="例如 /data/aerial/images" prefix={<DatabaseOutlined />} /></Form.Item>
-                <Form.Item label="标注文件（可选）"><Input value={annotationPath} onChange={(event) => setAnnotationPath(event.target.value)} placeholder="COCO JSON 或 YOLO 标签入口" /></Form.Item>
+                <Form.Item label="数据集名称" required>
+                  <Input value={localDatasetName} onChange={(event) => setLocalDatasetName(event.target.value)} maxLength={120} showCount placeholder="例如 VisDrone2019 测试集" />
+                </Form.Item>
+                <Form.Item label="图像目录" required>
+                  <input
+                    className="native-resource-picker"
+                    type="file"
+                    multiple
+                    onChange={selectLocalDirectory}
+                    {...({ webkitdirectory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+                  />
+                  <Typography.Paragraph type={localDirectory ? 'success' : 'secondary'} style={{ margin: '8px 0 0' }}>
+                    {localDirectory || '目录模式下图像文件显示为灰色是正常的；进入目标目录后，点击对话框右下角的“选择/打开”。'}
+                  </Typography.Paragraph>
+                </Form.Item>
+                <Form.Item label="标注（可选）">
+                  <Space direction="vertical" style={{ width: '100%' }}>
+                    <Segmented block value={annotationMode} onChange={changeAnnotationMode} options={[{ value: 'coco', label: 'COCO 格式json' }, { value: 'yolo', label: 'YOLO 格式' }, { value: 'visdrone', label: 'VisDrone 格式' }]} />
+                    {annotationMode === 'coco' ? (
+                      <input ref={annotationFileInput} className="native-resource-picker" type="file" onChange={selectLocalAnnotation} />
+                    ) : (
+                      <input
+                        className="native-resource-picker"
+                        type="file"
+                        multiple
+                        onChange={selectLocalYoloAnnotations}
+                        {...({ webkitdirectory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
+                      />
+                    )}
+                    {annotationPath && <Typography.Text type="success">已选择：{annotationPath}</Typography.Text>}
+                  </Space>
+                </Form.Item>
               </>}
               <Form.Item label="场景域"><Select loading={isBaseGen && basegenSchema.loading} value={domain} onChange={selectDomain} options={domainOptions.map((value) => ({ value }))} /></Form.Item>
               {isBaseGen && !basegenSchema.loading && !currentBasegenDomain && <Alert type="error" showIcon message="未找到当前领域的 BaseGen 场景目录" />}
@@ -399,16 +505,16 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
             </Form>
           </Card>
         </Col>
-        <Col xs={24} xl={12}>{source.id === 'local-import' ? <Card title="导入校验"><Timeline items={[{ color: 'blue', children: '扫描 PNG、JPEG、WebP 和 SVG 图像' }, { color: 'blue', children: '复制到内容受控的 Artifact 目录' }, { color: 'blue', children: '标注作为候选真值导入并等待校核' }, { color: 'green', children: '原始目录保持不变，平台不会原地修改图像' }]} /><Alert type="info" showIcon message="本地目录只读" description="平台将图像复制到工作区，不在源目录创建缓存或转换文件。" /></Card> : <Card title={isBaseGen ? '生成参数' : '传感器与成像条件'}><Form layout="vertical"><Form.Item label="图像分辨率"><Select value={resolution} onChange={setResolution} options={resolutionOptions.map((value) => ({ value }))} /></Form.Item>{isBaseGen ? <><Form.Item label="起始随机种子"><InputNumber value={generatorSeed} onChange={(value) => setGeneratorSeed(value || 0)} min={0} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="推理步数"><InputNumber value={generatorSteps} onChange={(value) => setGeneratorSteps(value || 1)} min={1} max={100} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="设备策略"><Select value={devicePolicy} onChange={setDevicePolicy} options={[{ value: 'cuda', label: '全量 CUDA（推荐）' }, { value: 'cpu-offload', label: 'CPU Offload（节省显存）' }]} /></Form.Item></> : <><Form.Item label={`运动模糊强度 ${blur.toFixed(1)}`}><Slider value={blur} onChange={setBlur} min={0} max={1} step={0.1} marks={{ 0: '清洁', 0.5: '中等', 1: '严重' }} /></Form.Item><Form.Item label="固定随机种子"><Checkbox.Group options={[1001, 1002, 1003, 1004].map((value) => ({ label: value, value }))} value={seeds} onChange={(values) => setSeeds(values as number[])} /></Form.Item></>}</Form></Card>}</Col>
+        <Col xs={24} xl={12}>{source.id === 'local-import' ? <Card title="导入校验"><Timeline items={[{ color: 'blue', children: '通过系统资源管理器选择图像目录' }, { color: 'blue', children: '上传 PNG、JPEG、WebP 和 SVG 到工作区暂存区' }, { color: 'blue', children: '标注作为候选真值导入并等待校核' }, { color: 'green', children: '导入完成后自动清理暂存文件，不修改原始目录' }]} /><Alert type="info" showIcon message="浏览器安全选择" description="浏览器不会向平台暴露本机绝对路径；只上传你在资源管理器中明确选择的文件。" /></Card> : <Card title={isBaseGen ? '生成参数' : '传感器与成像条件'}><Form layout="vertical"><Form.Item label="图像分辨率"><Select value={resolution} onChange={setResolution} options={resolutionOptions.map((value) => ({ value }))} /></Form.Item>{isBaseGen ? <><Form.Item label="起始随机种子"><InputNumber value={generatorSeed} onChange={(value) => setGeneratorSeed(value || 0)} min={0} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="推理步数"><InputNumber value={generatorSteps} onChange={(value) => setGeneratorSteps(value || 1)} min={1} max={100} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="设备策略"><Select value={devicePolicy} onChange={setDevicePolicy} options={[{ value: 'cuda', label: '全量 CUDA（推荐）' }, { value: 'cpu-offload', label: 'CPU Offload（节省显存）' }]} /></Form.Item></> : <><Form.Item label={`运动模糊强度 ${blur.toFixed(1)}`}><Slider value={blur} onChange={setBlur} min={0} max={1} step={0.1} marks={{ 0: '清洁', 0.5: '中等', 1: '严重' }} /></Form.Item><Form.Item label="固定随机种子"><Checkbox.Group options={[1001, 1002, 1003, 1004].map((value) => ({ label: value, value }))} value={seeds} onChange={(values) => setSeeds(values as number[])} /></Form.Item></>}</Form></Card>}</Col>
         {source.id === 'adapter_condition' && <Col span={24}><Card title="选择退化输入数据集"><Select value={inputDatasetId} onChange={setInputDatasetId} style={{ width: '100%' }} placeholder="选择已导入的 PNG/JPEG/WebP 数据集" options={datasets.data.filter((item) => item.source_type === 'REAL').map((item) => ({ value: item.id, label: `${item.name} · ${item.sample_count} 张` }))} /><Typography.Paragraph type="secondary" style={{ marginTop: 10, marginBottom: 0 }}>条件算子保持几何位置不变，但输出真值仍需抽查后冻结。</Typography.Paragraph></Card></Col>}
-        <Col span={24}><div className="wizard-actions"><Button onClick={() => setStep(0)}>上一步</Button><Button type="primary" disabled={source.id === 'local-import' ? !localDirectory : isBaseGen ? !currentBasegenDomain || generatorSeed < 0 || generatorSteps < 1 : source.id === 'adapter_condition' ? !inputDatasetId || !seeds.length : !seeds.length} onClick={() => setStep(2)}>下一步：组合预览</Button></div></Col>
+        <Col span={24}><div className="wizard-actions"><Button onClick={() => setStep(0)}>上一步</Button><Button type="primary" disabled={source.id === 'local-import' ? localDatasetName.trim().length < 2 || !localImageFiles.length : isBaseGen ? !currentBasegenDomain || generatorSeed < 0 || generatorSteps < 1 : source.id === 'adapter_condition' ? !inputDatasetId || !seeds.length : !seeds.length} onClick={() => setStep(2)}>下一步：组合预览</Button></div></Col>
       </Row>}
-      {step === 2 && <Card title="提交前确认" extra={isBaseGen ? <Tag color="purple">Z-Image-Turbo</Tag> : <DemoTag />}>
+      {step === 2 && <Card title="提交前确认" extra={source.id === 'local-import' ? <Tag color="blue">本地真实数据</Tag> : isBaseGen ? <Tag color="purple">Z-Image-Turbo</Tag> : <DemoTag />}>
         <Row gutter={[16, 16]}><Col xs={24} md={8}><Statistic title={source.id === 'local-import' ? '导入任务' : '配置单元'} value={source.id === 'local-import' ? 1 : combinationCount} suffix="个" /></Col><Col xs={24} md={8}><Statistic title="输出样本" value={source.id === 'local-import' ? '目录内图像' : samples} suffix={source.id === 'local-import' ? undefined : '张'} /></Col><Col xs={24} md={8}><Statistic title="真值入口" value={source.id === 'local-import' ? (annotationPath ? '已提供' : '未提供') : isBaseGen ? '未标注' : '候选框'} /></Col></Row><Divider />
         <Descriptions column={{ xs: 1, md: 2 }} bordered size="small" items={[{ key: 'source', label: '来源', children: source.title }, { key: 'scene', label: '场景', children: source.id === 'local-import' || isBaseGen ? domain : `${domain} / ${weather}` }, { key: 'sensor', label: source.id === 'local-import' ? '输入目录' : isBaseGen ? '生成参数' : '成像条件', children: source.id === 'local-import' ? localDirectory : isBaseGen ? `${resolution} / ${generatorSteps} 步 / ${devicePolicy}` : `${resolution} / 模糊 ${blur}` }, { key: 'seed', label: '随机种子', children: source.id === 'local-import' ? '不适用' : isBaseGen ? `${generatorSeed} 起连续 ${samples} 个` : seeds.join(', ') }, { key: 'truth', label: '真值策略', children: source.id === 'local-import' ? (annotationPath ? '导入后作为候选真值' : '未提供') : isBaseGen ? '未标注，需另行标注后评测' : '候选框，完成后需校核冻结' }, { key: 'official', label: '结果性质', children: source.id === 'local-import' ? <Tag color="blue">真实采集数据</Tag> : isBaseGen ? <Tag color="purple">真实模型生成</Tag> : <DemoTag /> }]} />
         {isBaseGen && <Card size="small" title="场景字段规则" className="top-gap"><Space wrap>{basegenSceneSummary.map((item) => <Tag key={item}>{item}</Tag>)}{basegenCustom && <Tag color="blue">自定义：{basegenCustom}</Tag>}</Space></Card>}
         {isBaseGen && basegenPreview && <Card size="small" title="随机计划预览（不加载模型）" className="top-gap"><List dataSource={basegenPreview.images} renderItem={(item) => <List.Item><Space direction="vertical" style={{ width: '100%' }}><Space wrap><Tag color="blue">seed {item.seed}</Tag><Tag>{item.width}×{item.height}</Tag>{currentBasegenDomain?.fields.filter((field) => field.kind !== 'text').map((field) => { const raw = item.scene[field.name]; const values = Array.isArray(raw) ? raw : [raw]; return <Tag key={field.name}>{field.label_zh}：{values.map((value) => optionFor(field, value)?.label_zh || value).join('、')}</Tag> })}</Space><Typography.Paragraph copyable={{ text: item.prompt }} ellipsis={{ rows: 3, expandable: true, symbol: '展开 prompt' }} style={{ marginBottom: 0 }}>{item.prompt}</Typography.Paragraph></Space></List.Item>} /></Card>}
-        {source.id !== 'local-import' && <Alert className="inline-alert" type={isBaseGen ? 'info' : 'warning'} showIcon message={isBaseGen ? '本任务将调用 BaseGen 真实生成图像' : source.id === 'adapter_condition' ? '本任务将创建真实图像的条件退化版本' : '本任务使用流程验证 Adapter'} description={isBaseGen ? '模型在独立 gen 环境中运行；纯文本生成不提供目标框等真值。' : source.id === 'adapter_condition' ? '输出记录原数据集和退化参数，正式冻结前仍需抽查真值。' : '输出会保留完整数据谱系，但不能作为生成模型能力结论。'} />}
+        {source.id !== 'local-import' && <Alert className="inline-alert" type={isBaseGen ? 'info' : 'warning'} showIcon message={isBaseGen ? '本任务将调用 BaseGen 真实生成图像' : source.id === 'adapter_condition' ? '本任务将创建真实图像的条件退化版本' : '本任务使用固定样例验证流程'} description={isBaseGen ? '模型在独立 gen 环境中运行；纯文本生成不提供目标框等真值。' : source.id === 'adapter_condition' ? '输出记录原数据集和退化参数，正式冻结前仍需抽查真值。' : '输出会保留完整数据谱系，但不能作为生成模型能力结论。'} />}
         <div className="wizard-actions"><Button onClick={() => { setBasegenPreview(undefined); setStep(1) }}>上一步</Button>{isBaseGen && <Button loading={previewing} onClick={previewBasegen}>预览 3 个随机场景</Button>}<Button type="primary" loading={submitting} icon={<PlayCircleOutlined />} onClick={submit}>提交构建任务</Button></div>
       </Card>}
       {step === 3 && <Space direction="vertical" size={16} style={{ width: '100%' }}><JobProgress jobId={jobId} onFinish={finish} />{finishedJob?.status === 'SUCCEEDED' && <Card><Result status="success" title={source.id === 'local-import' ? '本地图像已导入' : '数据构建任务已完成'} subTitle={finishedJob.result?.annotation_status === 'UNLABELED' ? '当前没有真值，需进入数据集完成标注后才能正式评测。' : '输出当前仍是候选真值，冻结前不会进入正式评测。'} extra={finishedJob.result?.annotation_status === 'UNLABELED' ? [<Button key="datasets" type="primary" onClick={() => navigate('datasets')}>打开数据集</Button>] : [<Button key="freeze" type="primary" icon={<LockOutlined />} onClick={freeze}>校核并冻结数据版本</Button>, <Button key="datasets" onClick={() => navigate('datasets')}>打开数据集</Button>]} /></Card>}</Space>}
@@ -425,6 +531,8 @@ function DatasetBrowser({ dataset, onClose }: { dataset?: Dataset; onClose: () =
   const [error, setError] = useState('')
   const loadingRef = useRef(false)
   const activeDatasetId = useRef<string>()
+  const browserRef = useRef<HTMLDivElement>(null)
+  const loadMoreRef = useRef<HTMLDivElement>(null)
 
   const load = async (datasetId: string, offset: number, replace: boolean) => {
     if (loadingRef.current) return
@@ -463,20 +571,90 @@ function DatasetBrowser({ dataset, onClose }: { dataset?: Dataset; onClose: () =
       load(dataset.id, items.length, false)
     }
   }
+  useEffect(() => {
+    const root = browserRef.current
+    const target = loadMoreRef.current
+    if (!dataset || !root || !target || loading || items.length >= total) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting && !loadingRef.current) {
+          load(dataset.id, items.length, false)
+        }
+      },
+      { root, rootMargin: '480px 0px' },
+    )
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [dataset?.id, items.length, total, loading])
+  const annotationSourceLabels = {
+    MANUAL: '平台标注',
+    COCO: 'COCO',
+    YOLO: 'YOLO',
+    VISDRONE: 'VisDrone',
+  }
+  const annotationBoxes = (item: DatasetSamplePage['items'][number]) => (
+    <div className="dataset-browser-boxes">
+      {item.boxes.map((box, index) => (
+        <div
+          className="dataset-browser-box"
+          key={`${box.label}-${index}`}
+          style={{
+            left: `${Math.max(0, Math.min(1, box.x)) * 100}%`,
+            top: `${Math.max(0, Math.min(1, box.y)) * 100}%`,
+            width: `${Math.max(0, Math.min(1 - Math.max(0, box.x), box.width)) * 100}%`,
+            height: `${Math.max(0, Math.min(1 - Math.max(0, box.y), box.height)) * 100}%`,
+            borderColor: box.color,
+          }}
+        >
+          <span style={{ background: box.color }}>{box.label}</span>
+        </div>
+      ))}
+    </div>
+  )
 
   return (
-    <Drawer open={Boolean(dataset)} width="90vw" title={dataset ? `${dataset.name} · 全部样本` : '全部样本'} onClose={onClose} extra={<Tag>{items.length} / {total || declaredCount}</Tag>}>
-      <div className="dataset-browser" onScroll={scroll}>
+    <Drawer open={Boolean(dataset)} width="90vw" title={dataset ? `${dataset.name} · 全部样本` : '全部样本'} onClose={onClose} extra={<Tag>已加载 {items.length} / 总计 {total || declaredCount}</Tag>}>
+      <div ref={browserRef} className="dataset-browser" onScroll={scroll}>
         {error && <Alert type="error" showIcon message="样本加载失败" description={error} />}
         {!loading && !error && total !== declaredCount && <Alert type="warning" showIcon message="登记样本数与磁盘文件数不一致" description={`登记 ${declaredCount} 个，当前 Artifact 目录找到 ${total} 个可浏览图片。`} />}
         {!loading && !error && total === 0 ? <Empty description="该数据集没有可浏览的图片文件" /> : (
-          <Image.PreviewGroup>
+          <Image.PreviewGroup preview={{
+            imageRender: (originalNode, info) => {
+              const item = items[info.current]
+              if (!item) return originalNode
+              const { x, y, rotate, scale, flipX, flipY } = info.transform
+              return (
+                <div
+                  className="dataset-browser-preview-image"
+                  style={{
+                    aspectRatio: item.width && item.height ? `${item.width} / ${item.height}` : '16 / 9',
+                    transform: `translate3d(${x}px, ${y}px, 0) scale3d(${flipX ? -scale : scale}, ${flipY ? -scale : scale}, 1) rotate(${rotate}deg)`,
+                  }}
+                >
+                  {cloneElement(originalNode, { style: { ...originalNode.props.style, transform: 'none', transitionDuration: '0s' } })}
+                  {annotationBoxes(item)}
+                </div>
+              )
+            },
+          }}>
             <div className="dataset-browser-grid">
-              {items.map((item) => <Image key={item.url} src={item.url} alt={item.name} loading="lazy" preview={{ mask: item.name }} />)}
+              {items.map((item) => (
+                <div className="dataset-browser-sample" key={item.url}>
+                  <div className="dataset-browser-image" style={{ aspectRatio: item.width && item.height ? `${item.width} / ${item.height}` : '16 / 9' }}>
+                    <Image src={item.url} alt={item.name} loading="lazy" preview={{ mask: item.name }} />
+                    {annotationBoxes(item)}
+                  </div>
+                  <div className="dataset-browser-caption">
+                    <Typography.Text ellipsis={{ tooltip: item.name }}>{item.name}</Typography.Text>
+                    {item.annotation_source ? <Tag color={item.boxes.length ? 'blue' : 'default'}>{annotationSourceLabels[item.annotation_source]} · {item.boxes.length} 框</Tag> : <Tag>无标注</Tag>}
+                  </div>
+                </div>
+              ))}
             </div>
           </Image.PreviewGroup>
         )}
         {loading && <div className="dataset-browser-loading"><Spin /><Typography.Text type="secondary">正在加载图片…</Typography.Text></div>}
+        {!loading && items.length < total && <div ref={loadMoreRef} className="dataset-browser-load-more"><Button onClick={() => dataset && load(dataset.id, items.length, false)}>加载更多（剩余 {total - items.length} 张）</Button></div>}
         {!loading && total > 0 && items.length >= total && <div className="dataset-browser-end">已加载全部 {total} 张图片</div>}
       </div>
     </Drawer>
@@ -926,11 +1104,353 @@ export function DatasetsPage(_: PageProps) {
   ]} /></Card><Drawer open={Boolean(selected)} width={760} title={selected?.name} onClose={() => setSelected(undefined)}>{selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Gallery images={selected.preview_images} height={140} /><Button block icon={<FileImageOutlined />} onClick={() => { setSelected(undefined); setBrowserDataset(selected) }}>浏览全部图片</Button><Button block onClick={() => { setSelected(undefined); setAnnotationDataset(selected) }}>{selected.frozen ? '查看目标检测标注' : '开始目标检测标注'}</Button><Descriptions bordered column={2} items={[{ key: 'source', label: '来源', children: selected.source_type }, { key: 'scene', label: '场景', children: selected.scene_domain }, { key: 'weather', label: '天气', children: selected.weather }, { key: 'resolution', label: '分辨率', children: selected.resolution }, { key: 'truth', label: '真值', children: <StatusTag status={selected.annotation_status} /> }, { key: 'frozen', label: '不可变', children: selected.frozen ? '是' : '否' }]} /><Alert type="info" showIcon message="数据谱系" description="所有样本均记录来源、条件、seed、Adapter 版本和文件摘要。流程样例不会被标记为正式生成数据。" /></Space>}</Drawer><DatasetBrowser dataset={browserDataset} onClose={() => setBrowserDataset(undefined)} /><AnnotationWorkspace dataset={annotationDataset} onClose={() => setAnnotationDataset(undefined)} onChanged={reload} /></>
 }
 
-export function RegistryPage(_: PageProps) {
+type LocalResourceKind = 'directory' | 'entrypoint' | 'weight'
+type LocalResourceScope = 'model' | 'environment'
+
+interface LocalResourceListing {
+  root: string
+  current: string
+  parent?: string
+  entries: Array<{
+    name: string
+    path: string
+    is_directory: boolean
+  }>
+}
+
+function LocalResourcePicker({
+  open,
+  title,
+  scope,
+  kind,
+  initialPath,
+  onClose,
+  onSelect,
+}: {
+  open: boolean
+  title: string
+  scope: LocalResourceScope
+  kind: LocalResourceKind
+  initialPath?: string
+  onClose: () => void
+  onSelect: (path: string) => void
+}) {
+  const [listing, setListing] = useState<LocalResourceListing>()
+  const [loading, setLoading] = useState(false)
+  const load = useCallback(async (path?: string) => {
+    setLoading(true)
+    try {
+      const query = new URLSearchParams({ scope, kind })
+      if (path) query.set('path', path)
+      setListing(await api<LocalResourceListing>(`/api/local-model-resources?${query}`))
+    } catch (error) {
+      message.error((error as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }, [scope, kind])
+  useEffect(() => {
+    if (open) load(initialPath).catch(() => undefined)
+  }, [open, initialPath, load])
+  return (
+    <Modal
+      open={open}
+      width={760}
+      title={title}
+      onCancel={onClose}
+      footer={[
+        <Button key="parent" disabled={!listing?.parent} onClick={() => listing?.parent && load(listing.parent)}>上一级</Button>,
+        kind === 'directory' && <Button key="select" type="primary" disabled={!listing} onClick={() => listing && onSelect(listing.current)}>选择当前目录</Button>,
+        <Button key="cancel" onClick={onClose}>取消</Button>,
+      ]}
+    >
+      <Typography.Paragraph copyable={{ text: listing?.current || '' }}>
+        <Typography.Text type="secondary">当前位置：</Typography.Text>{listing?.current || '加载中'}
+      </Typography.Paragraph>
+      <List
+        bordered
+        loading={loading}
+        dataSource={listing?.entries || []}
+        locale={{ emptyText: '当前目录没有可选择的资源' }}
+        renderItem={(entry) => (
+          <List.Item
+            actions={[
+              entry.is_directory
+                ? <Button type="link" onClick={() => load(entry.path)}>打开</Button>
+                : <Button type="link" onClick={() => onSelect(entry.path)}>选择</Button>,
+            ]}
+          >
+            <Space>
+              <Tag color={entry.is_directory ? 'blue' : 'default'}>{entry.is_directory ? '目录' : '文件'}</Tag>
+              <Typography.Text>{entry.name}</Typography.Text>
+            </Space>
+          </List.Item>
+        )}
+      />
+    </Modal>
+  )
+}
+
+interface LocalModelDraft {
+  name: string
+  family: string
+  architecture: string
+  backbone: string
+  detector_head: string
+  class_count: number | null
+  training_dataset: string
+  pretrained_dataset: string
+  version: string
+  precision: 'FP32' | 'FP16'
+  project_directory: string
+  working_directory: string
+  runtime_prefix: string
+  command_arguments: string
+  weight_path: string
+}
+
+const emptyLocalModelDraft = (): LocalModelDraft => ({
+  name: '',
+  family: '',
+  architecture: '',
+  backbone: '',
+  detector_head: '',
+  class_count: null,
+  training_dataset: '',
+  pretrained_dataset: '',
+  version: 'v1',
+  precision: 'FP16',
+  project_directory: '',
+  working_directory: '',
+  runtime_prefix: '',
+  command_arguments: '',
+  weight_path: '',
+})
+
+export function RegistryPage({ refresh }: PageProps) {
   const adapters = useResource<Adapter[]>('/api/adapters', [])
   const models = useResource<ModelVersion[]>('/api/models', [])
-  const health = async (id: string) => { try { const result = await post<{ healthy: boolean }>(`/api/adapters/${id}/health-check`); result.healthy ? message.success('适配器健康检查通过') : message.warning('适配器当前不可用'); adapters.reload() } catch (error) { message.error((error as Error).message) } }
-  return <Tabs items={[{ key: 'adapters', label: `适配器 ${adapters.data.length}`, children: <Card><Alert type="success" showIcon message="只读执行策略已启用" description="平台不向外部 conda 环境安装依赖；缺少依赖时应创建工作区克隆。" /><Table className="top-gap" rowKey="id" loading={adapters.loading} dataSource={adapters.data} columns={[{ title: '适配器', dataIndex: 'name', render: (value, row) => <Space direction="vertical" size={1}><Typography.Text strong>{value}</Typography.Text><Typography.Text type="secondary">{row.description}</Typography.Text></Space> }, { title: '类型', dataIndex: 'kind', render: (value) => <Tag>{value}</Tag> }, { title: '成熟度', dataIndex: 'maturity', render: (value) => <StatusTag status={value} /> }, { title: '运行方式', dataIndex: 'runtime_kind' }, { title: '环境策略', dataIndex: 'policy', render: () => <Tag icon={<SafetyCertificateOutlined />} color="success">只读</Tag> }, { title: '状态', dataIndex: 'status', render: (value) => <StatusTag status={value} /> }, { title: '操作', render: (_, row) => <Button type="link" onClick={() => health(row.id)}>健康检查</Button> }]} /></Card> }, { key: 'models', label: `模型版本 ${models.data.length}`, children: <Card><Table rowKey="id" loading={models.loading} dataSource={models.data} columns={[{ title: '模型', dataIndex: 'name', render: (value, row) => <Space><Typography.Text strong>{value}</Typography.Text>{row.is_demo && <DemoTag />}</Space> }, { title: '模型族', dataIndex: 'family' }, { title: 'Backbone', dataIndex: 'backbone' }, { title: '版本', dataIndex: 'version' }, { title: '精度', dataIndex: 'precision' }, { title: '状态', dataIndex: 'status', render: (value) => <StatusTag status={value} /> }]} /></Card> }]} />
+  const [registerOpen, setRegisterOpen] = useState(false)
+  const [registering, setRegistering] = useState(false)
+  const [selectedModel, setSelectedModel] = useState<ModelVersion>()
+  const [draft, setDraft] = useState<LocalModelDraft>(emptyLocalModelDraft)
+  const [picker, setPicker] = useState<{
+    field: 'project_directory' | 'working_directory' | 'runtime_prefix' | 'weight_path'
+    title: string
+    scope: LocalResourceScope
+    kind: LocalResourceKind
+    initialPath?: string
+  }>()
+  const setField = <K extends keyof LocalModelDraft>(field: K, value: LocalModelDraft[K]) =>
+    setDraft((current) => ({ ...current, [field]: value }))
+  const selectResource = (path: string) => {
+    if (!picker) return
+    if (picker.field === 'project_directory') {
+      setDraft((current) => ({
+        ...current,
+        project_directory: path,
+        working_directory: path,
+        runtime_prefix: current.runtime_prefix || `${path}/.venv`,
+        weight_path: '',
+      }))
+    } else if (picker.field === 'runtime_prefix') {
+      setField('runtime_prefix', path)
+    } else {
+      setField(picker.field, path)
+    }
+    setPicker(undefined)
+  }
+  const health = async (id: string) => {
+    try {
+      const result = await post<{ healthy: boolean }>(`/api/adapters/${id}/health-check`)
+      result.healthy ? message.success('模型运行环境健康检查通过') : message.warning('模型运行环境当前不可用')
+      await adapters.reload()
+    } catch (error) {
+      message.error((error as Error).message)
+    }
+  }
+  const removeModel = async (model: ModelVersion) => {
+    try {
+      await api(`/api/models/${model.id}`, { method: 'DELETE' })
+      message.success(`已删除模型：${model.name}`)
+      if (selectedModel?.id === model.id) setSelectedModel(undefined)
+      await Promise.all([models.reload(), adapters.reload()])
+      refresh()
+    } catch (error) {
+      message.error((error as Error).message)
+    }
+  }
+  const register = async () => {
+    setRegistering(true)
+    try {
+      await post<ModelVersion>('/api/local-detector-models', {
+        ...draft,
+        command_arguments: draft.command_arguments
+          .split('\n')
+          .map((value) => value.trim())
+          .filter(Boolean),
+      })
+      message.success('本地检测模型已注册')
+      setRegisterOpen(false)
+      setDraft(emptyLocalModelDraft())
+      await Promise.all([models.reload(), adapters.reload()])
+    } catch (error) {
+      message.error((error as Error).message)
+    } finally {
+      setRegistering(false)
+    }
+  }
+  const ready = Boolean(
+    draft.name.trim().length >= 2
+    && draft.family.trim()
+    && draft.architecture.trim()
+    && draft.backbone.trim()
+    && draft.detector_head.trim()
+    && draft.class_count !== null
+    && draft.class_count >= 1
+    && draft.training_dataset.trim()
+    && draft.pretrained_dataset.trim()
+    && draft.project_directory
+    && draft.working_directory
+    && draft.runtime_prefix
+    && draft.command_arguments.trim()
+    && draft.weight_path,
+  )
+  const modelsCard = (
+    <Card extra={<Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterOpen(true)}>注册本地检测模型</Button>}>
+      <Table rowKey="id" loading={models.loading} dataSource={models.data} scroll={{ x: 1650 }} onRow={(row) => ({ onClick: () => setSelectedModel(row), style: { cursor: 'pointer' } })} columns={[
+        { title: '模型', dataIndex: 'name', render: (value, row) => <Space><Typography.Text strong>{value}</Typography.Text>{row.is_demo && <DemoTag />}</Space> },
+        { title: '模型族', dataIndex: 'family' },
+        { title: '模型架构', dataIndex: 'architecture' },
+        { title: 'Backbone', dataIndex: 'backbone' },
+        { title: '检测头', dataIndex: 'detector_head' },
+        { title: '类别数', dataIndex: 'class_count', render: (value) => value || '—' },
+        { title: '训练数据', dataIndex: 'training_dataset' },
+        { title: '预训练数据', dataIndex: 'pretrained_dataset' },
+        { title: '版本', dataIndex: 'version' },
+        { title: '精度', dataIndex: 'precision' },
+        { title: '权重', dataIndex: 'weight_path', render: (value) => value ? <Typography.Text ellipsis={{ tooltip: value }} style={{ maxWidth: 180 }}>{String(value).split('/').pop()}</Typography.Text> : '—' },
+        { title: '状态', dataIndex: 'status', render: (value) => <StatusTag status={value} /> },
+        { title: '运行环境', render: (_, row) => <StatusTag status={adapters.data.find((item) => item.id === row.adapter_id)?.status || (adapters.loading ? 'CHECKING' : 'UNAVAILABLE')} /> },
+        { title: '操作', render: (_, row) => <span onClick={(event) => event.stopPropagation()}><Space><Button type="link" onClick={() => health(row.adapter_id)}>健康检查</Button><Popconfirm title="确认删除这个模型？" description="仅删除平台注册记录，不删除模型项目、环境或权重；存在评测引用时会拒绝删除。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => removeModel(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm></Space></span> },
+      ]} />
+    </Card>
+  )
+  return (
+    <>
+      {modelsCard}
+      <Drawer
+        open={registerOpen}
+        width={760}
+        title="注册本地检测模型"
+        onClose={() => setRegisterOpen(false)}
+      >
+        <Alert
+          type="info"
+          showIcon
+          message="配置结构化执行命令"
+          description="平台按参数数组直接启动进程，不经过 Shell。命令只需在指定位置生成 COCO predictions.json；同一项目的不同模型可以登记不同权重和参数。"
+        />
+        <Form layout="vertical" className="top-gap">
+          <Row gutter={12}>
+            <Col span={12}><Form.Item label="模型名称" required><Input value={draft.name} onChange={(event) => setField('name', event.target.value)} maxLength={120} placeholder="例如 YOLOv8m VisDrone" /></Form.Item></Col>
+            <Col span={12}><Form.Item label="模型族" required><Input value={draft.family} onChange={(event) => setField('family', event.target.value)} maxLength={80} placeholder="例如 YOLOv8" /></Form.Item></Col>
+            <Col span={8}><Form.Item label="模型架构" required><Input value={draft.architecture} onChange={(event) => setField('architecture', event.target.value)} maxLength={80} placeholder="例如 DETR" /></Form.Item></Col>
+            <Col span={8}><Form.Item label="Backbone" required><Input value={draft.backbone} onChange={(event) => setField('backbone', event.target.value)} maxLength={80} placeholder="例如 HGNetv2-B2" /></Form.Item></Col>
+            <Col span={8}><Form.Item label="检测头" required><Input value={draft.detector_head} onChange={(event) => setField('detector_head', event.target.value)} maxLength={80} placeholder="例如 D-FINE Transformer" /></Form.Item></Col>
+            <Col span={8}><Form.Item label="类别数" required><InputNumber value={draft.class_count} onChange={(value) => setField('class_count', value)} min={1} max={100000} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
+            <Col span={8}><Form.Item label="版本"><Input value={draft.version} onChange={(event) => setField('version', event.target.value)} maxLength={40} /></Form.Item></Col>
+            <Col span={8}><Form.Item label="精度"><Select value={draft.precision} onChange={(value) => setField('precision', value)} options={[{ value: 'FP16' }, { value: 'FP32' }]} /></Form.Item></Col>
+            <Col span={12}><Form.Item label="训练数据" required><Input value={draft.training_dataset} onChange={(event) => setField('training_dataset', event.target.value)} maxLength={120} placeholder="例如 VisDrone2019-DET" /></Form.Item></Col>
+            <Col span={12}><Form.Item label="预训练数据" required><Input value={draft.pretrained_dataset} onChange={(event) => setField('pretrained_dataset', event.target.value)} maxLength={120} placeholder="例如 Objects365；没有则填写无" /></Form.Item></Col>
+          </Row>
+          <Form.Item label="模型项目目录" required>
+            <Space.Compact block>
+              <Input readOnly value={draft.project_directory} placeholder="从服务器模型库选择目录" />
+              <Button onClick={() => setPicker({ field: 'project_directory', title: '选择模型项目目录', scope: 'model', kind: 'directory', initialPath: draft.project_directory || undefined })}>选择目录</Button>
+            </Space.Compact>
+          </Form.Item>
+          <Form.Item label="命令工作目录" required>
+            <Space.Compact block>
+              <Input readOnly value={draft.working_directory} placeholder="默认使用模型项目目录" />
+              <Button disabled={!draft.project_directory} onClick={() => setPicker({ field: 'working_directory', title: '选择命令工作目录', scope: 'model', kind: 'directory', initialPath: draft.working_directory || draft.project_directory })}>选择目录</Button>
+            </Space.Compact>
+          </Form.Item>
+          <Form.Item label="Python 环境目录" required extra={draft.runtime_prefix ? <>平台将使用 <Typography.Text code>{`${draft.runtime_prefix.replace(/\/+$/, '')}/bin/python`}</Typography.Text> 执行模型命令。</> : '目录内必须存在 bin/python；也可以选择模型目录中的 .venv。'}>
+            <Space.Compact block>
+              <Input value={draft.runtime_prefix} onChange={(event) => setField('runtime_prefix', event.target.value)} placeholder="/path/to/conda/env" />
+              <Button onClick={() => setPicker({ field: 'runtime_prefix', title: '选择 Conda 环境目录', scope: 'environment', kind: 'directory' })}>选择环境</Button>
+            </Space.Compact>
+          </Form.Item>
+          <Form.Item label="模型权重" required>
+            <Space.Compact block>
+              <Input readOnly value={draft.weight_path} placeholder="选择模型权重文件" />
+              <Button disabled={!draft.project_directory} onClick={() => setPicker({ field: 'weight_path', title: '选择模型权重', scope: 'model', kind: 'weight', initialPath: draft.project_directory || undefined })}>选择权重</Button>
+            </Space.Compact>
+          </Form.Item>
+          <Form.Item
+            label="命令参数"
+            required
+            extra="每行一个参数。参数会原样传给可执行程序，不要输入整段 Shell 命令。"
+          >
+            <Input.TextArea
+              value={draft.command_arguments}
+              onChange={(event) => setField('command_arguments', event.target.value)}
+              autoSize={{ minRows: 9, maxRows: 18 }}
+              placeholder={'tools/evaluate.py\n--weights\n{weight_path}\n--images\n{image_directory}\n--annotations\n{annotation_path}\n--output\n{predictions_path}'}
+            />
+          </Form.Item>
+          <Typography.Paragraph type="secondary">
+            可用占位符：<Typography.Text code>{'{weight_path}'}</Typography.Text> <Typography.Text code>{'{image_directory}'}</Typography.Text> <Typography.Text code>{'{annotation_path}'}</Typography.Text> <Typography.Text code>{'{predictions_path}'}</Typography.Text> <Typography.Text code>{'{output_directory}'}</Typography.Text> <Typography.Text code>{'{device}'}</Typography.Text> <Typography.Text code>{'{precision}'}</Typography.Text> <Typography.Text code>{'{request_path}'}</Typography.Text> <Typography.Text code>{'{result_path}'}</Typography.Text>
+          </Typography.Paragraph>
+          <Space>
+            <Button type="primary" loading={registering} disabled={!ready} onClick={register}>注册模型</Button>
+            <Button onClick={() => setRegisterOpen(false)}>取消</Button>
+          </Space>
+        </Form>
+      </Drawer>
+      <Drawer
+        open={Boolean(selectedModel)}
+        width={720}
+        title={selectedModel ? `${selectedModel.name} · 模型参数` : '模型参数'}
+        onClose={() => setSelectedModel(undefined)}
+      >
+        {selectedModel && (
+          <Space direction="vertical" size={18} style={{ width: '100%' }}>
+            <Descriptions bordered column={2} items={[
+              { key: 'name', label: '模型名称', children: selectedModel.name, span: 2 },
+              { key: 'family', label: '模型族', children: selectedModel.family },
+              { key: 'architecture', label: '模型架构', children: selectedModel.architecture || '未记录' },
+              { key: 'backbone', label: 'Backbone', children: selectedModel.backbone || '未记录' },
+              { key: 'head', label: '检测头', children: selectedModel.detector_head || '未记录' },
+              { key: 'classes', label: '类别数', children: selectedModel.class_count || '未记录' },
+              { key: 'version', label: '版本', children: selectedModel.version },
+              { key: 'training', label: '训练数据', children: selectedModel.training_dataset || '未记录' },
+              { key: 'pretrained', label: '预训练数据', children: selectedModel.pretrained_dataset || '未记录' },
+              { key: 'precision', label: '默认精度', children: <Tag>{selectedModel.precision}</Tag> },
+              { key: 'status', label: '状态', children: <StatusTag status={selectedModel.status} /> },
+              { key: 'kind', label: '记录类型', children: selectedModel.is_demo ? <DemoTag /> : <Tag color="purple">本地真实模型</Tag> },
+              { key: 'runtime', label: '运行环境', children: <StatusTag status={adapters.data.find((item) => item.id === selectedModel.adapter_id)?.status || (adapters.loading ? 'CHECKING' : 'UNAVAILABLE')} />, span: 2 },
+              { key: 'weight', label: '权重路径', children: selectedModel.weight_path ? <Typography.Text code copyable>{selectedModel.weight_path}</Typography.Text> : '未记录', span: 2 },
+              { key: 'sha', label: '权重 SHA-256', children: selectedModel.weight_sha256 ? <Typography.Text code copyable>{selectedModel.weight_sha256}</Typography.Text> : '未记录', span: 2 },
+              { key: 'id', label: '模型 ID', children: <Typography.Text code copyable>{selectedModel.id}</Typography.Text>, span: 2 },
+            ]} />
+          </Space>
+        )}
+      </Drawer>
+      {picker && (
+        <LocalResourcePicker
+          open
+          title={picker.title}
+          scope={picker.scope}
+          kind={picker.kind}
+          initialPath={picker.initialPath}
+          onClose={() => setPicker(undefined)}
+          onSelect={selectResource}
+        />
+      )}
+    </>
+  )
 }
 
 export function EvaluationPage({ navigate, refresh }: PageProps) {
@@ -938,17 +1458,30 @@ export function EvaluationPage({ navigate, refresh }: PageProps) {
   const models = useResource<ModelVersion[]>('/api/models', [])
   const [datasetIds, setDatasetIds] = useState<string[]>([])
   const [modelIds, setModelIds] = useState<string[]>([])
-  const [seeds, setSeeds] = useState([1001, 1002, 1003])
-  const [blurLevels, setBlurLevels] = useState([0, 0.3, 0.5])
   const [precision, setPrecision] = useState('FP16')
-  const [warmup, setWarmup] = useState(20)
   const [jobId, setJobId] = useState<string>()
   const [submitting, setSubmitting] = useState(false)
-  useEffect(() => { if (!datasetIds.length && datasets.data.length) setDatasetIds(datasets.data.filter((item) => item.frozen).slice(0, 2).map((item) => item.id)) }, [datasets.data])
-  useEffect(() => { if (!modelIds.length && models.data.length) setModelIds(models.data.slice(0, 2).map((item) => item.id)) }, [models.data])
-  const count = datasetIds.length * modelIds.length * seeds.length * blurLevels.length
-  const submit = async () => { setSubmitting(true); try { const plan = await post<{ id: string }>('/api/evaluation-plans', { name: `感知效能评测 ${new Date().toLocaleString('zh-CN')}`, dataset_ids: datasetIds, model_ids: modelIds, seeds, blur_levels: blurLevels, batch_size: 1, precision, warmup }); const job = await post<Job>(`/api/evaluation-plans/${plan.id}/runs`); setJobId(job.id); refresh(); message.success('评测矩阵已提交') } catch (error) { message.error((error as Error).message) } finally { setSubmitting(false) } }
-  return <Space direction="vertical" size={18} style={{ width: '100%' }}><Alert type="warning" showIcon message="当前参考检测器只验证软件评测链路" description="页面中的 mAP 和时延均为确定性流程样例，接入真实权重后才可升级为正式结果。" /><Row gutter={[16, 16]}><Col xs={24} xl={12}><Card title="数据版本"><Select mode="multiple" value={datasetIds} onChange={setDatasetIds} optionFilterProp="label" style={{ width: '100%' }} options={datasets.data.map((item) => ({ value: item.id, label: item.name, disabled: !item.frozen }))} /><Divider /><Typography.Text type="secondary">仅允许选择已校核并冻结的数据版本。</Typography.Text></Card></Col><Col xs={24} xl={12}><Card title="模型版本"><Select mode="multiple" value={modelIds} onChange={setModelIds} style={{ width: '100%' }} options={models.data.map((item) => ({ value: item.id, label: item.name }))} /><Divider /><Space><DemoTag /><Typography.Text type="secondary">替换为真实 Adapter 后界面不变。</Typography.Text></Space></Card></Col><Col xs={24} xl={12}><Card title="条件与随机重复"><Form layout="vertical"><Form.Item label="模糊强度网格"><Checkbox.Group value={blurLevels} onChange={(values) => setBlurLevels(values as number[])} options={[0, 0.1, 0.3, 0.5].map((value) => ({ value, label: value === 0 ? '0 清洁' : value }))} /></Form.Item><Form.Item label="固定 seed"><Checkbox.Group value={seeds} onChange={(values) => setSeeds(values as number[])} options={[1001, 1002, 1003, 1004].map((value) => ({ value, label: value }))} /></Form.Item></Form></Card></Col><Col xs={24} xl={12}><Card title="标准化推理协议"><Form layout="vertical"><Form.Item label="精度模式"><Segmented block value={precision} onChange={(value) => setPrecision(String(value))} options={['FP32', 'FP16', 'INT8']} /></Form.Item><Form.Item label="预热次数"><InputNumber value={warmup} onChange={(value) => setWarmup(value || 0)} min={0} max={200} style={{ width: '100%' }} addonAfter="次" /></Form.Item></Form></Card></Col></Row><Card className="matrix-preview"><Row align="middle" gutter={[18, 18]}><Col flex="auto"><Typography.Title level={4}>组合矩阵预览</Typography.Title><Typography.Text type="secondary">{datasetIds.length} 数据版本 × {modelIds.length} 模型 × {blurLevels.length} 条件 × {seeds.length} seed</Typography.Text></Col><Col><Statistic value={count} suffix="次运行" /></Col><Col><Button type="primary" size="large" icon={<PlayCircleOutlined />} disabled={!count} loading={submitting} onClick={submit}>启动批量评测</Button></Col></Row></Card>{jobId && <JobProgress jobId={jobId} onFinish={() => refresh()} />}{jobId && <Card><Button type="primary" onClick={() => navigate('explorer')}>打开效能探索器</Button></Card>}</Space>
+  const selectedModels = models.data.filter((item) => modelIds.includes(item.id))
+  const hasRealDetector = selectedModels.some((item) => !item.is_demo)
+  useEffect(() => { if (hasRealDetector && precision === 'INT8') setPrecision('FP16') }, [hasRealDetector, precision])
+  const count = datasetIds.length * modelIds.length
+  const submit = async () => { setSubmitting(true); try { const plan = await post<{ id: string }>('/api/evaluation-plans', { name: `感知效能评测 ${new Date().toLocaleString('zh-CN')}`, dataset_ids: datasetIds, model_ids: modelIds, seeds: [1001], blur_levels: [0], batch_size: 1, precision, warmup: 0 }); const job = await post<Job>(`/api/evaluation-plans/${plan.id}/runs`); setJobId(job.id); refresh(); message.success('评测矩阵已提交') } catch (error) { message.error((error as Error).message) } finally { setSubmitting(false) } }
+  return <Space direction="vertical" size={18} style={{ width: '100%' }}>
+    <Alert
+      type={hasRealDetector ? 'info' : 'warning'}
+      showIcon
+      message={hasRealDetector ? '已选择本地真实检测模型' : '当前选择的是参考流程模型'}
+      description={hasRealDetector ? '使用模型注册时登记的推理入口、Python 环境和权重执行真实推理，并用 pycocotools 计算 COCO 指标。' : '页面中的 mAP 和时延为确定性流程样例。可在“模型版本”中注册本地检测模型。'}
+    />
+    <Row gutter={[16, 16]}>
+      <Col xs={24} xl={12}><Card title="数据版本"><Select mode="multiple" value={datasetIds} onChange={setDatasetIds} optionFilterProp="label" style={{ width: '100%' }} options={datasets.data.map((item) => ({ value: item.id, label: item.name, disabled: !item.frozen }))} /><Divider /><Typography.Text type="secondary">真实检测要求数据集已冻结，并具有 COCO 或 VisDrone 目标框标注。</Typography.Text></Card></Col>
+      <Col xs={24} xl={12}><Card title="模型版本"><Select mode="multiple" value={modelIds} onChange={setModelIds} style={{ width: '100%' }} options={models.data.map((item) => ({ value: item.id, label: `${item.name}${item.is_demo ? '（流程样例）' : '（真实推理）'}`, disabled: item.status === 'UNAVAILABLE' }))} /><Divider />{hasRealDetector ? <Tag color="purple">本地真实模型</Tag> : <Space><DemoTag /><Typography.Text type="secondary">可选择已注册的本地检测模型。</Typography.Text></Space>}</Card></Col>
+      <Col span={24}><Card title="标准化推理协议"><Form layout="vertical"><Form.Item label="精度模式"><Segmented block value={precision} onChange={(value) => setPrecision(String(value))} options={[{ value: 'FP32', label: 'FP32' }, { value: 'FP16', label: 'FP16' }, { value: 'INT8', label: 'INT8', disabled: hasRealDetector }]} /></Form.Item></Form></Card></Col>
+    </Row>
+    <Card className="matrix-preview"><Row align="middle" gutter={[18, 18]}><Col flex="auto"><Typography.Title level={4}>组合矩阵预览</Typography.Title><Typography.Text type="secondary">{datasetIds.length} 数据版本 × {modelIds.length} 模型</Typography.Text></Col><Col><Statistic value={count} suffix="次运行" /></Col><Col><Button type="primary" size="large" icon={<PlayCircleOutlined />} disabled={!count} loading={submitting} onClick={submit}>启动批量评测</Button></Col></Row></Card>
+    {jobId && <JobProgress jobId={jobId} onFinish={() => refresh()} />}
+    {jobId && <Card><Button type="primary" onClick={() => navigate('explorer')}>打开效能探索器</Button></Card>}
+  </Space>
 }
 
 export function ExplorerPage({ dark }: PageProps) {
@@ -961,7 +1494,21 @@ export function ExplorerPage({ dark }: PageProps) {
   const load = async () => { setLoading(true); try { const query = new URLSearchParams(); if (scene) query.set('scene', scene); if (condition) query.set('condition', condition); if (resolution) query.set('resolution', resolution); setData(await api<ResultResponse>(`/api/results?${query}`)) } catch (error) { message.error((error as Error).message) } finally { setLoading(false) } }
   useEffect(() => { load() }, [])
   const robustness = useMemo(() => ({ tooltip: { trigger: 'axis' }, legend: { textStyle: { color: dark ? '#c5d0de' : '#4b5565' } }, grid: { left: 55, right: 20, top: 48, bottom: 38 }, xAxis: { type: 'category', name: '条件数据集', data: [...new Set(data.groups.map((item) => item.dataset_name.replace('无人机航拍 · ', '')))], axisLabel: { color: dark ? '#9dafc7' : '#687386' } }, yAxis: { type: 'value', min: 0.45, max: 0.9, axisLabel: { formatter: (value: number) => `${Math.round(value * 100)}%`, color: dark ? '#9dafc7' : '#687386' }, splitLine: { lineStyle: { color: dark ? '#263449' : '#eef1f5' } } }, series: [...new Set(data.groups.map((item) => item.model_name))].slice(0, 4).map((name) => ({ name: name.split('·')[0], type: 'line', smooth: true, data: [...new Set(data.groups.map((item) => item.dataset_name))].map((datasetName) => data.groups.find((item) => item.model_name === name && item.dataset_name === datasetName)?.map_mean ?? null) })) }), [data.groups, dark])
-  return <Space direction="vertical" size={18} style={{ width: '100%' }}><Card className="filter-card"><Row gutter={[12, 12]} align="bottom"><Col xs={24} md={5}><Typography.Text type="secondary">场景域</Typography.Text><Select allowClear value={scene} onChange={setScene} placeholder="全部场景" style={{ width: '100%', marginTop: 6 }} options={['无人机航拍', '城市驾驶', '卫星遥感'].map((value) => ({ value }))} /></Col><Col xs={24} md={5}><Typography.Text type="secondary">环境条件</Typography.Text><Select allowClear value={condition} onChange={setCondition} placeholder="全部条件" style={{ width: '100%', marginTop: 6 }} options={['晴朗', '雾', '雨', '夜间'].map((value) => ({ value }))} /></Col><Col xs={24} md={5}><Typography.Text type="secondary">分辨率</Typography.Text><Select allowClear value={resolution} onChange={setResolution} placeholder="保留为分组维度" style={{ width: '100%', marginTop: 6 }} options={['1920×1080', '1280×720', '640×640'].map((value) => ({ value }))} /></Col><Col xs={24} md={5}><Typography.Text type="secondary">硬件范围</Typography.Text><Select value="current" style={{ width: '100%', marginTop: 6 }} options={[{ value: 'current', label: '相同参考设备' }]} /></Col><Col xs={24} md={4}><Button block type="primary" icon={<EyeOutlined />} onClick={load} loading={loading}>查询效能</Button></Col></Row></Card><Alert type="info" showIcon message={`找到 ${data.count} 次 seed 运行，聚合为 ${data.groups.length} 个可比单元`} description={!resolution ? '分辨率未限定，结果按分辨率分别展示，不进行隐式平均。' : '当前为精确分辨率查询。'} action={<DemoTag />} /><Row gutter={[16, 16]}><Col xs={24} xl={12}><Card title="模型排行榜"><Table size="small" loading={loading} rowKey={(row) => `${row.dataset_id}-${row.model_id}`} dataSource={data.groups} pagination={{ pageSize: 6 }} onRow={(record) => ({ onClick: () => setSelected(record), style: { cursor: 'pointer' } })} columns={[{ title: '模型', dataIndex: 'model_name', render: (value) => <Typography.Text strong>{value.split('·')[0]}</Typography.Text> }, { title: '条件单元', dataIndex: 'dataset_name' }, { title: '分辨率', dataIndex: 'resolution' }, { title: 'mAP', dataIndex: 'map_mean', sorter: (a, b) => a.map_mean - b.map_mean, render: (value) => <Typography.Text strong className="map-value">{percent(value)}</Typography.Text> }, { title: 'σ', dataIndex: 'map_std', render: (value) => percent(value) }, { title: '时延', dataIndex: 'latency_mean', render: (value) => `${value} ms` }]} /></Card></Col><Col xs={24} xl={12}><Card title="mAP — 时延 Pareto"><ParetoChart groups={data.groups} dark={dark} height={320} /></Card></Col><Col xs={24} xl={12}><Card title="条件鲁棒性"><ReactECharts option={robustness} style={{ height: 300 }} /></Card></Col><Col xs={24} xl={12}><Card title="PR 曲线"><PRChart groups={data.groups} dark={dark} height={300} /></Card></Col></Row><Drawer open={Boolean(selected)} onClose={() => setSelected(undefined)} title="效能单元详情" width={620}>{selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Space><DemoTag /><StatusTag status="VERIFIED" /></Space><Row gutter={12}><Col span={8}><Card><Statistic title="mAP" value={selected.map_mean * 100} precision={1} suffix="%" /></Card></Col><Col span={8}><Card><Statistic title="seed σ" value={selected.map_std * 100} precision={2} suffix="%" /></Card></Col><Col span={8}><Card><Statistic title="时延" value={selected.latency_mean} precision={1} suffix="ms" /></Card></Col></Row><Descriptions bordered column={1} items={[{ key: 'model', label: '模型', children: selected.model_name }, { key: 'backbone', label: 'Backbone', children: selected.backbone }, { key: 'dataset', label: '数据版本', children: selected.dataset_name }, { key: 'scene', label: '场景', children: `${selected.scene_domain} / ${selected.weather}` }, { key: 'resolution', label: '分辨率', children: selected.resolution }, { key: 'seeds', label: '重复次数', children: `${selected.seed_count} 个 seed` }, { key: 'official', label: '结果性质', children: <DemoTag /> }]} /><PRChart groups={[selected]} dark={dark} /></Space>}</Drawer></Space>
+  const natureTag = (group: ResultGroup) => group.is_demo ? <DemoTag /> : group.is_official ? <Tag color="green">真实模型 · 正式结果</Tag> : <Tag color="purple">真实模型 · 实验性结果</Tag>
+  const containsRealResults = data.groups.some((item) => !item.is_demo)
+  return <Space direction="vertical" size={18} style={{ width: '100%' }}>
+    <Card className="filter-card"><Row gutter={[12, 12]} align="bottom"><Col xs={24} md={5}><Typography.Text type="secondary">场景域</Typography.Text><Select allowClear value={scene} onChange={setScene} placeholder="全部场景" style={{ width: '100%', marginTop: 6 }} options={['无人机航拍', '城市驾驶', '卫星遥感'].map((value) => ({ value }))} /></Col><Col xs={24} md={5}><Typography.Text type="secondary">环境条件</Typography.Text><Select allowClear value={condition} onChange={setCondition} placeholder="全部条件" style={{ width: '100%', marginTop: 6 }} options={['晴朗', '雾', '雨', '夜间'].map((value) => ({ value }))} /></Col><Col xs={24} md={5}><Typography.Text type="secondary">分辨率</Typography.Text><Select allowClear value={resolution} onChange={setResolution} placeholder="保留为分组维度" style={{ width: '100%', marginTop: 6 }} options={['1920×1080', '1280×720', '640×640'].map((value) => ({ value }))} /></Col><Col xs={24} md={5}><Typography.Text type="secondary">硬件范围</Typography.Text><Select value="current" style={{ width: '100%', marginTop: 6 }} options={[{ value: 'current', label: '相同参考设备' }]} /></Col><Col xs={24} md={4}><Button block type="primary" icon={<EyeOutlined />} onClick={load} loading={loading}>查询效能</Button></Col></Row></Card>
+    <Alert type="info" showIcon message={`找到 ${data.count} 次 seed 运行，聚合为 ${data.groups.length} 个可比单元`} description={!resolution ? '分辨率未限定，结果按分辨率分别展示，不进行隐式平均。' : '当前为精确分辨率查询。'} action={containsRealResults ? <Tag color="purple">包含真实模型结果</Tag> : <DemoTag />} />
+    <Row gutter={[16, 16]}>
+      <Col xs={24} xl={12}><Card title="模型排行榜"><Table size="small" loading={loading} rowKey={(row) => `${row.dataset_id}-${row.model_id}`} dataSource={data.groups} pagination={{ pageSize: 6 }} onRow={(record) => ({ onClick: () => setSelected(record), style: { cursor: 'pointer' } })} columns={[{ title: '模型', dataIndex: 'model_name', render: (value) => <Typography.Text strong>{value.split('·')[0]}</Typography.Text> }, { title: '条件单元', dataIndex: 'dataset_name' }, { title: '分辨率', dataIndex: 'resolution' }, { title: 'mAP', dataIndex: 'map_mean', sorter: (a, b) => a.map_mean - b.map_mean, render: (value) => <Typography.Text strong className="map-value">{percent(value)}</Typography.Text> }, { title: 'σ', dataIndex: 'map_std', render: (value) => percent(value) }, { title: '时延', dataIndex: 'latency_mean', render: (value) => `${value} ms` }]} /></Card></Col>
+      <Col xs={24} xl={12}><Card title="mAP — 时延 Pareto"><ParetoChart groups={data.groups} dark={dark} height={320} /></Card></Col>
+      <Col xs={24} xl={12}><Card title="条件鲁棒性"><ReactECharts option={robustness} style={{ height: 300 }} /></Card></Col>
+      <Col xs={24} xl={12}><Card title="PR 曲线"><PRChart groups={data.groups} dark={dark} height={300} /></Card></Col>
+    </Row>
+    <Drawer open={Boolean(selected)} onClose={() => setSelected(undefined)} title="效能单元详情" width={620}>
+      {selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Space>{natureTag(selected)}<StatusTag status="VERIFIED" /></Space><Row gutter={12}><Col span={8}><Card><Statistic title="mAP" value={selected.map_mean * 100} precision={1} suffix="%" /></Card></Col><Col span={8}><Card><Statistic title="seed σ" value={selected.map_std * 100} precision={2} suffix="%" /></Card></Col><Col span={8}><Card><Statistic title="时延" value={selected.latency_mean} precision={1} suffix="ms" /></Card></Col></Row><Descriptions bordered column={1} items={[{ key: 'model', label: '模型', children: selected.model_name }, { key: 'backbone', label: 'Backbone', children: selected.backbone }, { key: 'dataset', label: '数据版本', children: selected.dataset_name }, { key: 'scene', label: '场景', children: `${selected.scene_domain} / ${selected.weather}` }, { key: 'resolution', label: '分辨率', children: selected.resolution }, { key: 'seeds', label: '重复次数', children: `${selected.seed_count} 个 seed` }, { key: 'official', label: '结果性质', children: natureTag(selected) }]} /><PRChart groups={[selected]} dark={dark} /></Space>}
+    </Drawer>
+  </Space>
 }
 
 export function TasksPage(_: PageProps) {

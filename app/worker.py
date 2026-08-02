@@ -14,8 +14,16 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from PIL import Image, ImageFilter
+
+from app.annotation_formats import (
+    convert_visdrone_to_coco,
+    is_visdrone_label_directory,
+)
+from app.command_protocol import CommandTemplateError, render_command
 from app.config import Settings, settings
 from app.db import Database, db, json_dump, json_load, make_curves, make_metrics, new_id, utc_now
+from app.detection_metrics import evaluate_coco_predictions
 
 
 class JobAgent:
@@ -329,7 +337,8 @@ class JobAgent:
         current = int(event.get("current", 0))
         total = max(1, int(event.get("total", 1)))
         progress = 25 + 48 * current / total
-        self._progress(job_id, progress, f"生成图像 {current}/{total}")
+        stage = str(event.get("stage", "生成图像"))
+        self._progress(job_id, progress, f"{stage} {current}/{total}")
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[str]) -> None:
@@ -347,26 +356,66 @@ class JobAgent:
         source = Path(payload["directory"]).expanduser().resolve()
         if not source.is_dir():
             raise FileNotFoundError(f"导入目录不存在: {source}")
-        candidates = [
+        candidates = sorted(
             path
             for path in source.rglob("*")
             if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".svg"}
-        ]
+        )
         if not candidates:
             raise ValueError("目录中没有支持的图像")
         target = self.settings.artifact_dir / "imports" / job["id"]
         target.mkdir(parents=True, exist_ok=True)
         for index, path in enumerate(candidates):
             self._check_cancelled(job["id"])
-            shutil.copy2(path, target / f"{index:06d}{path.suffix.lower()}")
+            image_target = target / path.name
+            if image_target.exists():
+                raise ValueError(
+                    f"图像目录中存在重复文件名，无法匹配标注: {path.name}"
+                )
+            shutil.copy2(path, image_target)
             self._progress(job["id"], 10 + 70 * (index + 1) / len(candidates), f"复制图像 {index + 1}/{len(candidates)}")
         annotation = payload.get("annotation_path")
         annotation_status = "UNLABELED"
+        annotation_count = 0
         if annotation:
             annotation_path = Path(annotation).expanduser().resolve()
             if annotation_path.is_file():
-                shutil.copy2(annotation_path, target / annotation_path.name)
+                if annotation_path.suffix.lower() == ".json":
+                    annotation_target = target / "annotations" / "instances.json"
+                    annotation_target.parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    annotation_target = target / annotation_path.name
+                shutil.copy2(annotation_path, annotation_target)
                 annotation_status = "CANDIDATE"
+                annotation_count = 1
+            elif annotation_path.is_dir():
+                annotation_format = str(
+                    payload.get("annotation_format", "YOLO")
+                ).lower()
+                annotation_target = (
+                    target / "annotations" / annotation_format
+                )
+                supported = {".txt", ".yaml", ".yml", ".names"}
+                annotation_files = sorted(
+                    path
+                    for path in annotation_path.rglob("*")
+                    if path.is_file() and path.suffix.lower() in supported
+                )
+                for path in annotation_files:
+                    relative = path.relative_to(annotation_path)
+                    output = annotation_target / relative
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, output)
+                if annotation_files:
+                    annotation_status = "CANDIDATE"
+                    annotation_count = len(annotation_files)
+                    if annotation_format == "visdrone":
+                        convert_visdrone_to_coco(
+                            target,
+                            annotation_target,
+                            target / "annotations" / "instances.json",
+                            payload["name"],
+                        )
         dataset_id = new_id("dataset")
         self.db.execute(
             """
@@ -391,7 +440,25 @@ class JobAgent:
                 utc_now(),
             ),
         )
-        return {"dataset_id": dataset_id, "samples": len(candidates), "annotation_status": annotation_status}
+        staged_upload_root = payload.get("staged_upload_root")
+        if staged_upload_root:
+            allowed_root = (
+                self.settings.task_dir / "import_uploads"
+            ).resolve()
+            staging = Path(staged_upload_root).resolve()
+            if (
+                staging != allowed_root
+                and staging.is_relative_to(allowed_root)
+                and source.is_relative_to(staging)
+                and staging.is_dir()
+            ):
+                shutil.rmtree(staging)
+        return {
+            "dataset_id": dataset_id,
+            "samples": len(candidates),
+            "annotation_status": annotation_status,
+            "annotation_files": annotation_count,
+        }
 
     def _run_evaluation(self, job: dict[str, Any]) -> dict[str, Any]:
         payload = job["payload"]
@@ -412,6 +479,22 @@ class JobAgent:
                 raise ValueError("数据集或模型不存在")
             if not dataset["frozen"]:
                 raise ValueError(f"数据集尚未冻结: {dataset['name']}")
+            if not model["is_demo"]:
+                run_id = self._run_detector_evaluation(
+                    job,
+                    plan,
+                    dataset,
+                    model,
+                    seed,
+                    blur,
+                )
+                created_runs.append(run_id)
+                self._progress(
+                    job["id"],
+                    8 + 88 * (index + 1) / len(combinations),
+                    f"真实检测评测 {index + 1}/{len(combinations)}",
+                )
+                continue
             run_id = new_id("run")
             stable = int(hashlib.sha256(f"{dataset_id}{model_id}{seed}{blur}".encode()).hexdigest()[:8], 16)
             family_bias = {"YOLOv5": 0.79, "Faster R-CNN": 0.83, "RetinaNet": 0.76}.get(model["family"], 0.72)
@@ -469,6 +552,392 @@ class JobAgent:
             self._progress(job["id"], 8 + 88 * (index + 1) / len(combinations), f"参考评测 {index + 1}/{len(combinations)}")
             time.sleep(0.03)
         return {"plan_id": plan["id"], "run_ids": created_runs, "count": len(created_runs), "is_official": False}
+
+    def _run_detector_evaluation(
+        self,
+        job: dict[str, Any],
+        plan: dict[str, Any],
+        dataset: dict[str, Any],
+        model: dict[str, Any],
+        seed: int,
+        blur: float,
+    ) -> str:
+        adapter = self.db.row(
+            "SELECT * FROM adapters WHERE id=?", (model["adapter_id"],)
+        )
+        if not adapter or adapter["kind"] != "DETECTOR":
+            raise ValueError(f"模型没有可用的检测适配器: {model['name']}")
+        if not model.get("weight_path") or not Path(model["weight_path"]).is_file():
+            raise FileNotFoundError(f"模型权重不存在: {model.get('weight_path')}")
+
+        artifact_root = self.settings.artifact_dir.resolve()
+        dataset_directory = (
+            artifact_root / str(dataset.get("artifact_path") or "")
+        ).resolve()
+        if (
+            dataset_directory == artifact_root
+            or not dataset_directory.is_relative_to(artifact_root)
+            or not dataset_directory.is_dir()
+        ):
+            raise ValueError(f"数据集 Artifact 不可用: {dataset['name']}")
+
+        run_id = new_id("run")
+        job_directory = self.settings.task_dir / job["id"] / "runs" / run_id
+        output_directory = self.settings.artifact_dir / "evaluations" / run_id
+        job_directory.mkdir(parents=True, exist_ok=True)
+        output_directory.mkdir(parents=True, exist_ok=True)
+
+        annotation_path = dataset_directory / "annotations" / "instances.json"
+        annotation_conversion = None
+        if not annotation_path.is_file():
+            annotations_directory = dataset_directory / "annotations"
+            visdrone_directory = next(
+                (
+                    candidate
+                    for candidate in (
+                        annotations_directory / "visdrone",
+                        annotations_directory / "yolo",
+                        annotations_directory,
+                    )
+                    if candidate.is_dir()
+                    and is_visdrone_label_directory(candidate)
+                ),
+                None,
+            )
+            if not visdrone_directory:
+                raise FileNotFoundError(
+                    "数据集缺少已提交的 COCO 标注，也未找到可转换的 "
+                    f"VisDrone TXT 标注: {annotation_path}"
+                )
+            annotation_path = job_directory / "annotations" / "instances.json"
+            annotation_conversion = convert_visdrone_to_coco(
+                dataset_directory,
+                visdrone_directory,
+                annotation_path,
+                dataset["name"],
+            )
+        ground_truth = json.loads(annotation_path.read_text(encoding="utf-8"))
+        if not ground_truth.get("images") or not ground_truth.get("categories"):
+            raise ValueError("COCO 标注必须包含图片和类别")
+
+        image_directory = dataset_directory
+        if float(blur) > 0:
+            image_directory = job_directory / "images"
+            self._prepare_blurred_evaluation_images(
+                dataset_directory,
+                image_directory,
+                ground_truth,
+                float(blur),
+            )
+
+        schema = json_load(adapter.get("parameter_schema"), {})
+        properties = schema.get("properties", {})
+
+        def parameter(name: str, fallback: Any) -> Any:
+            specification = properties.get(name, {})
+            return specification.get("const", specification.get("default", fallback))
+
+        protocol = json_load(plan.get("protocol"), {})
+        config = {
+            "batch_size": int(protocol.get("batch_size", 1)),
+            "precision": str(protocol.get("precision", model["precision"])),
+            "warmup": int(protocol.get("warmup", 20)),
+            "blur_level": float(blur),
+            "confidence": float(parameter("confidence", 0.001)),
+            "nms_iou": float(parameter("nms_iou", 0.7)),
+            "image_size": int(parameter("image_size", 1280)),
+            "max_detections": int(parameter("max_detections", 300)),
+            "metric_protocol": "pycocotools-2.0.11",
+            "adapter_id": adapter["id"],
+            "annotation_conversion": annotation_conversion,
+        }
+        request_path = job_directory / "request.json"
+        result_path = job_directory / "result.json"
+        request = {
+            "protocol_version": "1.0",
+            "job_id": job["id"],
+            "run_id": run_id,
+            "seed": int(seed),
+            "model": {
+                "id": model["id"],
+                "catalog_model_id": parameter(
+                    "catalog_model_id", "yolov8m_visdrone"
+                ),
+                "project_directory": parameter(
+                    "project_directory", None
+                ),
+                "weight_path": model["weight_path"],
+                "weight_sha256": model.get("weight_sha256"),
+            },
+            "dataset": {
+                "id": dataset["id"],
+                "image_directory": str(image_directory),
+                "annotation_path": str(annotation_path),
+            },
+            "inference": {
+                "device": "cuda:0",
+                "precision": config["precision"],
+                "batch_size": config["batch_size"],
+                "warmup": config["warmup"],
+                "confidence": config["confidence"],
+                "nms_iou": config["nms_iou"],
+                "image_size": config["image_size"],
+                "max_detections": config["max_detections"],
+            },
+            "category_aliases": {"motor": "motorcycle"},
+            "output_directory": str(output_directory),
+        }
+        request_path.write_text(json_dump(request), encoding="utf-8")
+
+        execution = schema.get("execution", {})
+        command_mode = execution.get("mode") == "command"
+        predictions_filename = str(
+            execution.get("predictions_filename", "predictions.json")
+        )
+        prediction_relative = Path(predictions_filename)
+        if (
+            prediction_relative.is_absolute()
+            or ".." in prediction_relative.parts
+        ):
+            raise ValueError("命令模式预测结果路径必须位于评测输出目录内")
+        if command_mode:
+            executable = Path(str(execution.get("executable", "")))
+            working_directory = Path(
+                str(execution.get("working_directory", ""))
+            )
+            arguments = execution.get("arguments", [])
+            if not executable.is_file():
+                raise FileNotFoundError(
+                    f"检测命令可执行程序不存在: {executable}"
+                )
+            if not working_directory.is_dir():
+                raise FileNotFoundError(
+                    f"检测命令工作目录不存在: {working_directory}"
+                )
+            if not isinstance(arguments, list) or not all(
+                isinstance(value, str) for value in arguments
+            ):
+                raise ValueError("检测命令参数必须是字符串数组")
+            placeholders = {
+                "annotation_path": str(annotation_path),
+                "batch_size": str(config["batch_size"]),
+                "confidence": str(config["confidence"]),
+                "dataset_id": str(dataset["id"]),
+                "device": "cuda:0",
+                "image_directory": str(image_directory),
+                "image_size": str(config["image_size"]),
+                "max_detections": str(config["max_detections"]),
+                "model_id": str(model["id"]),
+                "nms_iou": str(config["nms_iou"]),
+                "output_directory": str(output_directory),
+                "precision": str(config["precision"]),
+                "predictions_path": str(
+                    output_directory / prediction_relative
+                ),
+                "project_directory": str(
+                    request["model"].get("project_directory") or ""
+                ),
+                "request_path": str(request_path),
+                "result_path": str(result_path),
+                "weight_path": str(model["weight_path"]),
+            }
+            try:
+                command = render_command(
+                    str(executable),
+                    arguments,
+                    placeholders,
+                )
+            except CommandTemplateError as exc:
+                raise ValueError(str(exc)) from exc
+            process_directory = working_directory
+        else:
+            entrypoint_value = adapter.get("entrypoint")
+            if not entrypoint_value:
+                raise ValueError("检测适配器没有配置入口脚本")
+            entrypoint = Path(entrypoint_value)
+            if not entrypoint.is_absolute():
+                entrypoint = self.settings.root_dir / entrypoint
+            if not entrypoint.is_file():
+                raise FileNotFoundError(
+                    f"检测适配器入口不存在: {entrypoint}"
+                )
+            command = self._adapter_command(
+                adapter, entrypoint, request_path, result_path
+            )
+            process_directory = job_directory
+        environment = os.environ.copy()
+        environment.update(self._isolated_cache_environment(job_directory))
+        environment.update(
+            {
+                "DRONEDETS_ROOT": str(self.settings.dronedets_root),
+                "PYTHONUNBUFFERED": "1",
+            }
+        )
+        self._progress(
+            job["id"],
+            20,
+            "启动目标检测命令" if command_mode else "启动目标检测适配器",
+        )
+        command_started = time.monotonic()
+        returncode, log_tail = self._run_adapter_process(
+            job["id"], command, process_directory, environment
+        )
+        command_duration_ms = (
+            time.monotonic() - command_started
+        ) * 1000
+        if returncode != 0:
+            raise RuntimeError(
+                f"检测适配器退出码 {returncode}: {log_tail[-500:]}"
+            )
+        if result_path.is_file():
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        elif command_mode:
+            result = {
+                "protocol_version": "1.0",
+                "job_id": job["id"],
+                "run_id": run_id,
+                "status": "succeeded",
+                "predictions_path": predictions_filename,
+                "image_count": len(ground_truth["images"]),
+                "runtime": {
+                    "duration_ms": command_duration_ms,
+                    "peak_memory_mb": 0.0,
+                },
+                "environment": {
+                    "execution_mode": "command",
+                    "executable": str(command[0]),
+                },
+                "warnings": [
+                    "模型命令未生成 result.json；时延仅包含进程总耗时，"
+                    "不提供分阶段耗时和峰值显存。"
+                ],
+            }
+        else:
+            raise FileNotFoundError("检测适配器没有生成 result.json")
+        if result.get("protocol_version") != "1.0":
+            raise ValueError("检测适配器结果协议版本不受支持")
+        if result.get("job_id") != job["id"] or result.get("run_id") != run_id:
+            raise ValueError("检测适配器结果与当前运行不匹配")
+        if result.get("status") != "succeeded":
+            raise ValueError(f"检测适配器返回失败状态: {result.get('status')}")
+        if int(result.get("image_count", -1)) != len(ground_truth["images"]):
+            raise ValueError("检测适配器处理图片数与 COCO 真值不一致")
+
+        prediction_relative = Path(str(result.get("predictions_path", "")))
+        if prediction_relative.is_absolute() or ".." in prediction_relative.parts:
+            raise ValueError("检测结果路径必须位于评测 Artifact 目录内")
+        predictions_path = (output_directory / prediction_relative).resolve()
+        if (
+            not predictions_path.is_relative_to(output_directory.resolve())
+            or not predictions_path.is_file()
+        ):
+            raise FileNotFoundError("检测适配器没有生成有效的 predictions.json")
+        self._progress(job["id"], 78, "计算 COCO 检测指标")
+        metrics, curves = evaluate_coco_predictions(
+            annotation_path,
+            predictions_path,
+            result.get("runtime", {}),
+        )
+        config.update(
+            {
+                "predictions_path": predictions_path.relative_to(
+                    self.settings.artifact_dir
+                ).as_posix(),
+                "unmatched_labels": result.get("unmatched_labels", {}),
+                "warnings": result.get("warnings", []),
+            }
+        )
+        environment_details = result.get("environment", {})
+        fingerprint = hashlib.sha256(
+            json_dump(
+                {
+                    "environment": environment_details,
+                    "weight_sha256": model.get("weight_sha256"),
+                }
+            ).encode()
+        ).hexdigest()
+        is_official = (
+            adapter["maturity"] == "BENCHMARK_READY"
+            and model["status"] == "BENCHMARK_READY"
+        )
+        now = utc_now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO runs
+                (id,plan_id,job_id,dataset_id,model_id,seed,status,config,
+                 environment_fingerprint,hardware_profile,created_at,finished_at)
+                VALUES (?,?,?,?,?,?, 'SUCCEEDED', ?,?,?,?,?)
+                """,
+                (
+                    run_id,
+                    plan["id"],
+                    job["id"],
+                    dataset["id"],
+                    model["id"],
+                    int(seed),
+                    json_dump(config),
+                    fingerprint,
+                    json_dump(environment_details),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO results
+                (id,run_id,map,map50,map75,precision,recall,f1,latency_p50,
+                 latency_p95,fps,peak_memory,delta_map,metrics,curves,is_official,
+                 created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    new_id("result"),
+                    run_id,
+                    metrics["map"],
+                    metrics["map50"],
+                    metrics["map75"],
+                    metrics["precision"],
+                    metrics["recall"],
+                    metrics["f1"],
+                    metrics["latency_p50"],
+                    metrics["latency_p95"],
+                    metrics["fps"],
+                    metrics["peak_memory"],
+                    None,
+                    json_dump(metrics),
+                    json_dump(curves),
+                    int(is_official),
+                    now,
+                ),
+            )
+        return run_id
+
+    @staticmethod
+    def _prepare_blurred_evaluation_images(
+        source_directory: Path,
+        target_directory: Path,
+        ground_truth: dict[str, Any],
+        blur: float,
+    ) -> None:
+        target_directory.mkdir(parents=True, exist_ok=True)
+        radius = blur * 8
+        for image in ground_truth["images"]:
+            relative = Path(str(image["file_name"]))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"COCO 图片路径不安全: {relative}")
+            source = (source_directory / relative).resolve()
+            if (
+                not source.is_relative_to(source_directory.resolve())
+                or not source.is_file()
+            ):
+                raise FileNotFoundError(f"缺少评测图片: {source}")
+            target = target_directory / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with Image.open(source) as opened:
+                opened.convert("RGB").filter(
+                    ImageFilter.GaussianBlur(radius=radius)
+                ).save(target)
 
     def _isolated_cache_environment(self, job_dir: Path) -> dict[str, str]:
         cache = self.settings.runtime_dir / "cache"

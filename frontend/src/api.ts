@@ -1,8 +1,9 @@
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const isFormData = init?.body instanceof FormData
   const response = await fetch(path, {
     ...init,
     headers: {
-      'Content-Type': 'application/json',
+      ...(!isFormData ? { 'Content-Type': 'application/json' } : {}),
       ...(init?.headers || {}),
     },
   })
@@ -31,4 +32,3 @@ export function formatBytes(value: number): string {
 export function percent(value: number): string {
   return `${(value * 100).toFixed(1)}%`
 }
-

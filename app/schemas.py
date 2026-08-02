@@ -54,12 +54,35 @@ class SampleAnnotationUpdate(BaseModel):
 class ModelCreateRequest(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     family: str
+    architecture: str = "未记录"
     backbone: str = "未记录"
+    detector_head: str = "未记录"
+    class_count: int = Field(default=0, ge=0, le=100000)
+    training_dataset: str = "未记录"
+    pretrained_dataset: str = "未记录"
     version: str = "v1"
     precision: Literal["FP32", "FP16", "INT8"] = "FP32"
     adapter_id: str
     weight_path: str | None = None
     is_demo: bool = False
+
+
+class LocalDetectorModelRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    family: str = Field(min_length=1, max_length=80)
+    architecture: str = Field(min_length=1, max_length=80)
+    backbone: str = Field(min_length=1, max_length=80)
+    detector_head: str = Field(min_length=1, max_length=80)
+    class_count: int = Field(ge=1, le=100000)
+    training_dataset: str = Field(min_length=1, max_length=120)
+    pretrained_dataset: str = Field(min_length=1, max_length=120)
+    version: str = Field(default="v1", min_length=1, max_length=40)
+    precision: Literal["FP32", "FP16"] = "FP16"
+    project_directory: str
+    working_directory: str
+    runtime_prefix: str
+    command_arguments: list[str] = Field(min_length=1, max_length=100)
+    weight_path: str
 
 
 class EvaluationPlanRequest(BaseModel):

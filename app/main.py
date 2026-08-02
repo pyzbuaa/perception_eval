@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import UploadFile
 
 from app import __version__
 from app.config import settings
@@ -21,6 +23,7 @@ from app.schemas import (
     AnnotationSchemaUpdate,
     DatasetImportRequest,
     EvaluationPlanRequest,
+    LocalDetectorModelRequest,
     ModelCreateRequest,
     SampleAnnotationUpdate,
 )
@@ -29,9 +32,12 @@ from app.services import (
     DatasetAnnotationError,
     DatasetArtifactError,
     DatasetDeletionError,
+    LocalModelRegistrationError,
+    ModelDeletionError,
     adapter_health,
     complete_dataset_annotations,
     delete_dataset,
+    delete_model,
     environment_status,
     get_annotation_session,
     get_basegen_scene_schema,
@@ -41,11 +47,13 @@ from app.services import (
     list_dataset_samples,
     list_datasets,
     list_jobs,
+    list_local_model_resources,
     list_models,
     overview,
     preview_basegen_plan,
     query_results,
     queue_job,
+    register_local_detector_model,
     save_sample_annotation,
     update_annotation_schema,
 )
@@ -233,6 +241,178 @@ def import_dataset(request: DatasetImportRequest) -> dict[str, Any]:
     return queue_job("DATASET_IMPORT", request.model_dump())
 
 
+def _safe_upload_path(filename: str | None) -> Path:
+    relative = Path((filename or "").replace("\\", "/"))
+    if (
+        not relative.parts
+        or relative.is_absolute()
+        or ".." in relative.parts
+    ):
+        raise HTTPException(status_code=422, detail="上传文件路径不安全")
+    return relative
+
+
+@app.post("/api/datasets/import-upload", status_code=202)
+async def import_uploaded_dataset(request: Request) -> dict[str, Any]:
+    form = await request.form(
+        max_files=20001,
+        max_fields=20,
+        max_part_size=2 * 1024 * 1024,
+    )
+
+    def path_list(field: str) -> list[str]:
+        raw = form.get(field)
+        try:
+            values = json.loads(str(raw or "[]"))
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field} 不是有效的 JSON 数组",
+            ) from exc
+        if not isinstance(values, list) or not all(
+            isinstance(value, str) for value in values
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field} 必须是字符串数组",
+            )
+        return values
+
+    images = [
+        item
+        for item in form.getlist("images")
+        if isinstance(item, UploadFile)
+    ]
+    annotation_files = [
+        item
+        for item in form.getlist("annotation_files")
+        if isinstance(item, UploadFile)
+    ]
+    annotation_value = form.get("annotation")
+    annotation = (
+        annotation_value
+        if isinstance(annotation_value, UploadFile)
+        else None
+    )
+    return _stage_import_upload(
+        name=str(form.get("name") or ""),
+        scene_domain=str(form.get("scene_domain") or "未分类"),
+        annotation_format=str(form.get("annotation_format") or "COCO"),
+        images=images,
+        relative_paths=path_list("relative_paths_json"),
+        annotation=annotation,
+        annotation_files=annotation_files,
+        annotation_relative_paths=path_list(
+            "annotation_relative_paths_json"
+        ),
+    )
+
+
+def _stage_import_upload(
+    name: str,
+    scene_domain: str,
+    annotation_format: str,
+    images: list[UploadFile],
+    relative_paths: list[str],
+    annotation: UploadFile | None,
+    annotation_files: list[UploadFile],
+    annotation_relative_paths: list[str],
+) -> dict[str, Any]:
+    if not 2 <= len(name.strip()) <= 120:
+        raise HTTPException(status_code=422, detail="数据集名称长度必须为 2 到 120")
+    annotation_format = annotation_format.upper()
+    if annotation_format not in {"COCO", "YOLO", "VISDRONE"}:
+        raise HTTPException(status_code=422, detail="标注格式不受支持")
+    if len(images) != len(relative_paths):
+        raise HTTPException(status_code=422, detail="上传图片和相对路径数量不一致")
+    supported = {".jpg", ".jpeg", ".png", ".webp", ".svg"}
+    selected = [
+        (upload, relative)
+        for upload, raw_path in zip(images, relative_paths)
+        if (relative := _safe_upload_path(raw_path)).suffix.lower() in supported
+    ]
+    if not selected:
+        raise HTTPException(status_code=422, detail="所选目录中没有支持的图像")
+    if len(selected) > 10000:
+        raise HTTPException(status_code=422, detail="单次最多导入 10000 张图像")
+    label_uploads = annotation_files or []
+    label_paths = annotation_relative_paths or []
+    if annotation and annotation.filename and label_uploads:
+        raise HTTPException(
+            status_code=422,
+            detail="COCO 单文件和 YOLO 标注目录不能同时上传",
+        )
+    if len(label_uploads) != len(label_paths):
+        raise HTTPException(
+            status_code=422,
+            detail="YOLO 标注文件和相对路径数量不一致",
+        )
+    supported_labels = {".txt", ".yaml", ".yml", ".names"}
+    selected_labels = [
+        (upload, relative)
+        for upload, raw_path in zip(label_uploads, label_paths)
+        if (
+            relative := _safe_upload_path(raw_path)
+        ).suffix.lower() in supported_labels
+    ]
+    if label_uploads and not selected_labels:
+        raise HTTPException(
+            status_code=422,
+            detail="所选 YOLO 目录中没有 TXT、YAML 或 NAMES 文件",
+        )
+
+    upload_id = new_id("upload")
+    staging_root = settings.task_dir / "import_uploads" / upload_id
+    image_directory = staging_root / "images"
+    annotation_path: Path | None = None
+    try:
+        for upload, relative in selected:
+            target = image_directory / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"目录中存在重名文件: {relative}",
+                )
+            with target.open("wb") as output:
+                shutil.copyfileobj(upload.file, output)
+        if annotation and annotation.filename:
+            relative = _safe_upload_path(Path(annotation.filename).name)
+            annotation_path = staging_root / "annotation" / relative
+            annotation_path.parent.mkdir(parents=True, exist_ok=True)
+            with annotation_path.open("wb") as output:
+                shutil.copyfileobj(annotation.file, output)
+        elif selected_labels:
+            annotation_path = staging_root / "annotation_directory"
+            for upload, relative in selected_labels:
+                target = annotation_path / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"YOLO 目录中存在重名文件: {relative}",
+                    )
+                with target.open("wb") as output:
+                    shutil.copyfileobj(upload.file, output)
+        return queue_job(
+            "DATASET_IMPORT",
+            {
+                "name": name,
+                "directory": str(image_directory),
+                "annotation_path": (
+                    str(annotation_path) if annotation_path else None
+                ),
+                "scene_domain": scene_domain,
+                "annotation_format": annotation_format,
+                "staged_upload_root": str(staging_root),
+            },
+        )
+    except Exception:
+        if staging_root.is_dir():
+            shutil.rmtree(staging_root)
+        raise
+
+
 @app.post("/api/datasets/{dataset_id}/freeze")
 def freeze_dataset(dataset_id: str) -> dict[str, Any]:
     dataset = db.row("SELECT * FROM datasets WHERE id=?", (dataset_id,))
@@ -272,6 +452,39 @@ def get_models() -> list[dict[str, Any]]:
     return list_models()
 
 
+@app.get("/api/local-model-resources")
+def get_local_model_resources(
+    path: str | None = None,
+    scope: str = Query(default="model"),
+    kind: str = Query(default="directory"),
+) -> dict[str, Any]:
+    try:
+        return list_local_model_resources(path, scope, kind)
+    except LocalModelRegistrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/local-detector-models", status_code=201)
+def create_local_detector_model(
+    request: LocalDetectorModelRequest,
+) -> dict[str, Any]:
+    try:
+        return register_local_detector_model(request.model_dump())
+    except LocalModelRegistrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.delete("/api/models/{model_id}")
+def remove_model(model_id: str) -> dict[str, Any]:
+    try:
+        result = delete_model(model_id)
+    except ModelDeletionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    return result
+
+
 @app.post("/api/models", status_code=201)
 def create_model(request: ModelCreateRequest) -> dict[str, Any]:
     if not db.row("SELECT id FROM adapters WHERE id=?", (request.adapter_id,)):
@@ -280,11 +493,15 @@ def create_model(request: ModelCreateRequest) -> dict[str, Any]:
     db.execute(
         """
         INSERT INTO models
-        (id,name,family,backbone,version,precision,adapter_id,weight_path,weight_sha256,
-         is_demo,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        (id,name,family,architecture,backbone,detector_head,class_count,
+         training_dataset,pretrained_dataset,version,precision,adapter_id,
+         weight_path,weight_sha256,is_demo,status,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
-            model_id, request.name, request.family, request.backbone, request.version,
+            model_id, request.name, request.family, request.architecture,
+            request.backbone, request.detector_head, request.class_count,
+            request.training_dataset, request.pretrained_dataset, request.version,
             request.precision, request.adapter_id, request.weight_path, None,
             int(request.is_demo), "REGISTERED", utc_now(),
         ),

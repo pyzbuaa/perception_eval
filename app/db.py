@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -30,6 +32,15 @@ def json_load(value: str | None, default: Any = None) -> Any:
     return json.loads(value)
 
 
+@lru_cache(maxsize=8)
+def cached_file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 class Database:
     def __init__(self, app_settings: Settings = settings):
         self.settings = app_settings
@@ -50,7 +61,27 @@ class Database:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate_model_metadata(connection)
         self._seed_demo_data()
+
+    @staticmethod
+    def _migrate_model_metadata(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(models)").fetchall()
+        }
+        columns = {
+            "architecture": "TEXT NOT NULL DEFAULT '未记录'",
+            "detector_head": "TEXT NOT NULL DEFAULT '未记录'",
+            "class_count": "INTEGER NOT NULL DEFAULT 0",
+            "training_dataset": "TEXT NOT NULL DEFAULT '未记录'",
+            "pretrained_dataset": "TEXT NOT NULL DEFAULT '未记录'",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE models ADD COLUMN {name} {definition}"
+                )
 
     def rows(self, query: str, parameters: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -83,6 +114,51 @@ class Database:
                     "REGISTERED",
                     "通过独立 gen 环境调用 BaseGen；输出为未标注的真实生成图像。",
                     json_dump(BASEGEN_SCHEMA),
+                ),
+                (
+                    "adapter_dronedets_yolov8m",
+                    "DroneDets · YOLOv8m VisDrone",
+                    "DETECTOR",
+                    "1.0.0",
+                    "EXPERIMENTAL",
+                    "conda_external",
+                    str(self.settings.dronedets_runtime_prefix),
+                    "read_only",
+                    "adapters/dronedets_detector.py",
+                    1,
+                    "REGISTERED",
+                    "使用 DroneDets 只读环境执行 YOLOv8m VisDrone 真实目标检测。",
+                    json_dump(
+                        {
+                            "type": "object",
+                            "properties": {
+                                "catalog_model_id": {
+                                    "type": "string",
+                                    "const": "yolov8m_visdrone",
+                                },
+                                "confidence": {
+                                    "type": "number",
+                                    "default": 0.001,
+                                },
+                                "nms_iou": {
+                                    "type": "number",
+                                    "default": 0.7,
+                                },
+                                "image_size": {
+                                    "type": "integer",
+                                    "default": 1280,
+                                },
+                                "max_detections": {
+                                    "type": "integer",
+                                    "default": 300,
+                                },
+                            },
+                            "license": {
+                                "code": "AGPL-3.0",
+                                "weights": "see-model-card",
+                            },
+                        }
+                    ),
                 ),
                 (
                     "adapter_replay",
@@ -162,7 +238,46 @@ class Database:
                 """,
                 (str(self.settings.basegen_conda_prefix), now),
             )
+            connection.execute(
+                """
+                UPDATE adapters
+                SET runtime_kind='conda_external',runtime_prefix=?,policy='read_only',
+                    entrypoint='adapters/dronedets_detector.py',requires_gpu=1,updated_at=?
+                WHERE id='adapter_dronedets_yolov8m'
+                """,
+                (str(self.settings.dronedets_runtime_prefix), now),
+            )
+            weight_override = os.environ.get("DRONEDETS_YOLOV8M_WEIGHT")
+            weight_candidates = sorted(
+                Path("/mnt/data/cache/huggingface/hub/models--mshamrai--yolov8m-visdrone/snapshots").glob(
+                    "*/best.pt"
+                )
+            )
+            weight_path = (
+                Path(weight_override).expanduser()
+                if weight_override
+                else weight_candidates[-1] if weight_candidates else None
+            )
+            weight_value = str(weight_path) if weight_path and weight_path.is_file() else None
+            weight_sha256 = (
+                cached_file_sha256(str(weight_path.resolve()))
+                if weight_path and weight_path.is_file()
+                else None
+            )
             models = [
+                (
+                    "model_dronedets_yolov8m_visdrone",
+                    "DroneDets · YOLOv8m VisDrone",
+                    "YOLOv8",
+                    "YOLOv8m",
+                    "DroneDets-33db5f3",
+                    "FP16",
+                    "adapter_dronedets_yolov8m",
+                    weight_value,
+                    weight_sha256,
+                    0,
+                    "EXPERIMENTAL" if weight_value else "UNAVAILABLE",
+                ),
                 (
                     "model_yolov5s_demo",
                     "YOLOv5s · 流程样例",
@@ -210,6 +325,17 @@ class Database:
                  is_demo,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [item + (now,) for item in models],
+            )
+            connection.execute(
+                """
+                UPDATE models SET weight_path=?,weight_sha256=?,status=?
+                WHERE id='model_dronedets_yolov8m_visdrone'
+                """,
+                (
+                    weight_value,
+                    weight_sha256,
+                    "EXPERIMENTAL" if weight_value else "UNAVAILABLE",
+                ),
             )
             self._write_demo_artifacts()
             datasets = [
@@ -487,7 +613,12 @@ CREATE TABLE IF NOT EXISTS models (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     family TEXT NOT NULL,
+    architecture TEXT NOT NULL DEFAULT '未记录',
     backbone TEXT NOT NULL,
+    detector_head TEXT NOT NULL DEFAULT '未记录',
+    class_count INTEGER NOT NULL DEFAULT 0,
+    training_dataset TEXT NOT NULL DEFAULT '未记录',
+    pretrained_dataset TEXT NOT NULL DEFAULT '未记录',
     version TEXT NOT NULL,
     precision TEXT NOT NULL,
     adapter_id TEXT NOT NULL REFERENCES adapters(id),
