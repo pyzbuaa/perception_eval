@@ -145,7 +145,12 @@ curl -X POST http://127.0.0.1:18080/api/acquisition-jobs \
       "guidance_scale": 0,
       "device_policy": "cuda",
       "local_files_only": false
-    }
+    },
+    "category_template": "custom",
+    "categories": [
+      {"id": 1, "name": "car"},
+      {"id": 2, "name": "pedestrian"}
+    ]
   }'
 ```
 
@@ -175,6 +180,12 @@ curl http://127.0.0.1:18080/api/runs/<job-id>
 在“模型版本”点击“注册本地检测模型”，配置模型项目目录、命令
 工作目录、Python 环境、参数列表和权重。平台自动使用所选环境的 `bin/python`，只保存
 路径、结构化命令并计算权重摘要，不复制模型工程或权重。默认允许浏览：
+
+数据构建和模型注册均需选择目标检测类别。平台内置 COCO 2017、
+VisDrone 和 Pascal VOC 类别模板；自定义类别可逐项填写，也可从 JSON 类别数组、
+COCO JSON 的 `categories` 字段或每行 `id,name` 的 CSV/TXT 文件读取。
+评测要求数据集与模型的类别名称集合完全一致，ID 可以不同；平台在运行时
+自动将模型输出 ID 映射回数据集 COCO 类别 ID。
 
 ```text
 模型库：    /home/yons/ws/project_generator

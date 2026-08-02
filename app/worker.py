@@ -20,10 +20,12 @@ from app.annotation_formats import (
     convert_visdrone_to_coco,
     is_visdrone_label_directory,
 )
+from app.category_templates import normalize_categories, normalize_category_name
 from app.command_protocol import CommandTemplateError, render_command
 from app.config import Settings, settings
 from app.db import Database, db, json_dump, json_load, make_curves, make_metrics, new_id, utc_now
 from app.detection_metrics import evaluate_coco_predictions
+from app.services import category_compatibility, validate_evaluation_categories
 
 
 class JobAgent:
@@ -105,6 +107,13 @@ class JobAgent:
 
     def _run_acquisition(self, job: dict[str, Any]) -> dict[str, Any]:
         payload = job["payload"]
+        try:
+            dataset_categories = normalize_categories(
+                payload.get("categories", []), include_color=True
+            )
+        except ValueError as exc:
+            raise ValueError(f"数据集类别无效: {exc}") from exc
+        category_template = str(payload.get("category_template") or "custom")
         job_dir = self.settings.task_dir / job["id"]
         artifact_dir = self.settings.artifact_dir / "generated" / job["id"]
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -130,6 +139,18 @@ class JobAgent:
             input_dataset = self.db.row("SELECT * FROM datasets WHERE id=?", (input_dataset_id,))
             if not input_dataset or not input_dataset.get("artifact_path"):
                 raise ValueError("输入数据集不存在或没有 Artifact")
+            category_row = self.db.row(
+                "SELECT categories FROM dataset_annotation_schemas WHERE dataset_id=?",
+                (input_dataset_id,),
+            )
+            if not category_row:
+                raise ValueError("输入数据集尚未配置类别")
+            dataset_categories = normalize_categories(
+                json_load(category_row["categories"], []), include_color=True
+            )
+            category_template = str(
+                input_dataset.get("category_template") or "custom"
+            )
             input_directory = self.settings.artifact_dir / input_dataset["artifact_path"]
             input_images = [
                 str(path)
@@ -214,29 +235,39 @@ class JobAgent:
             resolution = "×".join(str(value) for value in resolution)
         annotation_status = "CANDIDATE" if result.get("has_candidate_annotations") else "UNLABELED"
         relative = artifact_dir.relative_to(self.settings.artifact_dir).as_posix()
-        self.db.execute(
-            """
-            INSERT INTO datasets
-            (id,name,version,source_type,scene_domain,weather,sensor_conditions,resolution,
-             sample_count,annotation_status,frozen,artifact_path,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                dataset_id,
-                payload["name"],
-                "v1",
-                payload.get("source_type", "REPLAY_FIXTURE"),
-                scene.get("domain_label", scene.get("domain", "无人机航拍")),
-                scene.get("weather", "晴朗"),
-                json_dump(sensor),
-                resolution,
-                len(samples),
-                annotation_status,
-                0,
-                relative,
-                utc_now(),
-            ),
-        )
+        now = utc_now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO datasets
+                (id,name,version,source_type,scene_domain,weather,sensor_conditions,resolution,
+                 sample_count,annotation_status,frozen,artifact_path,category_template,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    dataset_id,
+                    payload["name"],
+                    "v1",
+                    payload.get("source_type", "REPLAY_FIXTURE"),
+                    scene.get("domain_label", scene.get("domain", "无人机航拍")),
+                    scene.get("weather", "晴朗"),
+                    json_dump(sensor),
+                    resolution,
+                    len(samples),
+                    annotation_status,
+                    0,
+                    relative,
+                    category_template,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO dataset_annotation_schemas
+                (dataset_id,categories,updated_at) VALUES (?,?,?)
+                """,
+                (dataset_id, json_dump(dataset_categories), now),
+            )
         self._progress(job["id"], 95, "创建数据集草稿")
         return {"dataset_id": dataset_id, "samples": len(samples), "annotation_status": annotation_status}
 
@@ -353,6 +384,12 @@ class JobAgent:
 
     def _run_import(self, job: dict[str, Any]) -> dict[str, Any]:
         payload = job["payload"]
+        try:
+            dataset_categories = normalize_categories(
+                payload.get("categories", []), include_color=True
+            )
+        except ValueError as exc:
+            raise ValueError(f"数据集类别无效: {exc}") from exc
         source = Path(payload["directory"]).expanduser().resolve()
         if not source.is_dir():
             raise FileNotFoundError(f"导入目录不存在: {source}")
@@ -381,6 +418,23 @@ class JobAgent:
             annotation_path = Path(annotation).expanduser().resolve()
             if annotation_path.is_file():
                 if annotation_path.suffix.lower() == ".json":
+                    annotation_payload = json.loads(
+                        annotation_path.read_text(encoding="utf-8")
+                    )
+                    declared = {
+                        (item["id"], normalize_category_name(item["name"]))
+                        for item in normalize_categories(dataset_categories)
+                    }
+                    imported = {
+                        (item["id"], normalize_category_name(item["name"]))
+                        for item in normalize_categories(
+                            annotation_payload.get("categories", [])
+                        )
+                    }
+                    if declared != imported:
+                        raise ValueError(
+                            "COCO 标注中的类别 ID/名称与所选类别模板不一致"
+                        )
                     annotation_target = target / "annotations" / "instances.json"
                     annotation_target.parent.mkdir(parents=True, exist_ok=True)
                 else:
@@ -417,29 +471,39 @@ class JobAgent:
                             payload["name"],
                         )
         dataset_id = new_id("dataset")
-        self.db.execute(
-            """
-            INSERT INTO datasets
-            (id,name,version,source_type,scene_domain,weather,sensor_conditions,resolution,
-             sample_count,annotation_status,frozen,artifact_path,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                dataset_id,
-                payload["name"],
-                "v1",
-                "REAL",
-                payload.get("scene_domain", "未分类"),
-                "未记录",
-                "{}",
-                "原始分辨率",
-                len(candidates),
-                annotation_status,
-                0,
-                target.relative_to(self.settings.artifact_dir).as_posix(),
-                utc_now(),
-            ),
-        )
+        now = utc_now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO datasets
+                (id,name,version,source_type,scene_domain,weather,sensor_conditions,resolution,
+                 sample_count,annotation_status,frozen,artifact_path,category_template,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    dataset_id,
+                    payload["name"],
+                    "v1",
+                    "REAL",
+                    payload.get("scene_domain", "未分类"),
+                    "未记录",
+                    "{}",
+                    "原始分辨率",
+                    len(candidates),
+                    annotation_status,
+                    0,
+                    target.relative_to(self.settings.artifact_dir).as_posix(),
+                    str(payload.get("category_template") or "custom"),
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO dataset_annotation_schemas
+                (dataset_id,categories,updated_at) VALUES (?,?,?)
+                """,
+                (dataset_id, json_dump(dataset_categories), now),
+            )
         staged_upload_root = payload.get("staged_upload_root")
         if staged_upload_root:
             allowed_root = (
@@ -467,6 +531,7 @@ class JobAgent:
             raise ValueError("评测方案不存在")
         dataset_ids = json_load(plan["dataset_ids"], [])
         model_ids = json_load(plan["model_ids"], [])
+        validate_evaluation_categories(dataset_ids, model_ids, self.db)
         seeds = json_load(plan["seeds"], [])
         blur_levels = json_load(plan["blur_levels"], [0])
         combinations = [(dataset, model, seed, blur) for dataset in dataset_ids for model in model_ids for blur in blur_levels for seed in seeds]
@@ -619,6 +684,49 @@ class JobAgent:
         ground_truth = json.loads(annotation_path.read_text(encoding="utf-8"))
         if not ground_truth.get("images") or not ground_truth.get("categories"):
             raise ValueError("COCO 标注必须包含图片和类别")
+        compatibility = category_compatibility(dataset["id"], model["id"], self.db)
+        if not compatibility["compatible"]:
+            raise ValueError(compatibility["reason"])
+        model_to_dataset = {
+            int(model_id): int(dataset_id)
+            for model_id, dataset_id in compatibility["model_to_dataset"].items()
+        }
+        dataset_to_model = {
+            dataset_id: model_id for model_id, dataset_id in model_to_dataset.items()
+        }
+        stored_row = self.db.row(
+            "SELECT categories FROM dataset_annotation_schemas WHERE dataset_id=?",
+            (dataset["id"],),
+        )
+        stored_categories = normalize_categories(
+            json_load(stored_row["categories"], []) if stored_row else []
+        )
+        actual_categories = normalize_categories(ground_truth["categories"])
+        if {
+            (item["id"], normalize_category_name(item["name"]))
+            for item in stored_categories
+        } != {
+            (item["id"], normalize_category_name(item["name"]))
+            for item in actual_categories
+        }:
+            raise ValueError("COCO 标注类别与数据集登记类别不一致")
+        model_categories = normalize_categories(json_load(model["categories"], []))
+        inference_ground_truth = json.loads(json.dumps(ground_truth))
+        inference_ground_truth["categories"] = model_categories
+        for annotation in inference_ground_truth.get("annotations", []):
+            dataset_category_id = int(annotation["category_id"])
+            if dataset_category_id not in dataset_to_model:
+                raise ValueError(
+                    f"数据集标注引用了未登记类别 {dataset_category_id}"
+                )
+            annotation["category_id"] = dataset_to_model[dataset_category_id]
+        inference_annotation_path = (
+            job_directory / "annotations" / "model-category-space.json"
+        )
+        inference_annotation_path.parent.mkdir(parents=True, exist_ok=True)
+        inference_annotation_path.write_text(
+            json_dump(inference_ground_truth), encoding="utf-8"
+        )
 
         image_directory = dataset_directory
         if float(blur) > 0:
@@ -672,7 +780,7 @@ class JobAgent:
             "dataset": {
                 "id": dataset["id"],
                 "image_directory": str(image_directory),
-                "annotation_path": str(annotation_path),
+                "annotation_path": str(inference_annotation_path),
             },
             "inference": {
                 "device": "cuda:0",
@@ -719,7 +827,7 @@ class JobAgent:
             ):
                 raise ValueError("检测命令参数必须是字符串数组")
             placeholders = {
-                "annotation_path": str(annotation_path),
+                "annotation_path": str(inference_annotation_path),
                 "batch_size": str(config["batch_size"]),
                 "confidence": str(config["confidence"]),
                 "dataset_id": str(dataset["id"]),
@@ -832,6 +940,17 @@ class JobAgent:
             or not predictions_path.is_file()
         ):
             raise FileNotFoundError("检测适配器没有生成有效的 predictions.json")
+        predictions = json.loads(predictions_path.read_text(encoding="utf-8"))
+        if not isinstance(predictions, list):
+            raise ValueError("检测结果必须是 COCO predictions 数组")
+        for prediction in predictions:
+            model_category_id = int(prediction["category_id"])
+            if model_category_id not in model_to_dataset:
+                raise ValueError(
+                    f"模型输出了未登记类别 {model_category_id}"
+                )
+            prediction["category_id"] = model_to_dataset[model_category_id]
+        predictions_path.write_text(json_dump(predictions), encoding="utf-8")
         self._progress(job["id"], 78, "计算 COCO 检测指标")
         metrics, curves = evaluate_coco_predictions(
             annotation_path,
@@ -845,6 +964,7 @@ class JobAgent:
                 ).as_posix(),
                 "unmatched_labels": result.get("unmatched_labels", {}),
                 "warnings": result.get("warnings", []),
+                "category_mapping": compatibility["model_to_dataset"],
             }
         )
         environment_details = result.get("environment", {})

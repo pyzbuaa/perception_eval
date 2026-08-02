@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from PIL import Image
 
+from app.category_templates import normalize_categories, normalize_category_name
 from app.command_protocol import CommandTemplateError, validate_command_arguments
 from app.config import settings
 from app.db import (
@@ -37,6 +38,7 @@ JSON_FIELDS = {
     "hardware_profile",
     "metrics",
     "curves",
+    "categories",
 }
 
 BASEGEN_FIELD_LABELS = {
@@ -51,16 +53,6 @@ BASEGEN_FIELD_LABELS = {
     "elements": "关键元素",
     "custom": "自定义描述",
 }
-
-DEFAULT_ANNOTATION_CATEGORIES = [
-    {"id": 1, "name": "car", "color": "#1677FF"},
-    {"id": 2, "name": "truck", "color": "#13A8A8"},
-    {"id": 3, "name": "bus", "color": "#722ED1"},
-    {"id": 4, "name": "pedestrian", "color": "#EB2F96"},
-    {"id": 5, "name": "bicycle", "color": "#52C41A"},
-    {"id": 6, "name": "motorcycle", "color": "#FA8C16"},
-]
-
 
 def decode_row(row: dict[str, Any]) -> dict[str, Any]:
     output = dict(row)
@@ -84,6 +76,13 @@ def list_datasets(database: Database = db) -> list[dict[str, Any]]:
     rows = database.rows("SELECT * FROM datasets ORDER BY created_at DESC")
     for row in rows:
         row = decode_row(row)
+        category_row = database.row(
+            "SELECT categories FROM dataset_annotation_schemas WHERE dataset_id=?",
+            (row["id"],),
+        )
+        row["categories"] = (
+            json_load(category_row["categories"], []) if category_row else []
+        )
         relative = row.get("artifact_path")
         row["preview_images"] = []
         if relative:
@@ -119,6 +118,116 @@ class LocalModelRegistrationError(ValueError):
 
 class ModelDeletionError(ValueError):
     pass
+
+
+class CategoryCompatibilityError(ValueError):
+    pass
+
+
+def category_compatibility(
+    dataset_id: str,
+    model_id: str,
+    database: Database = db,
+) -> dict[str, Any]:
+    dataset = database.row("SELECT name FROM datasets WHERE id=?", (dataset_id,))
+    model = database.row("SELECT name,categories FROM models WHERE id=?", (model_id,))
+    category_row = database.row(
+        "SELECT categories FROM dataset_annotation_schemas WHERE dataset_id=?",
+        (dataset_id,),
+    )
+    if not dataset or not model:
+        raise CategoryCompatibilityError("数据集或模型不存在")
+    dataset_categories = json_load(category_row["categories"], []) if category_row else []
+    model_categories = json_load(model["categories"], [])
+    if not dataset_categories or not model_categories:
+        missing = []
+        if not dataset_categories:
+            missing.append(f"数据集“{dataset['name']}”")
+        if not model_categories:
+            missing.append(f"模型“{model['name']}”")
+        return {
+            "compatible": False,
+            "dataset_id": dataset_id,
+            "dataset_name": dataset["name"],
+            "model_id": model_id,
+            "model_name": model["name"],
+            "reason": f"{'、'.join(missing)}尚未配置类别",
+            "missing_in_model": [],
+            "extra_in_model": [],
+            "model_to_dataset": {},
+        }
+    try:
+        dataset_categories = normalize_categories(dataset_categories)
+        model_categories = normalize_categories(model_categories)
+    except ValueError as exc:
+        return {
+            "compatible": False,
+            "dataset_id": dataset_id,
+            "dataset_name": dataset["name"],
+            "model_id": model_id,
+            "model_name": model["name"],
+            "reason": str(exc),
+            "missing_in_model": [],
+            "extra_in_model": [],
+            "model_to_dataset": {},
+        }
+    dataset_by_name = {
+        normalize_category_name(item["name"]): item for item in dataset_categories
+    }
+    model_by_name = {
+        normalize_category_name(item["name"]): item for item in model_categories
+    }
+    missing = sorted(set(dataset_by_name) - set(model_by_name))
+    extra = sorted(set(model_by_name) - set(dataset_by_name))
+    mapping = {
+        str(model_category["id"]): dataset_by_name[name]["id"]
+        for name, model_category in model_by_name.items()
+        if name in dataset_by_name
+    }
+    return {
+        "compatible": not missing and not extra,
+        "dataset_id": dataset_id,
+        "dataset_name": dataset["name"],
+        "model_id": model_id,
+        "model_name": model["name"],
+        "reason": "" if not missing and not extra else "类别名称集合不一致",
+        "missing_in_model": [dataset_by_name[name]["name"] for name in missing],
+        "extra_in_model": [model_by_name[name]["name"] for name in extra],
+        "model_to_dataset": mapping,
+    }
+
+
+def validate_evaluation_categories(
+    dataset_ids: list[str],
+    model_ids: list[str],
+    database: Database = db,
+) -> list[dict[str, Any]]:
+    results = [
+        category_compatibility(dataset_id, model_id, database)
+        for dataset_id in dataset_ids
+        for model_id in model_ids
+    ]
+    incompatible = [item for item in results if not item["compatible"]]
+    if incompatible:
+        details = []
+        for item in incompatible:
+            differences = []
+            if item["missing_in_model"]:
+                differences.append(
+                    f"模型缺少 {', '.join(item['missing_in_model'])}"
+                )
+            if item["extra_in_model"]:
+                differences.append(
+                    f"模型多出 {', '.join(item['extra_in_model'])}"
+                )
+            details.append(
+                f"{item['dataset_name']} × {item['model_name']}: "
+                f"{'；'.join(differences) or item['reason']}"
+            )
+        raise CategoryCompatibilityError(
+            "类别不一致，无法启动评测。" + " | ".join(details)
+        )
+    return results
 
 
 LOCAL_WEIGHT_SUFFIXES = {
@@ -266,6 +375,10 @@ def register_local_detector_model(
         validate_command_arguments(values["command_arguments"])
     except CommandTemplateError as exc:
         raise LocalModelRegistrationError(str(exc)) from exc
+    try:
+        categories = normalize_categories(values["categories"])
+    except ValueError as exc:
+        raise LocalModelRegistrationError(str(exc)) from exc
 
     adapter_id = new_id("adapter")
     model_id = new_id("model")
@@ -320,10 +433,11 @@ def register_local_detector_model(
         connection.execute(
             """
             INSERT INTO models
-            (id,name,family,architecture,backbone,detector_head,class_count,
+            (id,name,family,architecture,backbone,detector_head,class_count,categories,
+             category_template,
              training_dataset,pretrained_dataset,version,precision,adapter_id,
              weight_path,weight_sha256,is_demo,status,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 model_id,
@@ -332,7 +446,9 @@ def register_local_detector_model(
                 values["architecture"],
                 values["backbone"],
                 values["detector_head"],
-                values["class_count"],
+                len(categories),
+                json_dump(categories),
+                values["category_template"],
                 values["training_dataset"],
                 values["pretrained_dataset"],
                 values["version"],
@@ -791,9 +907,7 @@ def _annotation_categories(
         "SELECT categories FROM dataset_annotation_schemas WHERE dataset_id=?",
         (dataset_id,),
     )
-    return json_load(row["categories"]) if row else [
-        dict(category) for category in DEFAULT_ANNOTATION_CATEGORIES
-    ]
+    return json_load(row["categories"]) if row else []
 
 
 def get_annotation_session(
@@ -877,20 +991,10 @@ def update_annotation_schema(
         return None
     if dataset["frozen"]:
         raise DatasetAnnotationError("冻结数据集的标注类别不可修改")
-    normalized = [
-        {
-            "id": int(category["id"]),
-            "name": str(category["name"]).strip(),
-            "color": str(category["color"]).upper(),
-        }
-        for category in categories
-    ]
-    ids = [category["id"] for category in normalized]
-    names = [category["name"].casefold() for category in normalized]
-    if any(not category["name"] for category in normalized):
-        raise DatasetAnnotationError("类别名称不能为空")
-    if len(ids) != len(set(ids)) or len(names) != len(set(names)):
-        raise DatasetAnnotationError("类别 ID 和名称必须唯一")
+    try:
+        normalized = normalize_categories(categories, include_color=True)
+    except ValueError as exc:
+        raise DatasetAnnotationError(str(exc)) from exc
     used_ids = {
         int(box["category_id"])
         for row in database.rows(
@@ -899,7 +1003,7 @@ def update_annotation_schema(
         )
         for box in json_load(row["boxes"], [])
     }
-    missing = used_ids - set(ids)
+    missing = used_ids - {category["id"] for category in normalized}
     if missing:
         raise DatasetAnnotationError("不能删除已被目标框使用的类别")
     database.execute(
@@ -910,6 +1014,10 @@ def update_annotation_schema(
         SET categories=excluded.categories,updated_at=excluded.updated_at
         """,
         (dataset_id, json_dump(normalized), utc_now()),
+    )
+    database.execute(
+        "UPDATE datasets SET category_template='custom' WHERE id=?",
+        (dataset_id,),
     )
     return {"dataset_id": dataset_id, "categories": normalized}
 
@@ -1005,6 +1113,8 @@ def complete_dataset_annotations(
             f"还有 {len(incomplete)} 张图片未确认完成"
         )
     categories = _annotation_categories(dataset_id, database)
+    if not categories:
+        raise DatasetAnnotationError("数据集尚未配置类别")
     images = []
     annotations = []
     annotation_id = 1

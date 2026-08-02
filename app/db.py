@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.config import Settings, settings
+from app.category_templates import normalize_categories, template_categories
 
 
 def utc_now() -> str:
@@ -62,6 +63,7 @@ class Database:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             self._migrate_model_metadata(connection)
+            self._migrate_dataset_metadata(connection)
         self._seed_demo_data()
 
     @staticmethod
@@ -76,12 +78,26 @@ class Database:
             "class_count": "INTEGER NOT NULL DEFAULT 0",
             "training_dataset": "TEXT NOT NULL DEFAULT '未记录'",
             "pretrained_dataset": "TEXT NOT NULL DEFAULT '未记录'",
+            "categories": "TEXT NOT NULL DEFAULT '[]'",
+            "category_template": "TEXT NOT NULL DEFAULT 'unconfigured'",
         }
         for name, definition in columns.items():
             if name not in existing:
                 connection.execute(
                     f"ALTER TABLE models ADD COLUMN {name} {definition}"
                 )
+
+    @staticmethod
+    def _migrate_dataset_metadata(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(datasets)").fetchall()
+        }
+        if "category_template" not in existing:
+            connection.execute(
+                "ALTER TABLE datasets ADD COLUMN category_template "
+                "TEXT NOT NULL DEFAULT 'unconfigured'"
+            )
 
     def rows(self, query: str, parameters: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -337,6 +353,63 @@ class Database:
                     "EXPERIMENTAL" if weight_value else "UNAVAILABLE",
                 ),
             )
+            visdrone_model_categories = [
+                {"id": item["id"], "name": item["name"]}
+                for item in template_categories("visdrone", "model")
+            ]
+            demo_dataset_categories = [
+                {"id": index, "name": name, "color": color}
+                for index, (name, color) in enumerate(
+                    (
+                        ("car", "#1677FF"),
+                        ("truck", "#13A8A8"),
+                        ("bus", "#722ED1"),
+                        ("pedestrian", "#EB2F96"),
+                        ("bicycle", "#52C41A"),
+                        ("motorcycle", "#FA8C16"),
+                    ),
+                    start=1,
+                )
+            ]
+            demo_model_categories = [
+                {"id": index, "name": item["name"]}
+                for index, item in enumerate(demo_dataset_categories)
+            ]
+            connection.execute(
+                """
+                UPDATE models SET categories=?,category_template='visdrone',class_count=?
+                WHERE id='model_dronedets_yolov8m_visdrone'
+                """,
+                (json_dump(visdrone_model_categories), len(visdrone_model_categories)),
+            )
+            connection.execute(
+                """
+                UPDATE models SET categories=?,category_template='custom',class_count=?
+                WHERE id IN ('model_yolov5s_demo','model_frcnn_demo','model_retinanet_demo')
+                """,
+                (json_dump(demo_model_categories), len(demo_model_categories)),
+            )
+            for template_id, marker in (
+                ("visdrone", "visdrone"),
+                ("coco2017", "coco"),
+                ("voc", "voc"),
+            ):
+                categories = [
+                    {"id": item["id"], "name": item["name"]}
+                    for item in template_categories(template_id, "model")
+                ]
+                connection.execute(
+                    """
+                    UPDATE models SET categories=?,category_template=?,class_count=?
+                    WHERE categories='[]' AND lower(name || ' ' || training_dataset) LIKE ?
+                    """,
+                    (
+                        json_dump(categories),
+                        template_id,
+                        len(categories),
+                        f"%{marker}%",
+                    ),
+                )
             self._write_demo_artifacts()
             datasets = [
                 (
@@ -391,6 +464,67 @@ class Database:
                 """,
                 [item + (now,) for item in datasets],
             )
+            connection.execute(
+                """
+                UPDATE datasets SET category_template='custom'
+                WHERE id IN ('dataset_aerial_clean','dataset_aerial_blur','dataset_urban_fog')
+                """
+            )
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO dataset_annotation_schemas
+                (dataset_id,categories,updated_at) VALUES (?,?,?)
+                """,
+                [
+                    (dataset_id, json_dump(demo_dataset_categories), now)
+                    for dataset_id in (
+                        "dataset_aerial_clean",
+                        "dataset_aerial_blur",
+                        "dataset_urban_fog",
+                    )
+                ],
+            )
+            for dataset in connection.execute(
+                """
+                SELECT id,artifact_path FROM datasets
+                WHERE id NOT IN (SELECT dataset_id FROM dataset_annotation_schemas)
+                  AND artifact_path IS NOT NULL
+                """
+            ).fetchall():
+                annotation_path = (
+                    self.settings.artifact_dir
+                    / dataset["artifact_path"]
+                    / "annotations"
+                    / "instances.json"
+                )
+                try:
+                    annotation = json.loads(annotation_path.read_text(encoding="utf-8"))
+                    categories = normalize_categories(
+                        annotation.get("categories", []), include_color=True
+                    )
+                except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    continue
+                template_id = "custom"
+                normalized_pairs = [(item["id"], item["name"]) for item in categories]
+                for candidate in ("coco2017", "visdrone", "voc"):
+                    expected = [
+                        (item["id"], item["name"])
+                        for item in template_categories(candidate, "dataset")
+                    ]
+                    if normalized_pairs == expected:
+                        template_id = candidate
+                        break
+                connection.execute(
+                    """
+                    INSERT INTO dataset_annotation_schemas
+                    (dataset_id,categories,updated_at) VALUES (?,?,?)
+                    """,
+                    (dataset["id"], json_dump(categories), now),
+                )
+                connection.execute(
+                    "UPDATE datasets SET category_template=? WHERE id=?",
+                    (template_id, dataset["id"]),
+                )
             if not connection.execute("SELECT COUNT(*) FROM results").fetchone()[0]:
                 self._seed_results(connection, now)
 
@@ -592,6 +726,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     annotation_status TEXT NOT NULL,
     frozen INTEGER NOT NULL DEFAULT 0,
     artifact_path TEXT,
+    category_template TEXT NOT NULL DEFAULT 'unconfigured',
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS dataset_annotation_schemas (
@@ -617,6 +752,8 @@ CREATE TABLE IF NOT EXISTS models (
     backbone TEXT NOT NULL,
     detector_head TEXT NOT NULL DEFAULT '未记录',
     class_count INTEGER NOT NULL DEFAULT 0,
+    categories TEXT NOT NULL DEFAULT '[]',
+    category_template TEXT NOT NULL DEFAULT 'unconfigured',
     training_dataset TEXT NOT NULL DEFAULT '未记录',
     pretrained_dataset TEXT NOT NULL DEFAULT '未记录',
     version TEXT NOT NULL,

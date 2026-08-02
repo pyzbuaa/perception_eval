@@ -16,6 +16,8 @@ class AcquisitionRequest(BaseModel):
     conditions: dict[str, Any] = Field(default_factory=dict)
     model_parameters: dict[str, Any] = Field(default_factory=dict)
     input_dataset_id: str | None = None
+    category_template: str = Field(min_length=1, max_length=40)
+    categories: list["CategoryInput"] = Field(min_length=1, max_length=1000)
 
 
 class DatasetImportRequest(BaseModel):
@@ -23,10 +25,17 @@ class DatasetImportRequest(BaseModel):
     directory: str
     annotation_path: str | None = None
     scene_domain: str = "未分类"
+    category_template: str = Field(min_length=1, max_length=40)
+    categories: list["CategoryInput"] = Field(min_length=1, max_length=1000)
+
+
+class CategoryInput(BaseModel):
+    id: int = Field(ge=0)
+    name: str = Field(min_length=1, max_length=64)
 
 
 class AnnotationCategory(BaseModel):
-    id: int = Field(ge=1)
+    id: int = Field(ge=0)
     name: str = Field(min_length=1, max_length=64)
     color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
 
@@ -37,7 +46,7 @@ class AnnotationSchemaUpdate(BaseModel):
 
 class DetectionBox(BaseModel):
     id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
-    category_id: int = Field(ge=1)
+    category_id: int = Field(ge=0)
     x: float = Field(ge=0)
     y: float = Field(ge=0)
     width: float = Field(gt=0)
@@ -57,7 +66,8 @@ class ModelCreateRequest(BaseModel):
     architecture: str = "未记录"
     backbone: str = "未记录"
     detector_head: str = "未记录"
-    class_count: int = Field(default=0, ge=0, le=100000)
+    categories: list[CategoryInput] = Field(min_length=1, max_length=1000)
+    category_template: str = Field(min_length=1, max_length=40)
     training_dataset: str = "未记录"
     pretrained_dataset: str = "未记录"
     version: str = "v1"
@@ -73,7 +83,8 @@ class LocalDetectorModelRequest(BaseModel):
     architecture: str = Field(min_length=1, max_length=80)
     backbone: str = Field(min_length=1, max_length=80)
     detector_head: str = Field(min_length=1, max_length=80)
-    class_count: int = Field(ge=1, le=100000)
+    categories: list[CategoryInput] = Field(min_length=1, max_length=1000)
+    category_template: str = Field(min_length=1, max_length=40)
     training_dataset: str = Field(min_length=1, max_length=120)
     pretrained_dataset: str = Field(min_length=1, max_length=120)
     version: str = Field(default="v1", min_length=1, max_length=40)

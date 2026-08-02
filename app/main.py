@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile
 
 from app import __version__
+from app.category_templates import list_category_templates, normalize_categories
 from app.config import settings
 from app.db import db, json_dump, new_id, utc_now
 from app.schemas import (
@@ -29,6 +30,7 @@ from app.schemas import (
 )
 from app.services import (
     BaseGenCatalogError,
+    CategoryCompatibilityError,
     DatasetAnnotationError,
     DatasetArtifactError,
     DatasetDeletionError,
@@ -56,6 +58,7 @@ from app.services import (
     register_local_detector_model,
     save_sample_annotation,
     update_annotation_schema,
+    validate_evaluation_categories,
 )
 from app.worker import JobAgent
 
@@ -152,6 +155,11 @@ def get_datasets() -> list[dict[str, Any]]:
     return list(list_datasets())
 
 
+@app.get("/api/category-templates")
+def get_category_templates() -> list[dict[str, Any]]:
+    return list_category_templates()
+
+
 @app.get("/api/datasets/{dataset_id}/samples")
 def get_dataset_samples(
     dataset_id: str,
@@ -238,7 +246,12 @@ def complete_annotations(dataset_id: str) -> dict[str, Any]:
 
 @app.post("/api/datasets/import", status_code=202)
 def import_dataset(request: DatasetImportRequest) -> dict[str, Any]:
-    return queue_job("DATASET_IMPORT", request.model_dump())
+    payload = request.model_dump()
+    try:
+        payload["categories"] = normalize_categories(payload["categories"])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return queue_job("DATASET_IMPORT", payload)
 
 
 def _safe_upload_path(filename: str | None) -> Path:
@@ -278,6 +291,19 @@ async def import_uploaded_dataset(request: Request) -> dict[str, Any]:
             )
         return values
 
+    def category_list() -> list[dict[str, Any]]:
+        raw = form.get("categories_json")
+        try:
+            values = json.loads(str(raw or "[]"))
+            if not isinstance(values, list):
+                raise ValueError
+            return normalize_categories(values)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="类别列表无效，请重新选择类别模板",
+            ) from exc
+
     images = [
         item
         for item in form.getlist("images")
@@ -305,6 +331,8 @@ async def import_uploaded_dataset(request: Request) -> dict[str, Any]:
         annotation_relative_paths=path_list(
             "annotation_relative_paths_json"
         ),
+        category_template=str(form.get("category_template") or "custom"),
+        categories=category_list(),
     )
 
 
@@ -317,9 +345,15 @@ def _stage_import_upload(
     annotation: UploadFile | None,
     annotation_files: list[UploadFile],
     annotation_relative_paths: list[str],
+    category_template: str,
+    categories: list[dict[str, Any]],
 ) -> dict[str, Any]:
     if not 2 <= len(name.strip()) <= 120:
         raise HTTPException(status_code=422, detail="数据集名称长度必须为 2 到 120")
+    try:
+        categories = normalize_categories(categories)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     annotation_format = annotation_format.upper()
     if annotation_format not in {"COCO", "YOLO", "VISDRONE"}:
         raise HTTPException(status_code=422, detail="标注格式不受支持")
@@ -404,6 +438,8 @@ def _stage_import_upload(
                 ),
                 "scene_domain": scene_domain,
                 "annotation_format": annotation_format,
+                "category_template": category_template,
+                "categories": categories,
                 "staged_upload_root": str(staging_root),
             },
         )
@@ -420,6 +456,11 @@ def freeze_dataset(dataset_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="数据集不存在")
     if dataset["annotation_status"] not in {"VERIFIED", "CANDIDATE"}:
         raise HTTPException(status_code=409, detail="数据集缺少可校核真值，不能冻结")
+    if not db.row(
+        "SELECT 1 FROM dataset_annotation_schemas WHERE dataset_id=?",
+        (dataset_id,),
+    ):
+        raise HTTPException(status_code=409, detail="数据集尚未配置类别，不能冻结")
     db.execute(
         "UPDATE datasets SET frozen=1,annotation_status='VERIFIED' WHERE id=?", (dataset_id,)
     )
@@ -444,7 +485,12 @@ def create_acquisition(request: AcquisitionRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="适配器不存在")
     if adapter["requires_gpu"] and not environment_status()["gpu"]["available"]:
         raise HTTPException(status_code=409, detail="GPU 当前不可用，任务已安全阻止")
-    return queue_job("ACQUISITION", request.model_dump())
+    payload = request.model_dump()
+    try:
+        payload["categories"] = normalize_categories(payload["categories"])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return queue_job("ACQUISITION", payload)
 
 
 @app.get("/api/models")
@@ -489,18 +535,26 @@ def remove_model(model_id: str) -> dict[str, Any]:
 def create_model(request: ModelCreateRequest) -> dict[str, Any]:
     if not db.row("SELECT id FROM adapters WHERE id=?", (request.adapter_id,)):
         raise HTTPException(status_code=404, detail="检测适配器不存在")
+    try:
+        categories = normalize_categories(
+            [category.model_dump() for category in request.categories]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     model_id = new_id("model")
     db.execute(
         """
         INSERT INTO models
-        (id,name,family,architecture,backbone,detector_head,class_count,
+        (id,name,family,architecture,backbone,detector_head,class_count,categories,
+         category_template,
          training_dataset,pretrained_dataset,version,precision,adapter_id,
          weight_path,weight_sha256,is_demo,status,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             model_id, request.name, request.family, request.architecture,
-            request.backbone, request.detector_head, request.class_count,
+            request.backbone, request.detector_head, len(categories),
+            json_dump(categories), request.category_template,
             request.training_dataset, request.pretrained_dataset, request.version,
             request.precision, request.adapter_id, request.weight_path, None,
             int(request.is_demo), "REGISTERED", utc_now(),
@@ -517,6 +571,10 @@ def create_plan(request: EvaluationPlanRequest) -> dict[str, Any]:
     for model_id in request.model_ids:
         if not db.row("SELECT id FROM models WHERE id=?", (model_id,)):
             raise HTTPException(status_code=404, detail=f"模型不存在: {model_id}")
+    try:
+        validate_evaluation_categories(request.dataset_ids, request.model_ids)
+    except CategoryCompatibilityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     plan_id = new_id("plan")
     protocol = {
         "batch_size": request.batch_size,
@@ -549,6 +607,13 @@ def run_plan(plan_id: str) -> dict[str, Any]:
     plan = db.row("SELECT * FROM evaluation_plans WHERE id=?", (plan_id,))
     if not plan:
         raise HTTPException(status_code=404, detail="评测方案不存在")
+    try:
+        validate_evaluation_categories(
+            json.loads(plan["dataset_ids"]),
+            json.loads(plan["model_ids"]),
+        )
+    except CategoryCompatibilityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     protocol = json.loads(plan["protocol"])
     return queue_job("EVALUATION", {"plan_id": plan_id, **protocol})
 

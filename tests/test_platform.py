@@ -15,15 +15,18 @@ import app.main as main_module
 from adapters.basegen_generator import prepare_plan
 from adapters.dronedets_detector import category_mapping
 from app.command_protocol import CommandTemplateError, validate_command_arguments
+from app.category_templates import list_category_templates, template_categories
 from app.config import ROOT_DIR, Settings
 from app.db import Database, json_dump, utc_now
 from app.detection_metrics import evaluate_coco_predictions
 from app.services import (
     DatasetAnnotationError,
     DatasetDeletionError,
+    CategoryCompatibilityError,
     LocalModelRegistrationError,
     ModelDeletionError,
     complete_dataset_annotations,
+    category_compatibility,
     delete_dataset,
     delete_model,
     get_annotation_session,
@@ -37,6 +40,7 @@ from app.services import (
     register_local_detector_model,
     save_sample_annotation,
     update_annotation_schema,
+    validate_evaluation_categories,
 )
 from app.worker import JobAgent
 
@@ -86,7 +90,46 @@ def test_model_metadata_migration_preserves_legacy_rows() -> None:
     assert row["class_count"] == 0
     assert row["training_dataset"] == "未记录"
     assert row["pretrained_dataset"] == "未记录"
+    assert row["categories"] == "[]"
+    assert row["category_template"] == "unconfigured"
     connection.close()
+
+
+def test_category_templates_keep_dataset_and_model_id_spaces() -> None:
+    templates = {item["id"]: item for item in list_category_templates()}
+    assert set(templates) == {"coco2017", "visdrone", "voc"}
+    assert len(templates["coco2017"]["categories"]) == 80
+    coco_car = next(
+        item for item in templates["coco2017"]["categories"]
+        if item["name"] == "car"
+    )
+    assert coco_car == {"name": "car", "dataset_id": 3, "model_id": 2}
+    visdrone_car = next(
+        item for item in templates["visdrone"]["categories"]
+        if item["name"] == "car"
+    )
+    assert visdrone_car == {"name": "car", "dataset_id": 4, "model_id": 3}
+
+
+def test_category_compatibility_maps_ids_and_rejects_name_mismatch(
+    tmp_path: Path,
+) -> None:
+    database, _ = make_database(tmp_path)
+    compatible = category_compatibility(
+        "dataset_aerial_clean", "model_yolov5s_demo", database
+    )
+    assert compatible["compatible"]
+    assert compatible["model_to_dataset"] == {
+        "0": 1, "1": 2, "2": 3, "3": 4, "4": 5, "5": 6,
+    }
+    database.execute(
+        "UPDATE models SET categories=? WHERE id='model_yolov5s_demo'",
+        (json_dump([{"id": 0, "name": "person"}]),),
+    )
+    with pytest.raises(CategoryCompatibilityError, match="模型缺少"):
+        validate_evaluation_categories(
+            ["dataset_aerial_clean"], ["model_yolov5s_demo"], database
+        )
 
 
 def test_local_detector_model_registration_uses_bounded_resources(
@@ -139,7 +182,13 @@ def test_local_detector_model_registration_uses_bounded_resources(
             "architecture": "One-stage",
             "backbone": "CustomNet",
             "detector_head": "CustomHead",
-            "class_count": 6,
+            "category_template": "custom",
+            "categories": [
+                {"id": index, "name": name}
+                for index, name in enumerate(
+                    ("car", "truck", "bus", "pedestrian", "bicycle", "motorcycle")
+                )
+            ],
             "training_dataset": "Custom Detection v1",
             "pretrained_dataset": "ImageNet-1K",
             "version": "v1",
@@ -248,7 +297,8 @@ def test_structured_detector_command_only_requires_coco_predictions(
             "architecture": "One-stage",
             "backbone": "Test",
             "detector_head": "TestHead",
-            "class_count": 1,
+            "category_template": "custom",
+            "categories": [{"id": 0, "name": "car"}],
             "training_dataset": "Test Detection",
             "pretrained_dataset": "无",
             "version": "v1",
@@ -319,10 +369,18 @@ def test_structured_detector_command_only_requires_coco_predictions(
             "100×80",
             1,
             "VERIFIED",
-            1,
+            0,
             "command-dataset",
             utc_now(),
         ),
+    )
+    update_annotation_schema(
+        "dataset_command_detector",
+        [{"id": 1, "name": "car", "color": "#1677FF"}],
+        database,
+    )
+    database.execute(
+        "UPDATE datasets SET frozen=1 WHERE id='dataset_command_detector'"
     )
     database.execute(
         """
@@ -359,6 +417,7 @@ def test_structured_detector_command_only_requires_coco_predictions(
     )
     assert run["map"] == pytest.approx(1)
     assert run["latency_p50"] > 0
+    assert json.loads(run["config"])["category_mapping"] == {"0": 1}
     assert "未生成 result.json" in json.loads(run["config"])["warnings"][0]
 
 
@@ -450,6 +509,8 @@ def test_replay_adapter_job_creates_dataset_draft(tmp_path: Path) -> None:
                 "sensor": {"resolution": "1920×1080", "motion_blur": 0.2},
             },
             "model_parameters": {},
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
         },
         database,
     )
@@ -504,6 +565,8 @@ def test_external_conda_adapter_uses_registered_python(tmp_path: Path) -> None:
                 "sensor": {"resolution": "960×540"},
             },
             "model_parameters": {},
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
         },
         database,
     )
@@ -872,7 +935,7 @@ def test_detection_annotations_persist_and_export_coco(tmp_path: Path) -> None:
     session = get_annotation_session("dataset_annotation_test", database)
     assert session
     assert session["progress"] == {"completed": 0, "total": 2}
-    assert len(session["categories"]) == 6
+    assert session["categories"] == []
 
     categories = [
         {"id": 1, "name": "vehicle", "color": "#1677FF"},
@@ -1070,10 +1133,18 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
             "100×80",
             1,
             "CANDIDATE",
-            1,
+            0,
             "real-detector",
             utc_now(),
         ),
+    )
+    update_annotation_schema(
+        "dataset_real_detector",
+        template_categories("visdrone", "dataset"),
+        database,
+    )
+    database.execute(
+        "UPDATE datasets SET frozen=1 WHERE id='dataset_real_detector'"
     )
     fake_weight = tmp_path / "best.pt"
     fake_weight.write_bytes(b"test-only-weight")
@@ -1129,7 +1200,7 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
             converted_annotation.read_text(encoding="utf-8")
         )
         assert converted["info"]["source_format"] == "VisDrone"
-        assert converted["annotations"][0]["category_id"] == 4
+        assert converted["annotations"][0]["category_id"] == 3
         output_directory = Path(request["output_directory"])
         output_directory.mkdir(parents=True, exist_ok=True)
         (output_directory / "predictions.json").write_text(
@@ -1137,7 +1208,7 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
                 [
                     {
                         "image_id": 1,
-                        "category_id": 4,
+                        "category_id": 3,
                         "bbox": [10, 10, 30, 20],
                         "score": 0.99,
                     }
@@ -1194,7 +1265,14 @@ def test_local_import_can_feed_real_condition_operator(tmp_path: Path) -> None:
     Image.new("RGB", (64, 40), (38, 120, 180)).save(source_directory / "aerial.png")
     import_job = queue_job(
         "DATASET_IMPORT",
-        {"name": "真实航拍导入", "directory": str(source_directory), "annotation_path": None, "scene_domain": "无人机航拍"},
+        {
+            "name": "真实航拍导入",
+            "directory": str(source_directory),
+            "annotation_path": None,
+            "scene_domain": "无人机航拍",
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
+        },
         database,
     )
     agent = JobAgent(database, app_settings)
@@ -1215,6 +1293,8 @@ def test_local_import_can_feed_real_condition_operator(tmp_path: Path) -> None:
                 "sensor": {"resolution": "原始分辨率", "motion_blur": 0.4},
             },
             "model_parameters": {},
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
         },
         database,
     )
@@ -1281,6 +1361,8 @@ def test_resource_picker_upload_imports_and_cleans_staging(
         annotation=UploadFile(annotation_bytes, filename="instances.json"),
         annotation_files=[],
         annotation_relative_paths=[],
+        category_template="custom",
+        categories=[{"id": 1, "name": "car"}],
     )
     assert response["status"] == "QUEUED"
     assert captured["job_type"] == "DATASET_IMPORT"
@@ -1323,6 +1405,8 @@ def test_upload_endpoint_uses_raised_multipart_file_limit(
                 [f"images/{index}.png" for index in range(file_count)]
             ),
             "annotation_relative_paths_json": "[]",
+            "categories_json": json.dumps([{"id": 1, "name": "car"}]),
+            "category_template": "custom",
         }
 
         def get(self, name: str) -> object | None:
@@ -1397,6 +1481,11 @@ def test_yolo_annotation_directory_imports_every_label_file(
             "labels/first.txt",
             "labels/nested/second.txt",
         ],
+        category_template="custom",
+        categories=[
+            {"id": 0, "name": "car"},
+            {"id": 1, "name": "pedestrian"},
+        ],
     )
     assert response["status"] == "QUEUED"
     payload = captured["payload"]
@@ -1468,6 +1557,8 @@ def test_visdrone_import_creates_committed_coco_annotations(
             "annotation_path": str(label_directory),
             "annotation_format": "VISDRONE",
             "scene_domain": "无人机航拍",
+            "category_template": "visdrone",
+            "categories": template_categories("visdrone", "dataset"),
         },
         database,
     )

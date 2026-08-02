@@ -30,8 +30,26 @@ export interface Dataset {
   sample_count: number
   annotation_status: string
   frozen: boolean
+  category_template: string
+  categories: CategoryDefinition[]
   preview_images: string[]
   created_at: string
+}
+
+export interface CategoryDefinition {
+  id: number
+  name: string
+  color?: string
+}
+
+export interface CategoryTemplate {
+  id: string
+  name: string
+  categories: Array<{
+    name: string
+    dataset_id: number
+    model_id: number
+  }>
 }
 
 export interface DatasetSamplePage {
@@ -59,9 +77,7 @@ export interface DatasetSamplePage {
   }>
 }
 
-export interface AnnotationCategory {
-  id: number
-  name: string
+export interface AnnotationCategory extends CategoryDefinition {
   color: string
 }
 
@@ -104,6 +120,8 @@ export interface ModelVersion {
   backbone: string
   detector_head: string
   class_count: number
+  category_template: string
+  categories: CategoryDefinition[]
   training_dataset: string
   pretrained_dataset: string
   version: string
