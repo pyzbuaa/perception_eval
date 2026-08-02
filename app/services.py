@@ -849,10 +849,17 @@ def _sample_visualizations(
                     )
                 except ValueError:
                     continue
+                category = categories.get(
+                    category_id,
+                    {
+                        "name": f"class {category_id}",
+                        "color": colors[category_id % len(colors)],
+                    },
+                )
                 boxes.append(
                     {
-                        "label": f"class {category_id}",
-                        "color": colors[category_id % len(colors)],
+                        "label": category["name"],
+                        "color": category["color"],
                         "x": center_x - box_width / 2,
                         "y": center_y - box_height / 2,
                         "width": box_width,
@@ -901,6 +908,86 @@ def _dataset_images(
             and path.suffix.lower() in {".svg", ".png", ".jpg", ".jpeg", ".webp"}
         ]
     return dataset, directory, files
+
+
+def dataset_statistics(
+    dataset_id: str,
+    database: Database = db,
+) -> dict[str, Any] | None:
+    resolved = _dataset_images(dataset_id, database)
+    if not resolved:
+        return None
+    dataset, directory, files = resolved
+    stored_categories = _annotation_categories(dataset_id, database)
+    categories = normalize_categories(stored_categories) if stored_categories else []
+    counts = {
+        normalize_category_name(category["name"]): {
+            "id": category["id"],
+            "name": category["name"],
+            "count": 0,
+        }
+        for category in categories
+    }
+    visualizations = _sample_visualizations(dataset_id, directory, files, database)
+    resolution_counts: dict[tuple[int, int], int] = defaultdict(int)
+    scale_counts = {"small": 0, "medium": 0, "large": 0, "unknown": 0}
+    annotated_images = 0
+    object_count = 0
+    for item in visualizations.values():
+        width = int(item["width"])
+        height = int(item["height"])
+        if width > 0 and height > 0:
+            resolution_counts[(width, height)] += 1
+        if item["annotation_source"]:
+            annotated_images += 1
+        for box in item["boxes"]:
+            object_count += 1
+            normalized_name = normalize_category_name(box["label"])
+            if normalized_name not in counts:
+                counts[normalized_name] = {
+                    "id": None,
+                    "name": box["label"],
+                    "count": 0,
+                }
+            counts[normalized_name]["count"] += 1
+            if width <= 0 or height <= 0:
+                scale_counts["unknown"] += 1
+                continue
+            area = max(0.0, float(box["width"]) * width) * max(0.0, float(box["height"]) * height)
+            if area < 32 ** 2:
+                scale_counts["small"] += 1
+            elif area < 96 ** 2:
+                scale_counts["medium"] += 1
+            else:
+                scale_counts["large"] += 1
+    category_counts = sorted(
+        counts.values(),
+        key=lambda item: (
+            item["id"] is None,
+            item["id"] if item["id"] is not None else item["name"],
+        ),
+    )
+    resolutions = [
+        {"width": width, "height": height, "label": f"{width}×{height}", "count": count}
+        for (width, height), count in sorted(
+            resolution_counts.items(),
+            key=lambda item: (-item[1], -(item[0][0] * item[0][1]), item[0]),
+        )
+    ]
+    return {
+        "dataset_id": dataset_id,
+        "image_count": len(files),
+        "annotated_image_count": annotated_images,
+        "object_count": object_count,
+        "category_counts": category_counts,
+        "resolutions": resolutions,
+        "scales": [
+            {"key": "small", "label": "小目标 < 32²", "count": scale_counts["small"]},
+            {"key": "medium", "label": "中目标 32²–96²", "count": scale_counts["medium"]},
+            {"key": "large", "label": "大目标 ≥ 96²", "count": scale_counts["large"]},
+            {"key": "unknown", "label": "尺寸未知", "count": scale_counts["unknown"]},
+        ],
+    }
 
 
 def _annotation_categories(

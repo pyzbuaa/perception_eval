@@ -184,6 +184,8 @@ curl http://127.0.0.1:18080/api/runs/<job-id>
 数据构建和模型注册均需选择目标检测类别。平台内置 COCO 2017、
 VisDrone 和 Pascal VOC 类别模板；自定义类别可逐项填写，也可从 JSON 类别数组、
 COCO JSON 的 `categories` 字段或每行 `id,name` 的 CSV/TXT 文件读取。
+VisDrone 和 Pascal VOC 模板生成的 COCO 类别 ID 均从 0 开始；VisDrone 原始 TXT
+中的 1–10 类别编号会在导入时自动转换为 0–9。
 评测要求数据集与模型的类别名称集合完全一致，ID 可以不同；平台在运行时
 自动将模型输出 ID 映射回数据集 COCO 类别 ID。
 
@@ -331,11 +333,12 @@ POST /api/datasets/<dataset-id>/annotations/complete
 
 ## 浏览数据集图片
 
-数据集列表和详情中的 6 张图片是快速预览。点击“浏览全部”会打开滚轮浏览抽屉，并在接近
-底部时每次加载 48 张图片，适用于包含大量图片的数据集。分页 API 为：
+数据集列表和详情中的 6 张图片是快速预览。点击“浏览全部”会打开分页浏览抽屉，每页
+仅加载 50 张图片。数据集“查看”抽屉还会统计类别、分辨率和 COCO 尺度分布。对应 API 为：
 
 ```text
-GET /api/datasets/<dataset-id>/samples?offset=0&limit=48
+GET /api/datasets/<dataset-id>/samples?offset=0&limit=50
+GET /api/datasets/<dataset-id>/statistics
 ```
 
 ## 删除数据集

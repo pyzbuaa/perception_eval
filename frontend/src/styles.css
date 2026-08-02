@@ -64,8 +64,7 @@ body { overflow-x: auto; }
 .dataset-browser-preview-image { position: relative; display: inline-flex; max-width: 90vw; max-height: 82vh; overflow: hidden; line-height: 0; transform-origin: center center; transition: transform .3s cubic-bezier(0, 0, .25, 1); }
 .dataset-browser-preview-image > .ant-image-preview-img { display: block; width: auto; height: auto; max-width: 90vw; max-height: 82vh; object-fit: contain; }
 .dataset-browser-loading { min-height: 80px; display: flex; align-items: center; justify-content: center; gap: 10px; }
-.dataset-browser-load-more { min-height: 84px; display: flex; align-items: center; justify-content: center; }
-.dataset-browser-end { padding: 24px 0 6px; text-align: center; color: var(--muted); }
+.dataset-browser-pagination { padding: 24px 0 6px; display: flex; justify-content: center; }
 
 .annotation-loading { min-height: 55vh; display: flex; align-items: center; justify-content: center; gap: 12px; }
 .annotation-workspace { height: calc(100vh - 112px); min-height: 620px; display: grid; grid-template-columns: 245px minmax(0, 1fr) 292px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; outline: none; background: var(--panel-bg); }

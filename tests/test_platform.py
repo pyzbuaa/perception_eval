@@ -31,6 +31,7 @@ from app.services import (
     delete_dataset,
     delete_job,
     delete_model,
+    dataset_statistics,
     get_annotation_session,
     get_basegen_scene_schema,
     get_sample_annotation,
@@ -167,7 +168,13 @@ def test_category_templates_keep_dataset_and_model_id_spaces() -> None:
         item for item in templates["visdrone"]["categories"]
         if item["name"] == "car"
     )
-    assert visdrone_car == {"name": "car", "dataset_id": 4, "model_id": 3}
+    assert visdrone_car == {"name": "car", "dataset_id": 3, "model_id": 3}
+    assert templates["voc"]["categories"][0] == {
+        "name": "aeroplane", "dataset_id": 0, "model_id": 0,
+    }
+    assert templates["voc"]["categories"][-1] == {
+        "name": "tvmonitor", "dataset_id": 19, "model_id": 19,
+    }
 
 
 def test_category_compatibility_maps_ids_and_rejects_name_mismatch(
@@ -1043,6 +1050,19 @@ def test_detection_annotations_persist_and_export_coco(tmp_path: Path) -> None:
         "width": pytest.approx(20 / 64),
         "height": pytest.approx(15 / 40),
     }
+    statistics = dataset_statistics("dataset_annotation_test", database)
+    assert statistics
+    assert statistics["image_count"] == 2
+    assert statistics["annotated_image_count"] == 1
+    assert statistics["object_count"] == 1
+    assert statistics["category_counts"] == [
+        {"id": 1, "name": "vehicle", "count": 1},
+        {"id": 2, "name": "person", "count": 0},
+    ]
+    assert statistics["resolutions"] == [
+        {"width": 64, "height": 40, "label": "64×40", "count": 2}
+    ]
+    assert [item["count"] for item in statistics["scales"]] == [1, 0, 0, 0]
     assert database.row(
         "SELECT annotation_status FROM datasets WHERE id='dataset_annotation_test'"
     )["annotation_status"] == "ANNOTATING"
@@ -1575,9 +1595,9 @@ def test_yolo_annotation_directory_imports_every_label_file(
     assert [item["annotation_source"] for item in page["items"]] == [
         "YOLO",
         "YOLO",
-    ]
+        ]
     assert page["items"][0]["boxes"][0] == {
-        "label": "class 0",
+        "label": "car",
         "color": "#1677FF",
         "x": pytest.approx(0.4),
         "y": pytest.approx(0.4),
@@ -1635,5 +1655,6 @@ def test_visdrone_import_creates_committed_coco_annotations(
     )
     assert coco["info"]["source_format"] == "VisDrone"
     assert len(coco["images"]) == 1
-    assert [item["category_id"] for item in coco["annotations"]] == [4]
+    assert [item["category_id"] for item in coco["annotations"]] == [3]
+    assert [item["id"] for item in coco["categories"]] == list(range(10))
     assert len(coco["categories"]) == 10

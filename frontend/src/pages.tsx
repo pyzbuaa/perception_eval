@@ -16,6 +16,7 @@ import {
   InputNumber,
   List,
   Modal,
+  Pagination,
   Popconfirm,
   Progress,
   Radio,
@@ -61,7 +62,7 @@ import ReactECharts from 'echarts-for-react'
 import { api, formatBytes, percent, post } from './api'
 import { parseCategoryFile } from './categoryFiles'
 import { DemoTag, Gallery, JobProgress, ParetoChart, PRChart, StatusTag } from './components'
-import type { Adapter, AnnotationCategory, AnnotationSession, BaseGenSceneField, BaseGenSceneOption, BaseGenSceneSchema, CategoryDefinition, CategoryTemplate, Dataset, DatasetSamplePage, DetectionBox, EnvironmentStatus, Job, ModelVersion, Overview, ResultGroup, ResultResponse, SampleAnnotation } from './types'
+import type { Adapter, AnnotationCategory, AnnotationSession, BaseGenSceneField, BaseGenSceneOption, BaseGenSceneSchema, CategoryDefinition, CategoryTemplate, Dataset, DatasetSamplePage, DatasetStatistics, DetectionBox, EnvironmentStatus, Job, ModelVersion, Overview, ResultGroup, ResultResponse, SampleAnnotation } from './types'
 
 type RouteKey = 'overview' | 'builder' | 'datasets' | 'registry' | 'evaluation' | 'explorer' | 'tasks' | 'environment'
 interface PageProps { dark: boolean; navigate: (route: RouteKey) => void; refresh: () => void }
@@ -224,11 +225,11 @@ export function OverviewPage({ dark, navigate, overview }: PageProps & { overvie
 }
 
 const sourceCards = [
-  { id: 'local-import', source: 'REAL', icon: <ImportOutlined />, title: '本地数据', description: '导入本地 PNG/JPEG图像及可选 COCO/YOLO/VisDrone格式标注文件。', recommended: true },
-  { id: 'adapter_replay', source: 'REPLAY_FIXTURE', icon: <PlayCircleOutlined />, title: '测试回放', description: '固定样例验证生成任务、标注与评测闭环。', recommended: true },
-  { id: 'adapter_condition', source: 'REAL_TRANSFORMED', icon: <CloudOutlined />, title: '条件退化', description: '读取已导入的真实图像，产生模糊、雾化和噪声条件。' },
-  { id: 'adapter_basegen', source: 'GENERATIVE', icon: <RobotOutlined />, title: 'Z-Image-Turbo', description: '通过独立 gen 环境调用 BaseGen 生成未标注感知图像。' },
+  { id: 'local-import', source: 'REAL', icon: <ImportOutlined />, title: '本地数据导入', description: '导入本地 PNG/JPEG图像及可选 COCO/YOLO/VisDrone格式标注文件。', recommended: true },
+  { id: 'adapter_basegen', source: 'GENERATIVE', icon: <RobotOutlined />, title: '基础图像生成', description: '调用生成式模型生成感知数据。' },
+  { id: 'adapter_condition', source: 'REAL_TRANSFORMED', icon: <CloudOutlined />, title: '非理想条件生成', description: '读取已导入的真实图像，产生模糊、雾化和噪声条件。' },
   { id: 'airsim-future', source: 'SIMULATOR', icon: <CodeOutlined />, title: 'AirSim / UE', description: '通过独立 RPC 服务采集图像与真值。', disabled: true },
+  { id: 'adapter_replay', source: 'REPLAY_FIXTURE', icon: <PlayCircleOutlined />, title: '测试回放', description: '固定样例验证生成任务、标注与评测闭环。', recommended: true },
 ]
 
 type BaseGenSelection =
@@ -526,13 +527,13 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
 
   return (
     <Space direction="vertical" size={18} style={{ width: '100%' }}>
-      <Steps current={step} items={['选择来源', '配置条件', '组合预览', '执行与浏览', '真值冻结'].map((title) => ({ title }))} />
+      <Steps current={step} items={(source.id === 'local-import' ? ['选择来源', '导入配置', '导入确认', '执行导入', '真值冻结'] : ['选择来源', '配置条件', '组合预览', '执行与浏览', '真值冻结']).map((title) => ({ title }))} />
       {step === 0 && <Card title="选择数据来源" extra={<Tag color="purple">BaseGen 已接入</Tag>}>
         <Row gutter={[16, 16]}>{sourceCards.map((item) => {
           const runtime = sourceRuntimes.data.find((entry) => entry.id === item.id)
           return <Col xs={24} md={12} xl={6} key={item.id}><Card hoverable={!item.disabled} className={`source-card ${source.id === item.id ? 'source-selected' : ''} ${item.disabled ? 'source-disabled' : ''}`} onClick={() => selectSource(item)}><div className="source-icon">{item.icon}</div><Space><Typography.Title level={4}>{item.title}</Typography.Title>{item.recommended && <Tag color="cyan">推荐</Tag>}</Space><Typography.Paragraph type="secondary">{item.description}</Typography.Paragraph><Space wrap>{item.id === 'local-import' ? <StatusTag status="HEALTHY" /> : item.disabled ? <Tag>未接入</Tag> : <><StatusTag status={runtime?.status || (sourceRuntimes.loading ? 'CHECKING' : 'UNAVAILABLE')} /><Button size="small" onClick={(event) => { event.stopPropagation(); healthSource(item.id) }}>健康检查</Button></>}</Space></Card></Col>
         })}</Row>
-        <div className="wizard-actions"><Button type="primary" onClick={() => setStep(1)}>下一步：配置条件 <ArrowRightOutlined /></Button></div>
+        <div className="wizard-actions"><Button type="primary" onClick={() => setStep(1)}>下一步：{source.id === 'local-import' ? '导入配置' : '配置条件'} <ArrowRightOutlined /></Button></div>
       </Card>}
       {step === 1 && <Row gutter={16}>
         <Col xs={24} xl={12}>
@@ -605,14 +606,14 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
         <Col xs={24} xl={12}>{source.id === 'local-import' ? <Card title="导入校验"><Timeline items={[{ color: 'blue', children: '通过系统资源管理器选择图像目录' }, { color: 'blue', children: '上传 PNG、JPEG、WebP 和 SVG 到工作区暂存区' }, { color: 'blue', children: '标注作为候选真值导入并等待校核' }, { color: 'green', children: '导入完成后自动清理暂存文件，不修改原始目录' }]} /><Alert type="info" showIcon message="浏览器安全选择" description="浏览器不会向平台暴露本机绝对路径；只上传你在资源管理器中明确选择的文件。" /></Card> : <Card title={isBaseGen ? '生成参数' : '传感器与成像条件'}><Form layout="vertical"><Form.Item label="图像分辨率"><Select value={resolution} onChange={setResolution} options={resolutionOptions.map((value) => ({ value }))} /></Form.Item>{isBaseGen ? <><Form.Item label="起始随机种子"><InputNumber value={generatorSeed} onChange={(value) => setGeneratorSeed(value || 0)} min={0} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="推理步数"><InputNumber value={generatorSteps} onChange={(value) => setGeneratorSteps(value || 1)} min={1} max={100} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="设备策略"><Select value={devicePolicy} onChange={setDevicePolicy} options={[{ value: 'cuda', label: '全量 CUDA（推荐）' }, { value: 'cpu-offload', label: 'CPU Offload（节省显存）' }]} /></Form.Item></> : <><Form.Item label={`运动模糊强度 ${blur.toFixed(1)}`}><Slider value={blur} onChange={setBlur} min={0} max={1} step={0.1} marks={{ 0: '清洁', 0.5: '中等', 1: '严重' }} /></Form.Item><Form.Item label="固定随机种子"><Checkbox.Group options={[1001, 1002, 1003, 1004].map((value) => ({ label: value, value }))} value={seeds} onChange={(values) => setSeeds(values as number[])} /></Form.Item></>}</Form></Card>}</Col>
         {source.id === 'adapter_condition' && <Col span={24}><Card title="选择退化输入数据集"><Select value={inputDatasetId} onChange={setInputDatasetId} style={{ width: '100%' }} placeholder="选择已导入的 PNG/JPEG/WebP 数据集" options={datasets.data.filter((item) => item.source_type === 'REAL').map((item) => ({ value: item.id, label: `${item.name} · ${item.sample_count} 张`, disabled: !item.categories.length }))} /><Typography.Paragraph type="secondary" style={{ marginTop: 10, marginBottom: 0 }}>条件算子保持几何位置不变，并自动继承输入数据集的类别。</Typography.Paragraph></Card></Col>}
         <Col span={24}><Card title="目标检测类别">{source.id === 'adapter_condition' ? inputDataset ? <Alert type="info" showIcon message={`已继承 ${inputDataset.categories.length} 个类别`} description={inputDataset.categories.map((item) => `${item.id}:${item.name}`).join(' · ')} /> : <Alert type="warning" showIcon message="请先选择输入数据集" /> : <CategoryConfiguration templates={categoryTemplates.data} templateId={categoryTemplateId} scope="dataset" customCategories={customDatasetCategories} onTemplateChange={setCategoryTemplateId} onCustomChange={setCustomDatasetCategories} />}</Card></Col>
-        <Col span={24}><div className="wizard-actions"><Button onClick={() => setStep(0)}>上一步</Button><Button type="primary" disabled={!categoriesReady || (source.id === 'local-import' ? localDatasetName.trim().length < 2 || !localImageFiles.length : isBaseGen ? !currentBasegenDomain || generatorSeed < 0 || generatorSteps < 1 : source.id === 'adapter_condition' ? !inputDatasetId || !seeds.length : !seeds.length)} onClick={() => setStep(2)}>下一步：组合预览</Button></div></Col>
+        <Col span={24}><div className="wizard-actions"><Button onClick={() => setStep(0)}>上一步</Button><Button type="primary" disabled={!categoriesReady || (source.id === 'local-import' ? localDatasetName.trim().length < 2 || !localImageFiles.length : isBaseGen ? !currentBasegenDomain || generatorSeed < 0 || generatorSteps < 1 : source.id === 'adapter_condition' ? !inputDatasetId || !seeds.length : !seeds.length)} onClick={() => setStep(2)}>下一步：{source.id === 'local-import' ? '导入确认' : '组合预览'}</Button></div></Col>
       </Row>}
-      {step === 2 && <Card title="提交前确认" extra={source.id === 'local-import' ? <Tag color="blue">本地真实数据</Tag> : isBaseGen ? <Tag color="purple">Z-Image-Turbo</Tag> : <DemoTag />}>
+      {step === 2 && <Card title="提交前确认" extra={source.id === 'local-import' ? <Tag color="blue">本地真实数据</Tag> : isBaseGen ? <Tag color="purple">基础图像生成</Tag> : <DemoTag />}>
         <Row gutter={[16, 16]}><Col xs={24} md={8}><Statistic title={source.id === 'local-import' ? '导入任务' : '配置单元'} value={source.id === 'local-import' ? 1 : combinationCount} suffix="个" /></Col><Col xs={24} md={8}><Statistic title="输出样本" value={source.id === 'local-import' ? '目录内图像' : samples} suffix={source.id === 'local-import' ? undefined : '张'} /></Col><Col xs={24} md={8}><Statistic title="真值入口" value={source.id === 'local-import' ? (annotationPath ? '已提供' : '未提供') : isBaseGen ? '未标注' : '候选框'} /></Col></Row><Divider />
-        <Descriptions column={{ xs: 1, md: 2 }} bordered size="small" items={[{ key: 'source', label: '来源', children: source.title }, { key: 'scene', label: '场景', children: source.id === 'local-import' || isBaseGen ? domain : `${domain} / ${weather}` }, { key: 'sensor', label: source.id === 'local-import' ? '输入目录' : isBaseGen ? '生成参数' : '成像条件', children: source.id === 'local-import' ? localDirectory : isBaseGen ? `${resolution} / ${generatorSteps} 步 / ${devicePolicy}` : `${resolution} / 模糊 ${blur}` }, { key: 'categories', label: '检测类别', children: `${selectedCategories.length} 类` }, { key: 'seed', label: '随机种子', children: source.id === 'local-import' ? '不适用' : isBaseGen ? `${generatorSeed} 起连续 ${samples} 个` : seeds.join(', ') }, { key: 'truth', label: '真值策略', children: source.id === 'local-import' ? (annotationPath ? '导入后作为候选真值' : '未提供') : isBaseGen ? '未标注，需另行标注后评测' : '候选框，完成后需校核冻结' }, { key: 'official', label: '结果性质', children: source.id === 'local-import' ? <Tag color="blue">真实采集数据</Tag> : isBaseGen ? <Tag color="purple">真实模型生成</Tag> : <DemoTag /> }]} />
+        <Descriptions column={{ xs: 1, md: 2 }} bordered size="small" items={[{ key: 'source', label: '构建方式', children: source.title }, { key: 'scene', label: '场景', children: source.id === 'local-import' || isBaseGen ? domain : `${domain} / ${weather}` }, { key: 'sensor', label: source.id === 'local-import' ? '输入目录' : isBaseGen ? '生成参数' : '成像条件', children: source.id === 'local-import' ? localDirectory : isBaseGen ? `${resolution} / ${generatorSteps} 步 / ${devicePolicy}` : `${resolution} / 模糊 ${blur}` }, { key: 'categories', label: '检测类别', span: 2, children: <Space direction="vertical" size={4} style={{ width: '100%' }}><Typography.Text strong>{selectedCategories.length} 类</Typography.Text><Typography.Paragraph ellipsis={{ rows: 3, expandable: true, symbol: '展开全部' }} style={{ marginBottom: 0 }}>{selectedCategories.map((item) => `${item.id}:${item.name}`).join(' · ')}</Typography.Paragraph></Space> }, { key: 'seed', label: '随机种子', children: source.id === 'local-import' ? '不适用' : isBaseGen ? `${generatorSeed} 起连续 ${samples} 个` : seeds.join(', ') }, { key: 'truth', label: '真值策略', children: source.id === 'local-import' ? (annotationPath ? '导入后作为候选真值' : '未提供') : isBaseGen ? '未标注，需另行标注后评测' : '候选框，完成后需校核冻结' }, { key: 'official', label: '数据来源', children: source.id === 'local-import' ? <Tag color="blue">真实采集数据</Tag> : isBaseGen ? <Tag color="purple">真实模型生成</Tag> : <DemoTag /> }]} />
         {isBaseGen && <Card size="small" title="场景字段规则" className="top-gap"><Space wrap>{basegenSceneSummary.map((item) => <Tag key={item}>{item}</Tag>)}{basegenCustom && <Tag color="blue">自定义：{basegenCustom}</Tag>}</Space></Card>}
         {isBaseGen && basegenPreview && <Card size="small" title="随机计划预览（不加载模型）" className="top-gap"><List dataSource={basegenPreview.images} renderItem={(item) => <List.Item><Space direction="vertical" style={{ width: '100%' }}><Space wrap><Tag color="blue">seed {item.seed}</Tag><Tag>{item.width}×{item.height}</Tag>{currentBasegenDomain?.fields.filter((field) => field.kind !== 'text').map((field) => { const raw = item.scene[field.name]; const values = Array.isArray(raw) ? raw : [raw]; return <Tag key={field.name}>{field.label_zh}：{values.map((value) => optionFor(field, value)?.label_zh || value).join('、')}</Tag> })}</Space><Typography.Paragraph copyable={{ text: item.prompt }} ellipsis={{ rows: 3, expandable: true, symbol: '展开 prompt' }} style={{ marginBottom: 0 }}>{item.prompt}</Typography.Paragraph></Space></List.Item>} /></Card>}
-        {source.id !== 'local-import' && <Alert className="inline-alert" type={isBaseGen ? 'info' : 'warning'} showIcon message={isBaseGen ? '本任务将调用 BaseGen 真实生成图像' : source.id === 'adapter_condition' ? '本任务将创建真实图像的条件退化版本' : '本任务使用固定样例验证流程'} description={isBaseGen ? '模型在独立 gen 环境中运行；纯文本生成不提供目标框等真值。' : source.id === 'adapter_condition' ? '输出记录原数据集和退化参数，正式冻结前仍需抽查真值。' : '输出会保留完整数据谱系，但不能作为生成模型能力结论。'} />}
+        {source.id !== 'local-import' && <Alert className="inline-alert" type={isBaseGen ? 'info' : 'warning'} showIcon message={isBaseGen ? '本任务将调用 BaseGen 真实生成图像' : source.id === 'adapter_condition' ? '本任务将创建真实图像的非理想条件版本' : '本任务使用固定样例验证流程'} description={isBaseGen ? '模型在独立 gen 环境中运行；纯文本生成不提供目标框等真值。' : source.id === 'adapter_condition' ? '输出记录原数据集和非理想条件参数，正式冻结前仍需抽查真值。' : '输出会保留完整数据谱系，但不能作为生成模型能力结论。'} />}
         <div className="wizard-actions"><Button onClick={() => { setBasegenPreview(undefined); setStep(1) }}>上一步</Button>{isBaseGen && <Button loading={previewing} onClick={previewBasegen}>预览 3 个随机场景</Button>}<Button type="primary" loading={submitting} icon={<PlayCircleOutlined />} onClick={submit}>提交构建任务</Button></div>
       </Card>}
       {step === 3 && <Space direction="vertical" size={16} style={{ width: '100%' }}><JobProgress jobId={jobId} onFinish={finish} />{finishedJob?.status === 'SUCCEEDED' && <Card><Result status="success" title={source.id === 'local-import' ? '本地图像已导入' : '数据构建任务已完成'} subTitle={finishedJob.result?.annotation_status === 'UNLABELED' ? '当前没有真值，需进入数据集完成标注后才能正式评测。' : '输出当前仍是候选真值，冻结前不会进入正式评测。'} extra={finishedJob.result?.annotation_status === 'UNLABELED' ? [<Button key="datasets" type="primary" onClick={() => navigate('datasets')}>打开数据集</Button>] : [<Button key="freeze" type="primary" icon={<LockOutlined />} onClick={freeze}>校核并冻结数据版本</Button>, <Button key="datasets" onClick={() => navigate('datasets')}>打开数据集</Button>]} /></Card>}</Space>}
@@ -622,26 +623,28 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
 }
 
 function DatasetBrowser({ dataset, onClose }: { dataset?: Dataset; onClose: () => void }) {
+  const pageSize = 50
   const [items, setItems] = useState<DatasetSamplePage['items']>([])
   const [total, setTotal] = useState(0)
   const [declaredCount, setDeclaredCount] = useState(0)
+  const [pageNumber, setPageNumber] = useState(1)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const loadingRef = useRef(false)
   const activeDatasetId = useRef<string>()
   const browserRef = useRef<HTMLDivElement>(null)
-  const loadMoreRef = useRef<HTMLDivElement>(null)
 
-  const load = async (datasetId: string, offset: number, replace: boolean) => {
+  const load = async (datasetId: string, nextPage: number) => {
     if (loadingRef.current) return
     loadingRef.current = true
     setLoading(true)
     try {
-      const page = await api<DatasetSamplePage>(`/api/datasets/${datasetId}/samples?offset=${offset}&limit=48`)
+      const page = await api<DatasetSamplePage>(`/api/datasets/${datasetId}/samples?offset=${(nextPage - 1) * pageSize}&limit=${pageSize}`)
       if (activeDatasetId.current !== datasetId) return
-      setItems((current) => replace ? page.items : [...current, ...page.items])
+      setItems(page.items)
       setTotal(page.total)
       setDeclaredCount(page.declared_count)
+      setPageNumber(nextPage)
       setError('')
     } catch (loadError) {
       if (activeDatasetId.current === datasetId) setError((loadError as Error).message)
@@ -658,32 +661,18 @@ function DatasetBrowser({ dataset, onClose }: { dataset?: Dataset; onClose: () =
     loadingRef.current = false
     setItems([])
     setTotal(0)
+    setPageNumber(1)
     setDeclaredCount(dataset?.sample_count || 0)
     setError('')
-    if (dataset) load(dataset.id, 0, true)
+    if (dataset) load(dataset.id, 1)
   }, [dataset?.id])
 
-  const scroll = (event: React.UIEvent<HTMLDivElement>) => {
-    const element = event.currentTarget
-    if (dataset && items.length < total && element.scrollHeight - element.scrollTop - element.clientHeight < 320) {
-      load(dataset.id, items.length, false)
-    }
+  const changePage = (nextPage: number) => {
+    if (!dataset || loadingRef.current) return
+    setItems([])
+    browserRef.current?.scrollTo({ top: 0 })
+    void load(dataset.id, nextPage)
   }
-  useEffect(() => {
-    const root = browserRef.current
-    const target = loadMoreRef.current
-    if (!dataset || !root || !target || loading || items.length >= total) return
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries[0]?.isIntersecting && !loadingRef.current) {
-          load(dataset.id, items.length, false)
-        }
-      },
-      { root, rootMargin: '480px 0px' },
-    )
-    observer.observe(target)
-    return () => observer.disconnect()
-  }, [dataset?.id, items.length, total, loading])
   const annotationSourceLabels = {
     MANUAL: '平台标注',
     COCO: 'COCO',
@@ -711,8 +700,8 @@ function DatasetBrowser({ dataset, onClose }: { dataset?: Dataset; onClose: () =
   )
 
   return (
-    <Drawer open={Boolean(dataset)} width="90vw" title={dataset ? `${dataset.name} · 全部样本` : '全部样本'} onClose={onClose} extra={<Tag>已加载 {items.length} / 总计 {total || declaredCount}</Tag>}>
-      <div ref={browserRef} className="dataset-browser" onScroll={scroll}>
+    <Drawer open={Boolean(dataset)} width="90vw" title={dataset ? `${dataset.name} · 全部样本` : '全部样本'} onClose={onClose} extra={<Tag>第 {pageNumber} 页 · 本页 {items.length} / 共 {total || declaredCount} 张</Tag>}>
+      <div ref={browserRef} className="dataset-browser">
         {error && <Alert type="error" showIcon message="样本加载失败" description={error} />}
         {!loading && !error && total !== declaredCount && <Alert type="warning" showIcon message="登记样本数与磁盘文件数不一致" description={`登记 ${declaredCount} 个，当前 Artifact 目录找到 ${total} 个可浏览图片。`} />}
         {!loading && !error && total === 0 ? <Empty description="该数据集没有可浏览的图片文件" /> : (
@@ -752,8 +741,7 @@ function DatasetBrowser({ dataset, onClose }: { dataset?: Dataset; onClose: () =
           </Image.PreviewGroup>
         )}
         {loading && <div className="dataset-browser-loading"><Spin /><Typography.Text type="secondary">正在加载图片…</Typography.Text></div>}
-        {!loading && items.length < total && <div ref={loadMoreRef} className="dataset-browser-load-more"><Button onClick={() => dataset && load(dataset.id, items.length, false)}>加载更多（剩余 {total - items.length} 张）</Button></div>}
-        {!loading && total > 0 && items.length >= total && <div className="dataset-browser-end">已加载全部 {total} 张图片</div>}
+        {!error && total > 0 && <div className="dataset-browser-pagination"><Pagination current={pageNumber} pageSize={pageSize} total={total} showSizeChanger={false} showQuickJumper disabled={loading} showTotal={(count) => `共 ${count} 张`} onChange={changePage} /></div>}
       </div>
     </Drawer>
   )
@@ -1173,7 +1161,49 @@ function AnnotationWorkspace({ dataset, onClose, onChanged }: { dataset?: Datase
   )
 }
 
-export function DatasetsPage(_: PageProps) {
+function DatasetStatisticsPanel({ datasetId, dark }: { datasetId: string; dark: boolean }) {
+  const { data, loading } = useResource<DatasetStatistics | undefined>(`/api/datasets/${datasetId}/statistics`, undefined)
+  if (loading) return <Card loading />
+  if (!data) return <Alert type="warning" showIcon message="暂时无法读取数据集统计" />
+  const textColor = dark ? '#c6d1df' : '#4b5565'
+  const splitColor = dark ? '#263449' : '#eef1f5'
+  const zoom = (count: number) => count > 12 ? [{ type: 'inside', yAxisIndex: 0, start: 0, end: 1200 / count }, { type: 'slider', yAxisIndex: 0, right: 4, width: 12, start: 0, end: 1200 / count }] : []
+  const categoryOption = {
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    grid: { left: 120, right: data.category_counts.length > 12 ? 38 : 18, top: 12, bottom: 34 },
+    xAxis: { type: 'value', minInterval: 1, name: '目标数', splitLine: { lineStyle: { color: splitColor } }, axisLabel: { color: textColor } },
+    yAxis: { type: 'category', inverse: true, data: data.category_counts.map((item) => `${item.id ?? '?'}:${item.name}`), axisLabel: { color: textColor, width: 108, overflow: 'truncate' } },
+    dataZoom: zoom(data.category_counts.length),
+    series: [{ type: 'bar', data: data.category_counts.map((item) => item.count), itemStyle: { color: '#1677FF', borderRadius: [0, 4, 4, 0] } }],
+  }
+  const resolutionOption = {
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    grid: { left: 100, right: data.resolutions.length > 12 ? 38 : 18, top: 12, bottom: 34 },
+    xAxis: { type: 'value', minInterval: 1, name: '图像数', splitLine: { lineStyle: { color: splitColor } }, axisLabel: { color: textColor } },
+    yAxis: { type: 'category', inverse: true, data: data.resolutions.map((item) => item.label), axisLabel: { color: textColor } },
+    dataZoom: zoom(data.resolutions.length),
+    series: [{ type: 'bar', data: data.resolutions.map((item) => item.count), itemStyle: { color: '#13A8A8', borderRadius: [0, 4, 4, 0] } }],
+  }
+  const scaleOption = {
+    tooltip: { trigger: 'item', formatter: '{b}<br/>{c} 个（{d}%）' },
+    legend: { bottom: 0, textStyle: { color: textColor } },
+    series: [{ type: 'pie', radius: ['42%', '68%'], center: ['50%', '44%'], label: { formatter: '{b}\n{c}', color: textColor }, data: data.scales.filter((item) => item.count).map((item) => ({ name: item.label, value: item.count })) }],
+  }
+  return <Space direction="vertical" size={14} style={{ width: '100%' }}>
+    <Row gutter={12}>
+      <Col span={8}><Card size="small"><Statistic title="实际图像" value={data.image_count} suffix="张" /></Card></Col>
+      <Col span={8}><Card size="small"><Statistic title="有标注图像" value={data.annotated_image_count} suffix="张" /></Card></Col>
+      <Col span={8}><Card size="small"><Statistic title="目标框" value={data.object_count} suffix="个" /></Card></Col>
+    </Row>
+    <Row gutter={[12, 12]}>
+      <Col xs={24} xl={12}><Card size="small" title="各类别目标数量">{data.category_counts.length ? <ReactECharts option={categoryOption} style={{ height: 330 }} /> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未配置类别" />}</Card></Col>
+      <Col xs={24} xl={12}><Card size="small" title="图像分辨率分布">{data.resolutions.length ? <ReactECharts option={resolutionOption} style={{ height: 330 }} /> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有可统计的图像" />}</Card></Col>
+      <Col span={24}><Card size="small" title="不同尺度目标数量" extra={<Typography.Text type="secondary">COCO 面积口径</Typography.Text>}>{data.object_count ? <ReactECharts option={scaleOption} style={{ height: 310 }} /> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无目标框" />}</Card></Col>
+    </Row>
+  </Space>
+}
+
+export function DatasetsPage({ dark }: PageProps) {
   const { data, loading, reload } = useResource<Dataset[]>('/api/datasets', [])
   const [selected, setSelected] = useState<Dataset>()
   const [browserDataset, setBrowserDataset] = useState<Dataset>()
@@ -1199,7 +1229,7 @@ export function DatasetsPage(_: PageProps) {
     { title: '真值', dataIndex: 'annotation_status', render: (value) => <StatusTag status={value} /> },
     { title: '版本', render: (_, row) => row.frozen ? <Tag icon={<LockOutlined />} color="success">{row.version} 已冻结</Tag> : <Tag>草稿</Tag> },
     { title: '操作', render: (_, row) => <Space><Button type="link" onClick={() => setSelected(row)}>查看</Button><Button type="link" icon={<FileImageOutlined />} onClick={() => setBrowserDataset(row)}>浏览全部</Button><Button type="link" onClick={() => setAnnotationDataset(row)}>{row.frozen ? '查看标注' : '目标标注'}</Button>{!row.frozen && <Button type="link" onClick={() => freeze(row)}>冻结</Button>}{!row.frozen && <Popconfirm title="确认删除这个数据集？" description={`${row.name} · ${row.sample_count} 个样本将移入回收站。`} okText="移入回收站" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => remove(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm>}</Space> },
-  ]} /></Card><Drawer open={Boolean(selected)} width={760} title={selected?.name} onClose={() => setSelected(undefined)}>{selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Gallery images={selected.preview_images} height={140} /><Button block icon={<FileImageOutlined />} onClick={() => { setSelected(undefined); setBrowserDataset(selected) }}>浏览全部图片</Button><Button block onClick={() => { setSelected(undefined); setAnnotationDataset(selected) }}>{selected.frozen ? '查看目标检测标注' : '开始目标检测标注'}</Button><Descriptions bordered column={2} items={[{ key: 'source', label: '来源', children: selected.source_type }, { key: 'scene', label: '场景', children: selected.scene_domain }, { key: 'weather', label: '天气', children: selected.weather }, { key: 'resolution', label: '分辨率', children: selected.resolution }, { key: 'truth', label: '真值', children: <StatusTag status={selected.annotation_status} /> }, { key: 'frozen', label: '不可变', children: selected.frozen ? '是' : '否' }, { key: 'categories', label: '检测类别', children: selected.categories.length ? <Space wrap>{selected.categories.map((item) => <Tag key={item.id}>{item.id}:{item.name}</Tag>)}</Space> : <Tag color="warning">待配置</Tag>, span: 2 }]} /><Alert type="info" showIcon message="数据谱系" description="所有样本均记录来源、条件、seed、Adapter 版本和文件摘要。流程样例不会被标记为正式生成数据。" /></Space>}</Drawer><DatasetBrowser dataset={browserDataset} onClose={() => setBrowserDataset(undefined)} /><AnnotationWorkspace dataset={annotationDataset} onClose={() => setAnnotationDataset(undefined)} onChanged={reload} /></>
+  ]} /></Card><Drawer open={Boolean(selected)} width={1040} title={selected?.name} onClose={() => setSelected(undefined)}>{selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Gallery images={selected.preview_images} height={140} /><Button block icon={<FileImageOutlined />} onClick={() => { setSelected(undefined); setBrowserDataset(selected) }}>浏览全部图片</Button><Button block onClick={() => { setSelected(undefined); setAnnotationDataset(selected) }}>{selected.frozen ? '查看目标检测标注' : '开始目标检测标注'}</Button><Descriptions bordered column={2} items={[{ key: 'source', label: '来源', children: selected.source_type }, { key: 'scene', label: '场景', children: selected.scene_domain }, { key: 'weather', label: '天气', children: selected.weather }, { key: 'resolution', label: '分辨率', children: selected.resolution }, { key: 'truth', label: '真值', children: <StatusTag status={selected.annotation_status} /> }, { key: 'frozen', label: '不可变', children: selected.frozen ? '是' : '否' }, { key: 'categories', label: '检测类别', children: selected.categories.length ? <Space wrap>{selected.categories.map((item) => <Tag key={item.id}>{item.id}:{item.name}</Tag>)}</Space> : <Tag color="warning">待配置</Tag>, span: 2 }]} /><Divider>数据统计</Divider><DatasetStatisticsPanel datasetId={selected.id} dark={dark} /><Alert type="info" showIcon message="数据谱系" description="所有样本均记录来源、条件、seed、Adapter 版本和文件摘要。流程样例不会被标记为正式生成数据。" /></Space>}</Drawer><DatasetBrowser dataset={browserDataset} onClose={() => setBrowserDataset(undefined)} /><AnnotationWorkspace dataset={annotationDataset} onClose={() => setAnnotationDataset(undefined)} onChanged={reload} /></>
 }
 
 type LocalResourceKind = 'directory' | 'entrypoint' | 'weight'

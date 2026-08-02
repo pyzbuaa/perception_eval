@@ -54,7 +54,7 @@ type RouteKey = 'overview' | 'builder' | 'datasets' | 'registry' | 'evaluation' 
 
 const routeTitles: Record<RouteKey, { title: string; subtitle: string }> = {
   overview: { title: '实验概览', subtitle: '数据、模型、任务与最佳效能的统一视图' },
-  builder: { title: '数据构建', subtitle: '统一纳管生成、仿真、真实导入和条件退化' },
+  builder: { title: '数据集构建', subtitle: '统一纳管基础图像生成、仿真、真实导入和非理想条件生成' },
   datasets: { title: '数据集', subtitle: '查看真值状态、数据谱系和不可变版本' },
   registry: { title: '模型版本', subtitle: '注册模型信息、权重和只读执行环境' },
   evaluation: { title: '评测中心', subtitle: '配置模型矩阵与标准化时延协议' },

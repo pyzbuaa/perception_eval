@@ -8,16 +8,16 @@ from PIL import Image
 
 
 VISDRONE_CATEGORIES = [
-    {"id": 1, "name": "pedestrian"},
-    {"id": 2, "name": "people"},
-    {"id": 3, "name": "bicycle"},
-    {"id": 4, "name": "car"},
-    {"id": 5, "name": "van"},
-    {"id": 6, "name": "truck"},
-    {"id": 7, "name": "tricycle"},
-    {"id": 8, "name": "awning-tricycle"},
-    {"id": 9, "name": "bus"},
-    {"id": 10, "name": "motor"},
+    {"id": 0, "name": "pedestrian"},
+    {"id": 1, "name": "people"},
+    {"id": 2, "name": "bicycle"},
+    {"id": 3, "name": "car"},
+    {"id": 4, "name": "van"},
+    {"id": 5, "name": "truck"},
+    {"id": 6, "name": "tricycle"},
+    {"id": 7, "name": "awning-tricycle"},
+    {"id": 8, "name": "bus"},
+    {"id": 9, "name": "motor"},
 ]
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
@@ -84,12 +84,12 @@ def convert_visdrone_to_coco(
                     float(value) for value in fields[:4]
                 )
                 score = int(float(fields[4]))
-                category_id = int(float(fields[5]))
+                source_category_id = int(float(fields[5]))
             except ValueError:
                 continue
             if (
                 score <= 0
-                or category_id not in range(1, 11)
+                or source_category_id not in range(1, 11)
                 or box_width <= 0
                 or box_height <= 0
             ):
@@ -106,7 +106,7 @@ def convert_visdrone_to_coco(
                 {
                     "id": annotation_id,
                     "image_id": image_id,
-                    "category_id": category_id,
+                    "category_id": source_category_id - 1,
                     "bbox": [x, y, box_width, box_height],
                     "area": box_width * box_height,
                     "iscrowd": 0,

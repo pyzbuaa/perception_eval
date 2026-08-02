@@ -42,6 +42,7 @@ from app.services import (
     delete_dataset,
     delete_job,
     delete_model,
+    dataset_statistics,
     environment_status,
     get_annotation_session,
     get_basegen_scene_schema,
@@ -166,10 +167,21 @@ def get_category_templates() -> list[dict[str, Any]]:
 def get_dataset_samples(
     dataset_id: str,
     offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=48, ge=1, le=200),
+    limit: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, Any]:
     try:
         result = list_dataset_samples(dataset_id, offset, limit)
+    except DatasetArtifactError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    return result
+
+
+@app.get("/api/datasets/{dataset_id}/statistics")
+def get_dataset_statistics(dataset_id: str) -> dict[str, Any]:
+    try:
+        result = dataset_statistics(dataset_id)
     except DatasetArtifactError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not result:

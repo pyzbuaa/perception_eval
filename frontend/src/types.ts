@@ -77,6 +77,16 @@ export interface DatasetSamplePage {
   }>
 }
 
+export interface DatasetStatistics {
+  dataset_id: string
+  image_count: number
+  annotated_image_count: number
+  object_count: number
+  category_counts: Array<{ id: number | null; name: string; count: number }>
+  resolutions: Array<{ width: number; height: number; label: string; count: number }>
+  scales: Array<{ key: 'small' | 'medium' | 'large' | 'unknown'; label: string; count: number }>
+}
+
 export interface AnnotationCategory extends CategoryDefinition {
   color: string
 }

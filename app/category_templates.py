@@ -70,12 +70,12 @@ CATEGORY_TEMPLATES = [
     _template(
         "visdrone",
         "VisDrone（10 类）",
-        [(index, name) for index, name in enumerate(VISDRONE_NAMES, start=1)],
+        list(enumerate(VISDRONE_NAMES)),
     ),
     _template(
         "voc",
         "Pascal VOC（20 类）",
-        [(index, name) for index, name in enumerate(VOC_NAMES, start=1)],
+        list(enumerate(VOC_NAMES)),
     ),
 ]
 
