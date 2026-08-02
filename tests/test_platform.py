@@ -1658,3 +1658,19 @@ def test_visdrone_import_creates_committed_coco_annotations(
     assert [item["category_id"] for item in coco["annotations"]] == [3]
     assert [item["id"] for item in coco["categories"]] == list(range(10))
     assert len(coco["categories"]) == 10
+    session = get_annotation_session(dataset["id"], database)
+    assert session and session["samples"][0]["box_count"] == 1
+    annotation = get_sample_annotation(dataset["id"], "sample.jpg", database)
+    assert annotation
+    assert annotation["width"] == 100
+    assert annotation["height"] == 80
+    assert annotation["boxes"] == [
+        {
+            "id": "imported_1",
+            "category_id": 3,
+            "x": pytest.approx(10),
+            "y": pytest.approx(20),
+            "width": pytest.approx(30),
+            "height": pytest.approx(40),
+        }
+    ]

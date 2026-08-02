@@ -1008,7 +1008,7 @@ def get_annotation_session(
     resolved = _dataset_images(dataset_id, database)
     if not resolved:
         return None
-    dataset, _, files = resolved
+    dataset, directory, files = resolved
     rows = {
         row["sample_name"]: row
         for row in database.rows(
@@ -1019,27 +1019,39 @@ def get_annotation_session(
             (dataset_id,),
         )
     }
-    completed = sum(
-        bool(rows[path.name]["completed"])
-        for path in files
-        if path.name in rows
-    )
+    imported = _sample_visualizations(dataset_id, directory, files, database)
+    samples = []
     artifact_root = database.settings.artifact_dir.resolve()
-    return {
-        "dataset": decode_row(dataset),
-        "categories": _annotation_categories(dataset_id, database),
-        "progress": {"completed": completed, "total": len(files)},
-        "samples": [
+    for path in files:
+        row = rows.get(path.name)
+        visualization = imported.get(path.name, {})
+        completed = (
+            bool(row["completed"])
+            if row
+            else bool(dataset["frozen"] and visualization.get("annotation_source"))
+        )
+        samples.append(
             {
                 "name": path.name,
                 "url": (
                     f"/artifacts/{quote(path.resolve().relative_to(artifact_root).as_posix(), safe='/')}"
                 ),
-                "completed": bool(rows.get(path.name, {}).get("completed")),
-                "box_count": len(json_load(rows.get(path.name, {}).get("boxes"), [])),
+                "completed": completed,
+                "box_count": (
+                    len(json_load(row["boxes"], []))
+                    if row
+                    else len(visualization.get("boxes", []))
+                ),
             }
-            for path in files
-        ],
+        )
+    return {
+        "dataset": decode_row(dataset),
+        "categories": _annotation_categories(dataset_id, database),
+        "progress": {
+            "completed": sum(bool(sample["completed"]) for sample in samples),
+            "total": len(samples),
+        },
+        "samples": samples,
     }
 
 
@@ -1051,8 +1063,9 @@ def get_sample_annotation(
     resolved = _dataset_images(dataset_id, database)
     if not resolved:
         return None
-    _, _, files = resolved
-    if sample_name not in {path.name for path in files}:
+    dataset, directory, files = resolved
+    sample_path = next((path for path in files if path.name == sample_name), None)
+    if not sample_path:
         return None
     row = database.row(
         """
@@ -1061,14 +1074,48 @@ def get_sample_annotation(
         """,
         (dataset_id, sample_name),
     )
+    if row:
+        return {
+            "dataset_id": dataset_id,
+            "sample_name": sample_name,
+            "width": row["width"],
+            "height": row["height"],
+            "boxes": json_load(row["boxes"], []),
+            "completed": bool(row["completed"]),
+            "updated_at": row["updated_at"],
+        }
+    visualization = _sample_visualizations(
+        dataset_id, directory, [sample_path], database
+    ).get(sample_name, {})
+    categories_by_name = {
+        normalize_category_name(category["name"]): int(category["id"])
+        for category in _annotation_categories(dataset_id, database)
+    }
+    width = int(visualization.get("width", 0))
+    height = int(visualization.get("height", 0))
+    boxes = []
+    for index, box in enumerate(visualization.get("boxes", []), start=1):
+        category_id = categories_by_name.get(normalize_category_name(box["label"]))
+        if category_id is None:
+            continue
+        boxes.append(
+            {
+                "id": f"imported_{index}",
+                "category_id": category_id,
+                "x": float(box["x"]) * width,
+                "y": float(box["y"]) * height,
+                "width": float(box["width"]) * width,
+                "height": float(box["height"]) * height,
+            }
+        )
     return {
         "dataset_id": dataset_id,
         "sample_name": sample_name,
-        "width": row["width"] if row else 0,
-        "height": row["height"] if row else 0,
-        "boxes": json_load(row["boxes"], []) if row else [],
-        "completed": bool(row["completed"]) if row else False,
-        "updated_at": row["updated_at"] if row else None,
+        "width": width,
+        "height": height,
+        "boxes": boxes,
+        "completed": bool(dataset["frozen"] and visualization.get("annotation_source")),
+        "updated_at": None,
     }
 
 
