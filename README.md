@@ -326,6 +326,9 @@ POST /api/datasets/<dataset-id>/annotations/complete
 标注状态按 `UNLABELED → ANNOTATING → CANDIDATE → VERIFIED/FROZEN` 流转。修改一张已经
 确认的图片时，该图片会自动恢复为待确认，防止修改后未经复核就提交。
 
+任务中心通过 `DELETE /api/jobs/<job-id>` 删除终态任务记录及其工作区和日志，
+不会删除任务生成的数据集或评测结果。
+
 ## 浏览数据集图片
 
 数据集列表和详情中的 6 张图片是快速预览。点击“浏览全部”会打开滚轮浏览抽屉，并在接近

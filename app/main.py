@@ -34,11 +34,13 @@ from app.services import (
     DatasetAnnotationError,
     DatasetArtifactError,
     DatasetDeletionError,
+    JobDeletionError,
     LocalModelRegistrationError,
     ModelDeletionError,
     adapter_health,
     complete_dataset_annotations,
     delete_dataset,
+    delete_job,
     delete_model,
     environment_status,
     get_annotation_session,
@@ -621,6 +623,17 @@ def run_plan(plan_id: str) -> dict[str, Any]:
 @app.get("/api/jobs")
 def get_jobs(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str, Any]]:
     return list_jobs(limit=limit)
+
+
+@app.delete("/api/jobs/{job_id}")
+def remove_job(job_id: str) -> dict[str, Any]:
+    try:
+        result = delete_job(job_id)
+    except JobDeletionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return result
 
 
 @app.get("/api/runs/{run_or_job_id}")

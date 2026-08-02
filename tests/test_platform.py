@@ -23,11 +23,13 @@ from app.services import (
     DatasetAnnotationError,
     DatasetDeletionError,
     CategoryCompatibilityError,
+    JobDeletionError,
     LocalModelRegistrationError,
     ModelDeletionError,
     complete_dataset_annotations,
     category_compatibility,
     delete_dataset,
+    delete_job,
     delete_model,
     get_annotation_session,
     get_basegen_scene_schema,
@@ -72,6 +74,63 @@ def test_database_seeds_traceable_demo_data(tmp_path: Path) -> None:
     )
     if detector_model["weight_path"]:
         assert Path(detector_model["weight_path"]).suffix == ".pt"
+
+
+def test_database_does_not_restore_deleted_demo_data(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    with database.connect() as connection:
+        connection.execute("DELETE FROM results")
+        connection.execute("DELETE FROM runs")
+        connection.execute("DELETE FROM evaluation_plans")
+        connection.execute("DELETE FROM jobs")
+        connection.execute("DELETE FROM datasets")
+        connection.execute("DELETE FROM models")
+
+    database.initialize()
+
+    for table in ("datasets", "models", "evaluation_plans", "runs", "results", "jobs"):
+        assert database.row(f"SELECT COUNT(*) AS n FROM {table}")["n"] == 0
+    assert database.row("SELECT COUNT(*) AS n FROM adapters")["n"] == 5
+
+
+def test_delete_job_rejects_active_task_and_preserves_evaluation_results(
+    tmp_path: Path,
+) -> None:
+    database, app_settings = make_database(tmp_path)
+    job = queue_job("EVALUATION", {"plan_id": "test"}, database)
+    workspace = app_settings.task_dir / job["id"]
+    workspace.mkdir(parents=True)
+    (workspace / "result.json").write_text("{}", encoding="utf-8")
+    staged = app_settings.task_dir / "import_uploads" / "upload_test"
+    staged.mkdir(parents=True)
+    (staged / "annotation.json").write_text("{}", encoding="utf-8")
+    log = app_settings.log_dir / f"{job['id']}.log"
+    log.write_text("completed", encoding="utf-8")
+    database.execute(
+        "UPDATE jobs SET payload=? WHERE id=?",
+        (json_dump({"staged_upload_root": str(staged)}), job["id"]),
+    )
+    with pytest.raises(JobDeletionError, match="尚未结束"):
+        delete_job(job["id"], database)
+
+    run = database.row("SELECT id FROM runs LIMIT 1")
+    database.execute("UPDATE runs SET job_id=? WHERE id=?", (job["id"], run["id"]))
+    database.execute(
+        "UPDATE jobs SET status='SUCCEEDED',progress=100 WHERE id=?", (job["id"],)
+    )
+    result_count = database.row("SELECT COUNT(*) AS n FROM results")["n"]
+
+    deleted = delete_job(job["id"], database)
+
+    assert deleted and deleted["deleted"]
+    assert deleted["results_preserved"]
+    assert deleted["cleanup_errors"] == []
+    assert database.row("SELECT id FROM jobs WHERE id=?", (job["id"],)) is None
+    assert database.row("SELECT job_id FROM runs WHERE id=?", (run["id"],))["job_id"] is None
+    assert database.row("SELECT COUNT(*) AS n FROM results")["n"] == result_count
+    assert not workspace.exists()
+    assert not staged.exists()
+    assert not log.exists()
 
 
 def test_model_metadata_migration_preserves_legacy_rows() -> None:

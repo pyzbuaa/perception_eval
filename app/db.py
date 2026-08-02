@@ -263,6 +263,10 @@ class Database:
                 """,
                 (str(self.settings.dronedets_runtime_prefix), now),
             )
+            if connection.execute(
+                "SELECT 1 FROM platform_state WHERE key='demo_data_seeded'"
+            ).fetchone():
+                return
             weight_override = os.environ.get("DRONEDETS_YOLOV8M_WEIGHT")
             weight_candidates = sorted(
                 Path("/mnt/data/cache/huggingface/hub/models--mshamrai--yolov8m-visdrone/snapshots").glob(
@@ -527,6 +531,9 @@ class Database:
                 )
             if not connection.execute("SELECT COUNT(*) FROM results").fetchone()[0]:
                 self._seed_results(connection, now)
+            connection.execute(
+                "INSERT INTO platform_state (key,value) VALUES ('demo_data_seeded','1')"
+            )
 
     def _write_demo_artifacts(self) -> None:
         styles = {
@@ -695,6 +702,10 @@ BASEGEN_SCHEMA = {
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS platform_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS adapters (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,

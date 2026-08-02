@@ -100,6 +100,10 @@ class DatasetDeletionError(ValueError):
     pass
 
 
+class JobDeletionError(ValueError):
+    pass
+
+
 class DatasetArtifactError(ValueError):
     pass
 
@@ -1364,6 +1368,59 @@ def list_jobs(database: Database = db, limit: int = 100) -> list[dict[str, Any]]
 def get_job(job_id: str, database: Database = db) -> dict[str, Any] | None:
     row = database.row("SELECT * FROM jobs WHERE id=?", (job_id,))
     return decode_row(row) if row else None
+
+
+def delete_job(job_id: str, database: Database = db) -> dict[str, Any] | None:
+    task_root = database.settings.task_dir.resolve()
+    log_root = database.settings.log_dir.resolve()
+    with database.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            return None
+        job = decode_row(dict(row))
+        if job["status"] not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+            raise JobDeletionError("任务尚未结束，请先取消任务并等待其进入终态")
+
+        paths: list[Path] = []
+        workspace = (task_root / job_id).resolve()
+        if workspace != task_root and workspace.is_relative_to(task_root):
+            paths.append(workspace)
+        payload = job.get("payload") or {}
+        staged_value = payload.get("staged_upload_root") if isinstance(payload, dict) else None
+        if staged_value:
+            staged = Path(str(staged_value)).expanduser().resolve()
+            staging_root = (task_root / "import_uploads").resolve()
+            if staged == staging_root or not staged.is_relative_to(staging_root):
+                raise JobDeletionError("任务暂存目录超出受控工作区，已拒绝删除")
+            paths.append(staged)
+        log_path = (log_root / f"{job_id}.log").resolve()
+        if log_path != log_root and log_path.is_relative_to(log_root):
+            paths.append(log_path)
+
+        connection.execute("UPDATE runs SET job_id=NULL WHERE job_id=?", (job_id,))
+        connection.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    cleanup_errors: list[str] = []
+    deleted_paths: list[str] = []
+    for path in dict.fromkeys(paths):
+        if not path.exists():
+            continue
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            deleted_paths.append(str(path))
+        except OSError as exc:
+            cleanup_errors.append(f"{path}: {exc}")
+    return {
+        "id": job_id,
+        "deleted": True,
+        "deleted_paths": deleted_paths,
+        "cleanup_errors": cleanup_errors,
+        "results_preserved": True,
+    }
 
 
 def queue_job(job_type: str, payload: dict[str, Any], database: Database = db) -> dict[str, Any]:
