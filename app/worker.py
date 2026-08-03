@@ -132,13 +132,22 @@ class JobAgent:
             "source_type": payload.get("source_type", "REPLAY_FIXTURE"),
             "output_directory": str(artifact_dir),
         }
-        if payload["adapter_id"] == "adapter_condition":
+        condition_adapter_ids = {"adapter_condition", "adapter_motion_blur"}
+        is_condition = payload["adapter_id"] in condition_adapter_ids
+        input_dataset: dict[str, Any] | None = None
+        source_annotation_directory: Path | None = None
+        if is_condition:
             input_dataset_id = payload.get("input_dataset_id")
             if not input_dataset_id:
                 raise ValueError("条件退化任务必须选择一个输入数据集")
             input_dataset = self.db.row("SELECT * FROM datasets WHERE id=?", (input_dataset_id,))
             if not input_dataset or not input_dataset.get("artifact_path"):
                 raise ValueError("输入数据集不存在或没有 Artifact")
+            if input_dataset.get("scene_domain") not in {
+                "无人机航拍",
+                "low-altitude-uav",
+            }:
+                raise ValueError("非理想条件生成当前仅支持无人机航拍域数据集")
             category_row = self.db.row(
                 "SELECT categories FROM dataset_annotation_schemas WHERE dataset_id=?",
                 (input_dataset_id,),
@@ -159,9 +168,81 @@ class JobAgent:
             ]
             if not input_images:
                 raise ValueError("输入数据集没有可处理的 PNG/JPEG/WebP 图像；SVG 流程样例不用于像素退化")
+            source_annotation_directory = input_directory / "annotations"
             request["input_images"] = input_images
             request["input_dataset_id"] = input_dataset_id
-            request["sample_count"] = min(request["sample_count"], len(input_images))
+            request["sample_count"] = len(input_images)
+            request["has_source_annotations"] = (
+                source_annotation_directory / "instances.json"
+            ).is_file()
+            resolution = input_dataset.get("resolution") or "原始分辨率"
+            if payload["adapter_id"] == "adapter_condition":
+                try:
+                    fog_strength = float(
+                        payload.get("model_parameters", {}).get("fog_strength", 1.0)
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("加雾强度必须是 0 到 1 之间的数值") from exc
+                if not 0 <= fog_strength <= 1:
+                    raise ValueError("加雾强度必须位于 0 到 1 之间")
+                request["conditions"] = {
+                    "scene": {"domain": "无人机航拍", "weather": "雾"},
+                    "sensor": {
+                        "resolution": resolution,
+                        "source_dataset_id": input_dataset_id,
+                        "degradation": "DiffusionDegrade UAV Fog",
+                    },
+                }
+                request["model_parameters"] = {
+                    "effect": "fog",
+                    "domain": "uav_aerial",
+                    "image_prep": "resize_512x512",
+                    "precision": "FP16",
+                    "fog_strength": fog_strength,
+                    "checkpoint": "uav_fog_content15_model_2501",
+                }
+            else:
+                motion_parameters = payload.get("model_parameters", {})
+                motion = str(motion_parameters.get("motion", "forward"))
+                allowed_motions = {
+                    "forward", "backward", "fly-left", "fly-right",
+                    "ascend", "descend", "yaw-left", "yaw-right",
+                    "tilt-up", "tilt-down", "tilt-left", "tilt-right",
+                    "vibration",
+                }
+                if motion not in allowed_motions:
+                    raise ValueError(f"不支持的无人机运动类型: {motion}")
+                try:
+                    motion_strength = float(motion_parameters.get("strength", 0.14))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("运动模糊强度必须是数值") from exc
+                if not 0.01 <= motion_strength <= 0.35:
+                    raise ValueError("运动模糊强度必须位于 0.01 到 0.35 之间")
+                request["conditions"] = {
+                    "scene": {
+                        "domain": "无人机航拍",
+                        "weather": input_dataset.get("weather") or "未记录",
+                    },
+                    "sensor": {
+                        "resolution": resolution,
+                        "source_dataset_id": input_dataset_id,
+                        "degradation": "ID-Blau UAV Motion Blur",
+                        "motion_blur": True,
+                        "motion_blur_model": "ID-Blau",
+                        "motion": motion,
+                        "motion_blur_strength": motion_strength,
+                        "motion_blur_sample_timesteps": 20,
+                    },
+                }
+                request["model_parameters"] = {
+                    "effect": "motion_blur",
+                    "domain": "uav_aerial",
+                    "motion": motion,
+                    "strength": motion_strength,
+                    "sample_timesteps": 20,
+                    "precision": "FP32",
+                    "checkpoint": "ID_Blau.pth",
+                }
         request_path.write_text(json_dump(request), encoding="utf-8")
         self._progress(job["id"], 12, "校验适配器协议")
         adapter = self.db.row("SELECT * FROM adapters WHERE id=?", (payload["adapter_id"],))
@@ -180,9 +261,27 @@ class JobAgent:
         environment.update(
             {
                 "BASEGEN_ROOT": str(self.settings.basegen_root),
+                "DIFFUSION_DEGRADE_ROOT": str(
+                    self.settings.diffusion_degrade_root
+                ),
+                "DIFFUSION_DEGRADE_UAV_FOG_CHECKPOINT": str(
+                    self.settings.diffusion_degrade_checkpoint
+                ),
+                "DIFFUSION_BLUR_ROOT": str(self.settings.diffusion_blur_root),
+                "DIFFUSION_BLUR_CHECKPOINT": str(
+                    self.settings.diffusion_blur_checkpoint
+                ),
                 "PYTHONUNBUFFERED": "1",
             }
         )
+        if payload["adapter_id"] == "adapter_condition":
+            environment.update(
+                {
+                    "HF_HOME": str(self.settings.diffusion_degrade_hf_home),
+                    "HF_HUB_OFFLINE": "1",
+                    "TRANSFORMERS_OFFLINE": "1",
+                }
+            )
         command = self._adapter_command(
             adapter, entrypoint, request_path, result_path
         )
@@ -227,13 +326,33 @@ class JobAgent:
                     raise FileNotFoundError(
                         f"缺少生成元数据: {sample['metadata_path']}"
                     )
+        if is_condition:
+            expected_names = {Path(value).name for value in request["input_images"]}
+            output_names = {str(sample["image_path"]) for sample in samples}
+            if output_names != expected_names:
+                raise ValueError("退化输出文件名与输入数据集不一致，无法继承标注")
+            if request["has_source_annotations"]:
+                assert source_annotation_directory is not None
+                shutil.copytree(
+                    source_annotation_directory,
+                    artifact_dir / "annotations",
+                )
         dataset_id = new_id("dataset")
-        sensor = payload.get("conditions", {}).get("sensor", {})
-        scene = payload.get("conditions", {}).get("scene", {})
+        dataset_conditions = (
+            request["conditions"]
+            if is_condition
+            else payload.get("conditions", {})
+        )
+        sensor = dataset_conditions.get("sensor", {})
+        scene = dataset_conditions.get("scene", {})
         resolution = sensor.get("resolution", "1920×1080")
         if isinstance(resolution, list):
             resolution = "×".join(str(value) for value in resolution)
         annotation_status = "CANDIDATE" if result.get("has_candidate_annotations") else "UNLABELED"
+        if is_condition:
+            annotation_status = (
+                "CANDIDATE" if request["has_source_annotations"] else "UNLABELED"
+            )
         relative = artifact_dir.relative_to(self.settings.artifact_dir).as_posix()
         now = utc_now()
         with self.db.connect() as connection:

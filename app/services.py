@@ -1827,6 +1827,119 @@ def adapter_health(adapter_id: str, database: Database = db) -> dict[str, Any] |
                 checks.append(
                     {"name": "生成依赖", "ok": False, "detail": str(exc)}
                 )
+        if adapter["id"] == "adapter_condition":
+            adapter_settings = database.settings
+            diffusion_root = adapter_settings.diffusion_degrade_root
+            checkpoint = adapter_settings.diffusion_degrade_checkpoint
+            model_cache = (
+                adapter_settings.diffusion_degrade_hf_home
+                / "hub"
+                / "models--stabilityai--sd-turbo"
+            )
+            checks.extend(
+                [
+                    {
+                        "name": "DiffusionDegrade项目",
+                        "ok": (
+                            diffusion_root / "src" / "cyclegan_turbo.py"
+                        ).is_file(),
+                        "detail": str(diffusion_root),
+                    },
+                    {
+                        "name": "无人机加雾权重",
+                        "ok": checkpoint.is_file(),
+                        "detail": str(checkpoint),
+                    },
+                    {
+                        "name": "SD-Turbo本地缓存",
+                        "ok": model_cache.is_dir(),
+                        "detail": str(model_cache),
+                    },
+                ]
+            )
+            try:
+                result = subprocess.run(
+                    [
+                        str(prefix / "bin" / "python"),
+                        "-B",
+                        str(entrypoint),
+                        "health",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    env={
+                        **os.environ,
+                        "DIFFUSION_DEGRADE_ROOT": str(diffusion_root),
+                        "DIFFUSION_DEGRADE_UAV_FOG_CHECKPOINT": str(
+                            checkpoint
+                        ),
+                        "HF_HOME": str(
+                            adapter_settings.diffusion_degrade_hf_home
+                        ),
+                        "HF_HUB_OFFLINE": "1",
+                        "TRANSFORMERS_OFFLINE": "1",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                )
+                checks.append(
+                    {
+                        "name": "加雾依赖",
+                        "ok": result.returncode == 0,
+                        "detail": (result.stdout or result.stderr).strip()[-500:],
+                    }
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                checks.append(
+                    {"name": "加雾依赖", "ok": False, "detail": str(exc)}
+                )
+        if adapter["id"] == "adapter_motion_blur":
+            adapter_settings = database.settings
+            blur_root = adapter_settings.diffusion_blur_root
+            checkpoint = adapter_settings.diffusion_blur_checkpoint
+            checks.extend(
+                [
+                    {
+                        "name": "DiffusionBlur项目",
+                        "ok": (blur_root / "reblur" / "pipeline.py").is_file(),
+                        "detail": str(blur_root),
+                    },
+                    {
+                        "name": "ID-Blau权重",
+                        "ok": checkpoint.is_file(),
+                        "detail": str(checkpoint),
+                    },
+                ]
+            )
+            try:
+                result = subprocess.run(
+                    [
+                        str(prefix / "bin" / "python"),
+                        "-B",
+                        str(entrypoint),
+                        "health",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    env={
+                        **os.environ,
+                        "DIFFUSION_BLUR_ROOT": str(blur_root),
+                        "DIFFUSION_BLUR_CHECKPOINT": str(checkpoint),
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                )
+                checks.append(
+                    {
+                        "name": "运动模糊依赖",
+                        "ok": result.returncode == 0,
+                        "detail": (result.stdout or result.stderr).strip()[-500:],
+                    }
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                checks.append(
+                    {"name": "运动模糊依赖", "ok": False, "detail": str(exc)}
+                )
         if adapter["id"] == "adapter_dronedets_yolov8m":
             dronedets_root = database.settings.dronedets_root
             model = database.row(

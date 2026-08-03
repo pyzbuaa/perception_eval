@@ -8,7 +8,7 @@
 - 概览、五步数据构建、数据集版本、模型版本、评测中心、效能探索、任务中心和环境页面
 - SQLite WAL 持久化及单机任务 Agent
 - 标准 JSON 子进程 Adapter 协议
-- 回放生成器、本地目录导入，以及对 PNG/JPEG/WebP 的真实模糊、雾化和噪声处理
+- 回放生成器、本地目录导入，以及无人机航拍域加雾与 ID-Blau 运动模糊生成
 - 数据集真值状态与不可变冻结
 - DroneDets YOLOv8m VisDrone 真实检测与 COCO 指标计算
 - 三 seed 参考评测、mAP/PR/时延/Pareto 展示
@@ -174,6 +174,41 @@ curl http://127.0.0.1:18080/api/runs/<job-id>
 默认单任务超时为 7200 秒，可以在启动前通过
 `PERCEPTION_EVAL_ADAPTER_TIMEOUT_SECONDS` 调整。如果 Adapter 需要新增依赖，应先克隆到
 `.runtime/envs/adapters/<adapter-version>`，不得修改原环境。
+
+## 非理想条件生成
+
+### 无人机航拍域加雾
+
+“数据构建 → 非理想条件生成”调用同级 `DiffusionDegrade` 项目及其只读 `.venv`，默认使用
+`uav_fog_8gpu_3125_content15/checkpoints/model_2501.pkl`。任务处理所选无人机航拍数据集的
+全部图像，输出恢复原图分辨率并保持文件名；源数据存在 COCO 标注时，标注会作为候选
+真值继承到输出数据集。
+
+页面中的“加雾强度（视觉混合）”范围为 `0～1`：`0` 输出原图，`1` 输出完整模型
+加雾结果，中间值在二者之间进行线性混合。该参数表示视觉效果强度，不是物理大气
+散射系数。
+
+路径不同时可在启动平台前设置：
+
+```bash
+export DIFFUSION_DEGRADE_ROOT=/absolute/path/to/DiffusionDegrade
+export DIFFUSION_DEGRADE_RUNTIME_PREFIX=/absolute/path/to/DiffusionDegrade/.venv
+export DIFFUSION_DEGRADE_UAV_FOG_CHECKPOINT=/absolute/path/to/model.pkl
+export DIFFUSION_DEGRADE_HF_HOME=/absolute/path/to/huggingface-cache
+```
+
+### 无人机运动模糊
+
+运动模糊调用同级 `DiffusionBlur` 项目的 ID-Blau 条件扩散模型，默认使用只读 `blau`
+Conda 环境和 `weights/ID_Blau.pth`。页面可选择飞行、升降、偏航、云台倾斜或复合振动
+预设，并在 `0.01～0.35` 范围内设置归一化运动条件强度；平台固定使用 DDIM 20 步推理。
+该强度不表示无人机速度、曝光时间或像素位移。
+
+```bash
+export DIFFUSION_BLUR_ROOT=/absolute/path/to/DiffusionBlur
+export DIFFUSION_BLUR_RUNTIME_PREFIX=/absolute/path/to/conda/env
+export DIFFUSION_BLUR_CHECKPOINT=/absolute/path/to/ID_Blau.pth
+```
 
 ## 注册本地目标检测模型
 

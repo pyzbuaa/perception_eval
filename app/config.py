@@ -27,6 +27,53 @@ class Settings:
             ROOT_DIR.parent / "DroneDets" / ".venv",
         )
     )
+    diffusion_degrade_root: Path = Path(
+        os.environ.get(
+            "DIFFUSION_DEGRADE_ROOT",
+            ROOT_DIR.parent / "DiffusionDegrade",
+        )
+    )
+    diffusion_degrade_runtime_prefix: Path = Path(
+        os.environ.get(
+            "DIFFUSION_DEGRADE_RUNTIME_PREFIX",
+            ROOT_DIR.parent / "DiffusionDegrade" / ".venv",
+        )
+    )
+    diffusion_degrade_checkpoint: Path = Path(
+        os.environ.get(
+            "DIFFUSION_DEGRADE_UAV_FOG_CHECKPOINT",
+            ROOT_DIR.parent
+            / "DiffusionDegrade"
+            / "outputs"
+            / "uav_fog_8gpu_3125_content15"
+            / "checkpoints"
+            / "model_2501.pkl",
+        )
+    )
+    diffusion_degrade_hf_home: Path = Path(
+        os.environ.get(
+            "DIFFUSION_DEGRADE_HF_HOME",
+            "/mnt/data/cache/huggingface",
+        )
+    )
+    diffusion_blur_root: Path = Path(
+        os.environ.get(
+            "DIFFUSION_BLUR_ROOT",
+            ROOT_DIR.parent / "DiffusionBlur",
+        )
+    )
+    diffusion_blur_runtime_prefix: Path = Path(
+        os.environ.get(
+            "DIFFUSION_BLUR_RUNTIME_PREFIX",
+            "/home/yons/miniforge3/envs/blau",
+        )
+    )
+    diffusion_blur_checkpoint: Path = Path(
+        os.environ.get(
+            "DIFFUSION_BLUR_CHECKPOINT",
+            ROOT_DIR.parent / "DiffusionBlur" / "weights" / "ID_Blau.pth",
+        )
+    )
     model_library_root: Path = Path(
         os.environ.get(
             "PERCEPTION_EVAL_MODEL_LIBRARY_ROOT",

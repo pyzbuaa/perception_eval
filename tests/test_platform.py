@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import sqlite3
@@ -13,6 +14,7 @@ from PIL import Image
 
 import app.main as main_module
 from adapters.basegen_generator import prepare_plan
+from adapters.diffusiondegrade_fog import blend_fog
 from adapters.dronedets_detector import category_mapping
 from app.command_protocol import CommandTemplateError, validate_command_arguments
 from app.category_templates import list_category_templates, template_categories
@@ -69,6 +71,20 @@ def test_database_seeds_traceable_demo_data(tmp_path: Path) -> None:
         "SELECT * FROM adapters WHERE id='adapter_dronedets_yolov8m'"
     )
     assert detector and detector["runtime_prefix"].endswith("DroneDets/.venv")
+    condition = database.row(
+        "SELECT * FROM adapters WHERE id='adapter_condition'"
+    )
+    assert condition and condition["runtime_kind"] == "conda_external"
+    assert condition["runtime_prefix"].endswith("DiffusionDegrade/.venv")
+    assert condition["entrypoint"] == "adapters/diffusiondegrade_fog.py"
+    assert condition["requires_gpu"] == 1
+    motion_blur = database.row(
+        "SELECT * FROM adapters WHERE id='adapter_motion_blur'"
+    )
+    assert motion_blur and motion_blur["runtime_kind"] == "conda_external"
+    assert motion_blur["runtime_prefix"].endswith("envs/blau")
+    assert motion_blur["entrypoint"] == "adapters/diffusionblur_motion.py"
+    assert motion_blur["requires_gpu"] == 1
     detector_model = database.row(
         "SELECT weight_path FROM models "
         "WHERE id='model_dronedets_yolov8m_visdrone'"
@@ -91,7 +107,63 @@ def test_database_does_not_restore_deleted_demo_data(tmp_path: Path) -> None:
 
     for table in ("datasets", "models", "evaluation_plans", "runs", "results", "jobs"):
         assert database.row(f"SELECT COUNT(*) AS n FROM {table}")["n"] == 0
-    assert database.row("SELECT COUNT(*) AS n FROM adapters")["n"] == 5
+    assert database.row("SELECT COUNT(*) AS n FROM adapters")["n"] == 6
+
+
+def test_diffusiondegrade_fog_strength_blends_source_and_model_output() -> None:
+    source = Image.new("RGB", (2, 2), (0, 0, 0))
+    fogged = Image.new("RGB", (2, 2), (200, 200, 200))
+
+    assert blend_fog(source, fogged, 0).getpixel((0, 0)) == (0, 0, 0)
+    assert blend_fog(source, fogged, 0.5).getpixel((0, 0)) == (100, 100, 100)
+    assert blend_fog(source, fogged, 1).getpixel((0, 0)) == (200, 200, 200)
+    with pytest.raises(ValueError, match="0 到 1"):
+        blend_fog(source, fogged, 1.1)
+
+
+def test_dataset_migration_marks_existing_id_blau_motion_blur(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    database.execute(
+        """
+        INSERT INTO datasets
+        (id,name,version,source_type,scene_domain,weather,sensor_conditions,
+         resolution,sample_count,annotation_status,frozen,artifact_path,
+         category_template,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "dataset_legacy_motion_blur",
+            "旧版运动模糊数据",
+            "v1",
+            "REAL_TRANSFORMED",
+            "无人机航拍",
+            "晴朗",
+            json_dump(
+                {
+                    "degradation": "ID-Blau UAV Motion Blur",
+                    "motion": "forward",
+                    "motion_blur_strength": 0.14,
+                }
+            ),
+            "原始分辨率",
+            1,
+            "UNLABELED",
+            0,
+            None,
+            "custom",
+            utc_now(),
+        ),
+    )
+
+    database.initialize()
+
+    row = database.row(
+        "SELECT sensor_conditions FROM datasets WHERE id='dataset_legacy_motion_blur'"
+    )
+    conditions = json.loads(row["sensor_conditions"])
+    assert conditions["motion_blur"] is True
+    assert conditions["motion_blur_model"] == "ID-Blau"
+    assert conditions["motion_blur_sample_timesteps"] == 20
 
 
 def test_delete_job_rejects_active_task_and_preserves_evaluation_results(
@@ -1337,7 +1409,10 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
     assert not (dataset_directory / "annotations" / "instances.json").exists()
 
 
-def test_local_import_can_feed_real_condition_operator(tmp_path: Path) -> None:
+def test_local_import_can_feed_diffusiondegrade_fog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     database, app_settings = make_database(tmp_path)
     source_directory = tmp_path / "source-images"
     source_directory.mkdir()
@@ -1358,20 +1433,83 @@ def test_local_import_can_feed_real_condition_operator(tmp_path: Path) -> None:
     assert agent.process_one()
     imported = database.row("SELECT * FROM datasets WHERE name='真实航拍导入'")
     assert imported and imported["source_type"] == "REAL"
+    imported_directory = app_settings.artifact_dir / imported["artifact_path"]
+    annotation_directory = imported_directory / "annotations"
+    annotation_directory.mkdir()
+    (annotation_directory / "instances.json").write_text(
+        json.dumps(
+            {
+                "images": [
+                    {"id": 1, "file_name": "aerial.png", "width": 64, "height": 40}
+                ],
+                "annotations": [
+                    {
+                        "id": 1,
+                        "image_id": 1,
+                        "category_id": 1,
+                        "bbox": [10, 8, 20, 12],
+                        "area": 240,
+                        "iscrowd": 0,
+                    }
+                ],
+                "categories": [{"id": 1, "name": "car"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    database.execute(
+        "UPDATE datasets SET annotation_status='CANDIDATE' WHERE id=?",
+        (imported["id"],),
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_adapter_process(job_id, command, cwd, environment):
+        request = json.loads((cwd / "request.json").read_text(encoding="utf-8"))
+        captured.update({"command": command, "environment": environment, "request": request})
+        output_directory = Path(request["output_directory"])
+        output = output_directory / "aerial.png"
+        with Image.open(request["input_images"][0]) as source:
+            source.save(output)
+        (cwd / "result.json").write_text(
+            json_dump(
+                {
+                    "protocol_version": "1.0",
+                    "job_id": job_id,
+                    "status": "succeeded",
+                    "samples": [
+                        {
+                            "sample_id": f"{job_id}-1",
+                            "image_path": "aerial.png",
+                            "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+                            "width": 64,
+                            "height": 40,
+                            "seed": 1001,
+                            "annotation_status": "CANDIDATE",
+                        }
+                    ],
+                    "has_candidate_annotations": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return 0, ""
+
+    monkeypatch.setattr(agent, "_run_adapter_process", fake_adapter_process)
     condition_job = queue_job(
         "ACQUISITION",
         {
-            "name": "真实航拍运动模糊",
+            "name": "真实航拍加雾",
             "adapter_id": "adapter_condition",
             "source_type": "REAL_TRANSFORMED",
             "sample_count": 1,
             "seeds": [1001],
             "input_dataset_id": imported["id"],
             "conditions": {
-                "scene": {"domain": "无人机航拍", "weather": "晴朗"},
-                "sensor": {"resolution": "原始分辨率", "motion_blur": 0.4},
+                "scene": {"domain": "无人机航拍", "weather": "雾"},
+                "sensor": {"resolution": "原始分辨率"},
             },
-            "model_parameters": {},
+            "model_parameters": {"fog_strength": 0.6},
             "category_template": "custom",
             "categories": [{"id": 1, "name": "car"}],
         },
@@ -1380,10 +1518,70 @@ def test_local_import_can_feed_real_condition_operator(tmp_path: Path) -> None:
     assert agent.process_one()
     completed = database.row("SELECT * FROM jobs WHERE id=?", (condition_job["id"],))
     assert completed["status"] == "SUCCEEDED"
-    transformed = database.row("SELECT * FROM datasets WHERE name='真实航拍运动模糊'")
+    transformed = database.row("SELECT * FROM datasets WHERE name='真实航拍加雾'")
     assert transformed["source_type"] == "REAL_TRANSFORMED"
+    assert transformed["scene_domain"] == "无人机航拍"
+    assert transformed["weather"] == "雾"
+    assert transformed["annotation_status"] == "CANDIDATE"
     outputs = list((app_settings.artifact_dir / transformed["artifact_path"]).glob("*.png"))
     assert len(outputs) == 1
+    assert (
+        app_settings.artifact_dir
+        / transformed["artifact_path"]
+        / "annotations"
+        / "instances.json"
+    ).is_file()
+    request = captured["request"]
+    assert isinstance(request, dict)
+    assert request["sample_count"] == 1
+    assert request["has_source_annotations"] is True
+    assert request["model_parameters"]["checkpoint"] == "uav_fog_content15_model_2501"
+    assert request["model_parameters"]["fog_strength"] == pytest.approx(0.6)
+    assert str(captured["command"][0]).endswith("DiffusionDegrade/.venv/bin/python")
+    assert captured["environment"]["HF_HUB_OFFLINE"] == "1"
+
+    blur_job = queue_job(
+        "ACQUISITION",
+        {
+            "name": "真实航拍运动模糊",
+            "adapter_id": "adapter_motion_blur",
+            "source_type": "REAL_TRANSFORMED",
+            "sample_count": 1,
+            "seeds": [2023],
+            "input_dataset_id": imported["id"],
+            "conditions": {},
+            "model_parameters": {"motion": "yaw-left", "strength": 0.18},
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
+        },
+        database,
+    )
+    assert agent.process_one()
+    completed = database.row("SELECT * FROM jobs WHERE id=?", (blur_job["id"],))
+    assert completed["status"] == "SUCCEEDED"
+    transformed = database.row("SELECT * FROM datasets WHERE name='真实航拍运动模糊'")
+    assert transformed["scene_domain"] == "无人机航拍"
+    assert transformed["weather"] == "未记录"
+    sensor = json.loads(transformed["sensor_conditions"])
+    assert sensor["motion_blur"] is True
+    assert sensor["motion_blur_model"] == "ID-Blau"
+    assert sensor["motion"] == "yaw-left"
+    assert sensor["motion_blur_strength"] == pytest.approx(0.18)
+    assert sensor["motion_blur_sample_timesteps"] == 20
+    request = captured["request"]
+    assert request["model_parameters"] == {
+        "effect": "motion_blur",
+        "domain": "uav_aerial",
+        "motion": "yaw-left",
+        "strength": 0.18,
+        "sample_timesteps": 20,
+        "precision": "FP32",
+        "checkpoint": "ID_Blau.pth",
+    }
+    assert str(captured["command"][0]).endswith("envs/blau/bin/python")
+    assert captured["environment"]["DIFFUSION_BLUR_ROOT"].endswith(
+        "DiffusionBlur"
+    )
 
 
 def test_resource_picker_upload_imports_and_cleans_staging(

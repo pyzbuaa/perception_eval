@@ -98,6 +98,27 @@ class Database:
                 "ALTER TABLE datasets ADD COLUMN category_template "
                 "TEXT NOT NULL DEFAULT 'unconfigured'"
             )
+        rows = connection.execute(
+            """
+            SELECT id,sensor_conditions FROM datasets
+            WHERE sensor_conditions LIKE '%ID-Blau UAV Motion Blur%'
+            """
+        ).fetchall()
+        for row in rows:
+            conditions = json_load(row["sensor_conditions"], {})
+            if conditions.get("motion_blur") is True:
+                continue
+            conditions.update(
+                {
+                    "motion_blur": True,
+                    "motion_blur_model": "ID-Blau",
+                    "motion_blur_sample_timesteps": 20,
+                }
+            )
+            connection.execute(
+                "UPDATE datasets SET sensor_conditions=? WHERE id=?",
+                (json_dump(conditions), row["id"]),
+            )
 
     def rows(self, query: str, parameters: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -193,18 +214,33 @@ class Database:
                 ),
                 (
                     "adapter_condition",
-                    "可控成像退化",
+                    "DiffusionDegrade · 无人机加雾",
                     "OPERATOR",
                     "1.0.0",
-                    "READY",
-                    "platform",
-                    None,
+                    "EXPERIMENTAL",
+                    "conda_external",
+                    str(self.settings.diffusion_degrade_runtime_prefix),
                     "read_only",
-                    "adapters/condition_operator.py",
-                    0,
-                    "HEALTHY",
-                    "对数据施加运动模糊、雾化、噪声等可重复条件。",
+                    "adapters/diffusiondegrade_fog.py",
+                    1,
+                    "REGISTERED",
+                    "使用 DiffusionDegrade 对无人机航拍图像执行真实域加雾；保持原图尺寸和文件名。",
                     json_dump(CONDITION_SCHEMA),
+                ),
+                (
+                    "adapter_motion_blur",
+                    "DiffusionBlur · 无人机运动模糊",
+                    "OPERATOR",
+                    "1.0.0",
+                    "EXPERIMENTAL",
+                    "conda_external",
+                    str(self.settings.diffusion_blur_runtime_prefix),
+                    "read_only",
+                    "adapters/diffusionblur_motion.py",
+                    1,
+                    "REGISTERED",
+                    "使用 ID-Blau 条件扩散模型生成可控无人机运动模糊；保持原图尺寸和文件名。",
+                    json_dump(MOTION_BLUR_SCHEMA),
                 ),
                 (
                     "adapter_reference_detector",
@@ -233,10 +269,41 @@ class Database:
             )
             connection.execute(
                 """
-                UPDATE adapters SET entrypoint='adapters/condition_operator.py',updated_at=?
-                WHERE id='adapter_condition' AND entrypoint='adapters/replay_generator.py'
+                UPDATE adapters
+                SET status=CASE
+                        WHEN entrypoint!='adapters/diffusiondegrade_fog.py'
+                        THEN 'REGISTERED' ELSE status END,
+                    name='DiffusionDegrade · 无人机加雾',maturity='EXPERIMENTAL',
+                    runtime_kind='conda_external',runtime_prefix=?,policy='read_only',
+                    entrypoint='adapters/diffusiondegrade_fog.py',requires_gpu=1,
+                    description='使用 DiffusionDegrade 对无人机航拍图像执行真实域加雾；保持原图尺寸和文件名。',
+                    parameter_schema=?,updated_at=?
+                WHERE id='adapter_condition'
                 """,
-                (now,),
+                (
+                    str(self.settings.diffusion_degrade_runtime_prefix),
+                    json_dump(CONDITION_SCHEMA),
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE adapters
+                SET status=CASE
+                        WHEN entrypoint!='adapters/diffusionblur_motion.py'
+                        THEN 'REGISTERED' ELSE status END,
+                    name='DiffusionBlur · 无人机运动模糊',maturity='EXPERIMENTAL',
+                    runtime_kind='conda_external',runtime_prefix=?,policy='read_only',
+                    entrypoint='adapters/diffusionblur_motion.py',requires_gpu=1,
+                    description='使用 ID-Blau 条件扩散模型生成可控无人机运动模糊；保持原图尺寸和文件名。',
+                    parameter_schema=?,updated_at=?
+                WHERE id='adapter_motion_blur'
+                """,
+                (
+                    str(self.settings.diffusion_blur_runtime_prefix),
+                    json_dump(MOTION_BLUR_SCHEMA),
+                    now,
+                ),
             )
             connection.execute(
                 """
@@ -676,9 +743,56 @@ REPLAY_SCHEMA = {
 CONDITION_SCHEMA = {
     "type": "object",
     "properties": {
-        "motion_blur": {"type": "number", "minimum": 0, "maximum": 1},
-        "fog_density": {"type": "number", "minimum": 0, "maximum": 1},
-        "noise_level": {"type": "number", "minimum": 0, "maximum": 1},
+        "effect": {"type": "string", "const": "fog"},
+        "domain": {"type": "string", "const": "uav_aerial"},
+        "image_prep": {"type": "string", "const": "resize_512x512"},
+        "precision": {"type": "string", "const": "FP16"},
+        "fog_strength": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 1,
+        },
+        "checkpoint": {
+            "type": "string",
+            "const": "uav_fog_content15_model_2501",
+        },
+    },
+}
+
+MOTION_BLUR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "effect": {"type": "string", "const": "motion_blur"},
+        "domain": {"type": "string", "const": "uav_aerial"},
+        "motion": {
+            "type": "string",
+            "enum": [
+                "forward",
+                "backward",
+                "fly-left",
+                "fly-right",
+                "ascend",
+                "descend",
+                "yaw-left",
+                "yaw-right",
+                "tilt-up",
+                "tilt-down",
+                "tilt-left",
+                "tilt-right",
+                "vibration",
+            ],
+            "default": "forward",
+        },
+        "strength": {
+            "type": "number",
+            "minimum": 0.01,
+            "maximum": 0.35,
+            "default": 0.14,
+        },
+        "sample_timesteps": {"type": "integer", "const": 20},
+        "precision": {"type": "string", "const": "FP32"},
+        "checkpoint": {"type": "string", "const": "ID_Blau.pth"},
     },
 }
 

@@ -227,7 +227,7 @@ export function OverviewPage({ dark, navigate, overview }: PageProps & { overvie
 const sourceCards = [
   { id: 'local-import', source: 'REAL', icon: <ImportOutlined />, title: '本地数据导入', description: '导入本地 PNG/JPEG图像及可选 COCO/YOLO/VisDrone格式标注文件。', recommended: true },
   { id: 'adapter_basegen', source: 'GENERATIVE', icon: <RobotOutlined />, title: '基础图像生成', description: '调用生成式模型生成感知数据。' },
-  { id: 'adapter_condition', source: 'REAL_TRANSFORMED', icon: <CloudOutlined />, title: '非理想条件生成', description: '读取已导入的真实图像，产生模糊、雾化和噪声条件。' },
+  { id: 'adapter_condition', source: 'REAL_TRANSFORMED', icon: <CloudOutlined />, title: '非理想条件生成', description: '为无人机航拍图像生成有雾域或运动模糊版本。' },
   { id: 'airsim-future', source: 'SIMULATOR', icon: <CodeOutlined />, title: 'AirSim / UE', description: '通过独立 RPC 服务采集图像与真值。', disabled: true },
   { id: 'adapter_replay', source: 'REPLAY_FIXTURE', icon: <PlayCircleOutlined />, title: '测试回放', description: '固定样例验证生成任务、标注与评测闭环。', recommended: true },
 ]
@@ -238,6 +238,44 @@ type BaseGenSelection =
   | { mode: 'fixed'; values: string[] }
 
 const RANDOM_VALUE = '__random__'
+
+const motionPresetOptions = [
+  { value: 'forward', label: '向前飞行' },
+  { value: 'backward', label: '向后飞行' },
+  { value: 'fly-left', label: '向左飞行' },
+  { value: 'fly-right', label: '向右飞行' },
+  { value: 'ascend', label: '上升' },
+  { value: 'descend', label: '下降' },
+  { value: 'yaw-left', label: '向左偏航' },
+  { value: 'yaw-right', label: '向右偏航' },
+  { value: 'tilt-up', label: '云台上倾' },
+  { value: 'tilt-down', label: '云台下倾' },
+  { value: 'tilt-left', label: '云台左倾' },
+  { value: 'tilt-right', label: '云台右倾' },
+  { value: 'vibration', label: '复合振动' },
+]
+
+function motionBlurDatasetItems(dataset: Dataset) {
+  const conditions = dataset.sensor_conditions || {}
+  const legacyStrength = Number(conditions.motion_blur)
+  const hasMotionBlur = conditions.motion_blur === true
+    || (Number.isFinite(legacyStrength) && legacyStrength > 0)
+    || conditions.degradation === 'ID-Blau UAV Motion Blur'
+  if (!hasMotionBlur) {
+    return [{ key: 'motion-blur', label: '运动模糊', children: <Tag>未叠加</Tag> }]
+  }
+  const motion = String(conditions.motion || '未记录')
+  const motionLabel = motionPresetOptions.find((item) => item.value === motion)?.label || motion
+  const strength = Number(conditions.motion_blur_strength ?? conditions.motion_blur)
+  const steps = Number(conditions.motion_blur_sample_timesteps)
+  const model = String(conditions.motion_blur_model || conditions.degradation || '未记录')
+  return [
+    { key: 'motion-blur', label: '运动模糊', children: <Tag color="magenta">已叠加</Tag> },
+    { key: 'motion-type', label: '无人机运动', children: motionLabel },
+    { key: 'motion-strength', label: '模糊强度', children: Number.isFinite(strength) ? strength.toFixed(2) : '未记录' },
+    { key: 'motion-model', label: '生成模型', children: `${model}${Number.isFinite(steps) ? ` / DDIM ${steps} 步` : ''}` },
+  ]
+}
 
 interface BaseGenPreview {
   model_path: string
@@ -259,6 +297,10 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
   const [weather, setWeather] = useState('晴朗')
   const [resolution, setResolution] = useState('1920×1080')
   const [blur, setBlur] = useState(0.3)
+  const [fogStrength, setFogStrength] = useState(1)
+  const [conditionEffect, setConditionEffect] = useState<'fog' | 'motion_blur'>('fog')
+  const [motionPreset, setMotionPreset] = useState('forward')
+  const [motionStrength, setMotionStrength] = useState(0.14)
   const [samples, setSamples] = useState(12)
   const [seeds, setSeeds] = useState([1001, 1002, 1003])
   const [generatorSeed, setGeneratorSeed] = useState(1001)
@@ -291,20 +333,32 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
   )
 
   const isBaseGen = source.id === 'adapter_basegen'
+  const isCondition = source.id === 'adapter_condition'
+  const isMotionBlur = isCondition && conditionEffect === 'motion_blur'
+  const conditionAdapterId = isMotionBlur ? 'adapter_motion_blur' : 'adapter_condition'
+  const motionPresetLabel = motionPresetOptions.find((item) => item.value === motionPreset)?.label || motionPreset
   const currentBasegenDomain = basegenSchema.data.domains.find((item) => item.label_zh === domain)
   const domainOptions = isBaseGen
     ? basegenSchema.data.domains.map((item) => item.label_zh)
-    : ['无人机航拍', '卫星遥感', '城市驾驶']
+    : isCondition ? ['无人机航拍'] : ['无人机航拍', '卫星遥感', '城市驾驶']
   const resolutionOptions = isBaseGen
-    ? ['1024×1024', '1024×576']
-    : ['1920×1080', '1280×720', '640×640']
+    ? [
+        { label: '方形', options: ['512×512', '768×768', '1024×1024'].map((value) => ({ value })) },
+        { label: '横屏 16:9', options: ['768×432', '1024×576', '1280×720', '1536×864'].map((value) => ({ value })) },
+        { label: '竖屏 9:16', options: ['432×768', '576×1024', '720×1280', '864×1536'].map((value) => ({ value })) },
+      ]
+    : [{ label: '常用分辨率', options: ['1920×1080', '1280×720', '640×640'].map((value) => ({ value })) }]
   const weatherOptions = ['晴朗', '雾', '雨', '夜间']
-  const combinationCount = isBaseGen ? 1 : seeds.length
+  const combinationCount = isBaseGen || isCondition ? 1 : seeds.length
   const inputDataset = datasets.data.find((item) => item.id === inputDatasetId)
-  const selectedCategories = source.id === 'adapter_condition'
+  const selectedCategories = isCondition
     ? inputDataset?.categories || []
     : categoriesFromSelection(categoryTemplates.data, categoryTemplateId, 'dataset', customDatasetCategories)
   const categoriesReady = validCategories(selectedCategories)
+  const outputSampleCount = isCondition ? inputDataset?.sample_count || 0 : samples
+  const conditionHasTruth = Boolean(
+    inputDataset && ['CANDIDATE', 'VERIFIED'].includes(inputDataset.annotation_status),
+  )
 
   useEffect(() => {
     if (!isBaseGen || !currentBasegenDomain) return
@@ -394,6 +448,10 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
       const nextDomain = available.includes(domain) ? domain : preferred?.label_zh || available[0] || '低空无人机'
       setDomain(nextDomain)
       setResolution(basegenSchema.data.domains.find((entry) => entry.label_zh === nextDomain)?.default_resolution || '1024×1024')
+    } else if (item.id === 'adapter_condition') {
+      setDomain('无人机航拍')
+      setWeather('雾')
+      setResolution('原始分辨率')
     } else {
       if (!['无人机航拍', '卫星遥感', '城市驾驶'].includes(domain)) setDomain('无人机航拍')
       setResolution('1920×1080')
@@ -401,7 +459,8 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
   }
   const healthSource = async (id: string) => {
     try {
-      const result = await post<{ healthy: boolean }>(`/api/adapters/${id}/health-check`)
+      const adapterId = id === 'adapter_condition' ? conditionAdapterId : id
+      const result = await post<{ healthy: boolean }>(`/api/adapters/${adapterId}/health-check`)
       result.healthy ? message.success('数据来源健康检查通过') : message.warning('数据来源当前不可用')
       await sourceRuntimes.reload()
     } catch (error) {
@@ -453,11 +512,11 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
     if (annotationFileInput.current) annotationFileInput.current.value = ''
   }
   const acquisitionPayload = () => ({
-    name: `${domain} · ${source.title} · ${new Date().toLocaleDateString('zh-CN')}`,
-    adapter_id: source.id,
+    name: `${domain} · ${isMotionBlur ? '无人机运动模糊' : source.title} · ${new Date().toLocaleDateString('zh-CN')}`,
+    adapter_id: isCondition ? conditionAdapterId : source.id,
     source_type: source.source,
-    sample_count: samples,
-    seeds: isBaseGen ? [generatorSeed] : seeds,
+    sample_count: isCondition ? inputDataset?.sample_count || 1 : samples,
+    seeds: isBaseGen ? [generatorSeed] : isCondition ? [isMotionBlur ? 2023 : 1001] : seeds,
     conditions: {
       scene: isBaseGen ? {
         domain: currentBasegenDomain?.value,
@@ -465,12 +524,12 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
         weather: weatherSummary,
         fields: basegenSelections,
         custom: basegenCustom,
-      } : { domain, weather },
-      sensor: isBaseGen ? { resolution } : { resolution, motion_blur: blur, fog_density: weather === '雾' ? 0.4 : 0 },
+      } : isCondition ? { domain: '无人机航拍', weather: isMotionBlur ? inputDataset?.weather || '未记录' : '雾' } : { domain, weather },
+      sensor: isBaseGen ? { resolution } : isCondition ? { resolution: inputDataset?.resolution || '原始分辨率' } : { resolution, motion_blur: blur, fog_density: weather === '雾' ? 0.4 : 0 },
     },
-    model_parameters: isBaseGen ? { steps: generatorSteps, guidance_scale: 0, device_policy: devicePolicy, local_files_only: false } : {},
-    input_dataset_id: source.id === 'adapter_condition' ? inputDatasetId : null,
-    category_template: source.id === 'adapter_condition' ? inputDataset?.category_template || 'custom' : categoryTemplateId,
+    model_parameters: isBaseGen ? { steps: generatorSteps, guidance_scale: 0, device_policy: devicePolicy, local_files_only: false } : isMotionBlur ? { effect: 'motion_blur', domain: 'uav_aerial', motion: motionPreset, strength: motionStrength, sample_timesteps: 20, precision: 'FP32', checkpoint: 'ID_Blau.pth' } : isCondition ? { effect: 'fog', domain: 'uav_aerial', image_prep: 'resize_512x512', precision: 'FP16', fog_strength: fogStrength, checkpoint: 'uav_fog_content15_model_2501' } : {},
+    input_dataset_id: isCondition ? inputDatasetId : null,
+    category_template: isCondition ? inputDataset?.category_template || 'custom' : categoryTemplateId,
     categories: selectedCategories.map(({ id, name }) => ({ id, name })),
   })
   const previewBasegen = async () => {
@@ -530,7 +589,8 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
       <Steps current={step} items={(source.id === 'local-import' ? ['选择来源', '导入配置', '导入确认', '执行导入', '真值冻结'] : ['选择来源', '配置条件', '组合预览', '执行与浏览', '真值冻结']).map((title) => ({ title }))} />
       {step === 0 && <Card title="选择数据来源" extra={<Tag color="purple">BaseGen 已接入</Tag>}>
         <Row gutter={[16, 16]}>{sourceCards.map((item) => {
-          const runtime = sourceRuntimes.data.find((entry) => entry.id === item.id)
+          const runtimeId = item.id === 'adapter_condition' ? conditionAdapterId : item.id
+          const runtime = sourceRuntimes.data.find((entry) => entry.id === runtimeId)
           return <Col xs={24} md={12} xl={6} key={item.id}><Card hoverable={!item.disabled} className={`source-card ${source.id === item.id ? 'source-selected' : ''} ${item.disabled ? 'source-disabled' : ''}`} onClick={() => selectSource(item)}><div className="source-icon">{item.icon}</div><Space><Typography.Title level={4}>{item.title}</Typography.Title>{item.recommended && <Tag color="cyan">推荐</Tag>}</Space><Typography.Paragraph type="secondary">{item.description}</Typography.Paragraph><Space wrap>{item.id === 'local-import' ? <StatusTag status="HEALTHY" /> : item.disabled ? <Tag>未接入</Tag> : <><StatusTag status={runtime?.status || (sourceRuntimes.loading ? 'CHECKING' : 'UNAVAILABLE')} /><Button size="small" onClick={(event) => { event.stopPropagation(); healthSource(item.id) }}>健康检查</Button></>}</Space></Card></Col>
         })}</Row>
         <div className="wizard-actions"><Button type="primary" onClick={() => setStep(1)}>下一步：{source.id === 'local-import' ? '导入配置' : '配置条件'} <ArrowRightOutlined /></Button></div>
@@ -573,7 +633,8 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
                   </Space>
                 </Form.Item>
               </>}
-              <Form.Item label="场景域"><Select loading={isBaseGen && basegenSchema.loading} value={domain} onChange={selectDomain} options={domainOptions.map((value) => ({ value }))} /></Form.Item>
+              {isCondition && <Form.Item label="非理想条件类型"><Segmented block value={conditionEffect} onChange={(value) => setConditionEffect(String(value) as 'fog' | 'motion_blur')} options={[{ value: 'fog', label: '无人机航拍域加雾' }, { value: 'motion_blur', label: '无人机运动模糊' }]} /></Form.Item>}
+              <Form.Item label="场景域"><Select disabled={isCondition} loading={isBaseGen && basegenSchema.loading} value={domain} onChange={selectDomain} options={domainOptions.map((value) => ({ value }))} /></Form.Item>
               {isBaseGen && !basegenSchema.loading && !currentBasegenDomain && <Alert type="error" showIcon message="未找到当前领域的 BaseGen 场景目录" />}
               {isBaseGen && currentBasegenDomain?.fields.map((field) => {
                 if (field.kind === 'text') {
@@ -598,22 +659,22 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
                   </Form.Item>
                 )
               })}
-              {source.id !== 'local-import' && !isBaseGen && <Form.Item label="天气 / 环境"><Segmented block value={weather} onChange={(value) => setWeather(String(value))} options={weatherOptions} /></Form.Item>}
-              {source.id !== 'local-import' && <Form.Item label="输出数量"><InputNumber value={samples} onChange={(value) => setSamples(value || 1)} min={1} max={1000} addonAfter="张" style={{ width: '100%' }} /></Form.Item>}
+              {source.id !== 'local-import' && !isBaseGen && !isCondition && <Form.Item label="天气 / 环境"><Segmented block value={weather} onChange={(value) => setWeather(String(value))} options={weatherOptions} /></Form.Item>}
+              {source.id !== 'local-import' && !isCondition && <Form.Item label="输出数量"><InputNumber value={samples} onChange={(value) => setSamples(value || 1)} min={1} max={1000} addonAfter="张" style={{ width: '100%' }} /></Form.Item>}
             </Form>
           </Card>
         </Col>
-        <Col xs={24} xl={12}>{source.id === 'local-import' ? <Card title="导入校验"><Timeline items={[{ color: 'blue', children: '通过系统资源管理器选择图像目录' }, { color: 'blue', children: '上传 PNG、JPEG、WebP 和 SVG 到工作区暂存区' }, { color: 'blue', children: '标注作为候选真值导入并等待校核' }, { color: 'green', children: '导入完成后自动清理暂存文件，不修改原始目录' }]} /><Alert type="info" showIcon message="浏览器安全选择" description="浏览器不会向平台暴露本机绝对路径；只上传你在资源管理器中明确选择的文件。" /></Card> : <Card title={isBaseGen ? '生成参数' : '传感器与成像条件'}><Form layout="vertical"><Form.Item label="图像分辨率"><Select value={resolution} onChange={setResolution} options={resolutionOptions.map((value) => ({ value }))} /></Form.Item>{isBaseGen ? <><Form.Item label="起始随机种子"><InputNumber value={generatorSeed} onChange={(value) => setGeneratorSeed(value || 0)} min={0} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="推理步数"><InputNumber value={generatorSteps} onChange={(value) => setGeneratorSteps(value || 1)} min={1} max={100} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="设备策略"><Select value={devicePolicy} onChange={setDevicePolicy} options={[{ value: 'cuda', label: '全量 CUDA（推荐）' }, { value: 'cpu-offload', label: 'CPU Offload（节省显存）' }]} /></Form.Item></> : <><Form.Item label={`运动模糊强度 ${blur.toFixed(1)}`}><Slider value={blur} onChange={setBlur} min={0} max={1} step={0.1} marks={{ 0: '清洁', 0.5: '中等', 1: '严重' }} /></Form.Item><Form.Item label="固定随机种子"><Checkbox.Group options={[1001, 1002, 1003, 1004].map((value) => ({ label: value, value }))} value={seeds} onChange={(values) => setSeeds(values as number[])} /></Form.Item></>}</Form></Card>}</Col>
-        {source.id === 'adapter_condition' && <Col span={24}><Card title="选择退化输入数据集"><Select value={inputDatasetId} onChange={setInputDatasetId} style={{ width: '100%' }} placeholder="选择已导入的 PNG/JPEG/WebP 数据集" options={datasets.data.filter((item) => item.source_type === 'REAL').map((item) => ({ value: item.id, label: `${item.name} · ${item.sample_count} 张`, disabled: !item.categories.length }))} /><Typography.Paragraph type="secondary" style={{ marginTop: 10, marginBottom: 0 }}>条件算子保持几何位置不变，并自动继承输入数据集的类别。</Typography.Paragraph></Card></Col>}
+        <Col xs={24} xl={12}>{source.id === 'local-import' ? <Card title="导入校验"><Timeline items={[{ color: 'blue', children: '通过系统资源管理器选择图像目录' }, { color: 'blue', children: '上传 PNG、JPEG、WebP 和 SVG 到工作区暂存区' }, { color: 'blue', children: '标注作为候选真值导入并等待校核' }, { color: 'green', children: '导入完成后自动清理暂存文件，不修改原始目录' }]} /><Alert type="info" showIcon message="浏览器安全选择" description="浏览器不会向平台暴露本机绝对路径；只上传你在资源管理器中明确选择的文件。" /></Card> : isCondition ? <Card title={isMotionBlur ? '运动模糊模型' : '加雾模型'}><Descriptions column={1} size="small" bordered items={isMotionBlur ? [{ key: 'model', label: '模型', children: 'DiffusionBlur · ID-Blau' }, { key: 'checkpoint', label: '权重', children: 'ID_Blau.pth' }, { key: 'sampler', label: '采样器', children: 'DDIM / 20 步' }, { key: 'output', label: '模型输出', children: '保持原图分辨率' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP32' }] : [{ key: 'model', label: '模型', children: 'DiffusionDegrade · UAV Fog' }, { key: 'checkpoint', label: '权重', children: 'content15 / model_2501' }, { key: 'prep', label: '模型输入', children: '缩放至 512×512' }, { key: 'output', label: '模型输出', children: '恢复原图分辨率' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP16' }]} />{isMotionBlur ? <Form layout="vertical" className="top-gap"><Form.Item label="无人机运动类型"><Select value={motionPreset} onChange={setMotionPreset} options={motionPresetOptions} /></Form.Item><Form.Item label={`运动模糊强度 ${motionStrength.toFixed(2)}`} extra="ID-Blau 归一化条件强度，不表示像素位移"><Slider value={motionStrength} onChange={setMotionStrength} min={0.01} max={0.35} step={0.01} marks={{ 0.01: '轻微', 0.14: '默认', 0.35: '强烈' }} /></Form.Item></Form> : <Form layout="vertical" className="top-gap"><Form.Item label={`加雾强度（视觉混合） ${fogStrength.toFixed(1)}`} extra="0 为原图，1 为完整模型加雾结果"><Slider value={fogStrength} onChange={setFogStrength} min={0} max={1} step={0.1} marks={{ 0: '原图', 0.5: '中等', 1: '完整加雾' }} /></Form.Item></Form>}</Card> : <Card title={isBaseGen ? '生成参数' : '传感器与成像条件'}><Form layout="vertical"><Form.Item label="图像分辨率"><Select value={resolution} onChange={setResolution} options={resolutionOptions} /></Form.Item>{isBaseGen ? <><Form.Item label="起始随机种子"><InputNumber value={generatorSeed} onChange={(value) => setGeneratorSeed(value || 0)} min={0} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="推理步数"><InputNumber value={generatorSteps} onChange={(value) => setGeneratorSteps(value || 1)} min={1} max={100} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="设备策略"><Select value={devicePolicy} onChange={setDevicePolicy} options={[{ value: 'cuda', label: '全量 CUDA（推荐）' }, { value: 'cpu-offload', label: 'CPU Offload（节省显存）' }]} /></Form.Item></> : <><Form.Item label={`运动模糊强度 ${blur.toFixed(1)}`}><Slider value={blur} onChange={setBlur} min={0} max={1} step={0.1} marks={{ 0: '清洁', 0.5: '中等', 1: '严重' }} /></Form.Item><Form.Item label="固定随机种子"><Checkbox.Group options={[1001, 1002, 1003, 1004].map((value) => ({ label: value, value }))} value={seeds} onChange={(values) => setSeeds(values as number[])} /></Form.Item></>}</Form></Card>}</Col>
+        {isCondition && <Col span={24}><Card title="选择非理想条件输入数据集"><Select value={inputDatasetId} onChange={setInputDatasetId} style={{ width: '100%' }} placeholder="选择无人机航拍域的本地导入数据集" options={datasets.data.filter((item) => item.source_type === 'REAL' && ['无人机航拍', 'low-altitude-uav'].includes(item.scene_domain)).map((item) => ({ value: item.id, label: `${item.name} · ${item.sample_count} 张 · ${item.annotation_status}`, disabled: !item.categories.length }))} /><Typography.Paragraph type="secondary" style={{ marginTop: 10, marginBottom: 0 }}>任务处理所选数据集的全部图像，并保持文件名和原始分辨率；若存在 COCO 标注，将作为候选真值一并继承。</Typography.Paragraph></Card></Col>}
         <Col span={24}><Card title="目标检测类别">{source.id === 'adapter_condition' ? inputDataset ? <Alert type="info" showIcon message={`已继承 ${inputDataset.categories.length} 个类别`} description={inputDataset.categories.map((item) => `${item.id}:${item.name}`).join(' · ')} /> : <Alert type="warning" showIcon message="请先选择输入数据集" /> : <CategoryConfiguration templates={categoryTemplates.data} templateId={categoryTemplateId} scope="dataset" customCategories={customDatasetCategories} onTemplateChange={setCategoryTemplateId} onCustomChange={setCustomDatasetCategories} />}</Card></Col>
-        <Col span={24}><div className="wizard-actions"><Button onClick={() => setStep(0)}>上一步</Button><Button type="primary" disabled={!categoriesReady || (source.id === 'local-import' ? localDatasetName.trim().length < 2 || !localImageFiles.length : isBaseGen ? !currentBasegenDomain || generatorSeed < 0 || generatorSteps < 1 : source.id === 'adapter_condition' ? !inputDatasetId || !seeds.length : !seeds.length)} onClick={() => setStep(2)}>下一步：{source.id === 'local-import' ? '导入确认' : '组合预览'}</Button></div></Col>
+        <Col span={24}><div className="wizard-actions"><Button onClick={() => setStep(0)}>上一步</Button><Button type="primary" disabled={!categoriesReady || (source.id === 'local-import' ? localDatasetName.trim().length < 2 || !localImageFiles.length : isBaseGen ? !currentBasegenDomain || generatorSeed < 0 || generatorSteps < 1 : isCondition ? !inputDatasetId : !seeds.length)} onClick={() => setStep(2)}>下一步：{source.id === 'local-import' ? '导入确认' : '组合预览'}</Button></div></Col>
       </Row>}
-      {step === 2 && <Card title="提交前确认" extra={source.id === 'local-import' ? <Tag color="blue">本地真实数据</Tag> : isBaseGen ? <Tag color="purple">基础图像生成</Tag> : <DemoTag />}>
-        <Row gutter={[16, 16]}><Col xs={24} md={8}><Statistic title={source.id === 'local-import' ? '导入任务' : '配置单元'} value={source.id === 'local-import' ? 1 : combinationCount} suffix="个" /></Col><Col xs={24} md={8}><Statistic title="输出样本" value={source.id === 'local-import' ? '目录内图像' : samples} suffix={source.id === 'local-import' ? undefined : '张'} /></Col><Col xs={24} md={8}><Statistic title="真值入口" value={source.id === 'local-import' ? (annotationPath ? '已提供' : '未提供') : isBaseGen ? '未标注' : '候选框'} /></Col></Row><Divider />
-        <Descriptions column={{ xs: 1, md: 2 }} bordered size="small" items={[{ key: 'source', label: '构建方式', children: source.title }, { key: 'scene', label: '场景', children: source.id === 'local-import' || isBaseGen ? domain : `${domain} / ${weather}` }, { key: 'sensor', label: source.id === 'local-import' ? '输入目录' : isBaseGen ? '生成参数' : '成像条件', children: source.id === 'local-import' ? localDirectory : isBaseGen ? `${resolution} / ${generatorSteps} 步 / ${devicePolicy}` : `${resolution} / 模糊 ${blur}` }, { key: 'categories', label: '检测类别', span: 2, children: <Space direction="vertical" size={4} style={{ width: '100%' }}><Typography.Text strong>{selectedCategories.length} 类</Typography.Text><Typography.Paragraph ellipsis={{ rows: 3, expandable: true, symbol: '展开全部' }} style={{ marginBottom: 0 }}>{selectedCategories.map((item) => `${item.id}:${item.name}`).join(' · ')}</Typography.Paragraph></Space> }, { key: 'seed', label: '随机种子', children: source.id === 'local-import' ? '不适用' : isBaseGen ? `${generatorSeed} 起连续 ${samples} 个` : seeds.join(', ') }, { key: 'truth', label: '真值策略', children: source.id === 'local-import' ? (annotationPath ? '导入后作为候选真值' : '未提供') : isBaseGen ? '未标注，需另行标注后评测' : '候选框，完成后需校核冻结' }, { key: 'official', label: '数据来源', children: source.id === 'local-import' ? <Tag color="blue">真实采集数据</Tag> : isBaseGen ? <Tag color="purple">真实模型生成</Tag> : <DemoTag /> }]} />
+      {step === 2 && <Card title="提交前确认" extra={source.id === 'local-import' ? <Tag color="blue">本地真实数据</Tag> : isBaseGen ? <Tag color="purple">基础图像生成</Tag> : isCondition ? <Tag color="cyan">{isMotionBlur ? 'DiffusionBlur' : 'DiffusionDegrade'}</Tag> : <DemoTag />}>
+        <Row gutter={[16, 16]}><Col xs={24} md={8}><Statistic title={source.id === 'local-import' ? '导入任务' : '配置单元'} value={source.id === 'local-import' ? 1 : combinationCount} suffix="个" /></Col><Col xs={24} md={8}><Statistic title="输出样本" value={source.id === 'local-import' ? '目录内图像' : outputSampleCount} suffix={source.id === 'local-import' ? undefined : '张'} /></Col><Col xs={24} md={8}><Statistic title="真值入口" value={source.id === 'local-import' ? (annotationPath ? '已提供' : '未提供') : isBaseGen ? '未标注' : isCondition ? (conditionHasTruth ? '继承为候选真值' : '未标注') : '候选框'} /></Col></Row><Divider />
+        <Descriptions column={{ xs: 1, md: 2 }} bordered size="small" items={[{ key: 'source', label: '构建方式', children: isMotionBlur ? '非理想条件生成 · 无人机运动模糊' : source.title }, { key: 'scene', label: '场景', children: isCondition ? (isMotionBlur ? '无人机航拍 / 保持源天气' : '无人机航拍 / 雾') : source.id === 'local-import' || isBaseGen ? domain : `${domain} / ${weather}` }, { key: 'sensor', label: source.id === 'local-import' ? '输入目录' : isBaseGen ? '生成参数' : '成像条件', children: source.id === 'local-import' ? localDirectory : isBaseGen ? `${resolution} / ${generatorSteps} 步 / ${devicePolicy}` : isMotionBlur ? `${inputDataset?.resolution || '原始分辨率'} / ${motionPresetLabel} / 强度 ${motionStrength.toFixed(2)} / DDIM 20 步` : isCondition ? `${inputDataset?.resolution || '原始分辨率'} / DiffusionDegrade UAV Fog / FP16 / 强度 ${fogStrength.toFixed(1)}` : `${resolution} / 模糊 ${blur}` }, { key: 'categories', label: '检测类别', span: 2, children: <Space direction="vertical" size={4} style={{ width: '100%' }}><Typography.Text strong>{selectedCategories.length} 类</Typography.Text><Typography.Paragraph ellipsis={{ rows: 3, expandable: true, symbol: '展开全部' }} style={{ marginBottom: 0 }}>{selectedCategories.map((item) => `${item.id}:${item.name}`).join(' · ')}</Typography.Paragraph></Space> }, { key: 'seed', label: '随机种子', children: source.id === 'local-import' ? '不适用' : isBaseGen ? `${generatorSeed} 起连续 ${samples} 个` : isCondition ? (isMotionBlur ? '2023 起按图像递增' : '固定为 1001') : seeds.join(', ') }, { key: 'truth', label: '真值策略', children: source.id === 'local-import' ? (annotationPath ? '导入后作为候选真值' : '未提供') : isBaseGen ? '未标注，需另行标注后评测' : isCondition ? (conditionHasTruth ? '继承标注为候选真值，需抽查后冻结' : '源数据无标注，输出保持未标注') : '候选框，完成后需校核冻结' }, { key: 'official', label: '数据来源', children: source.id === 'local-import' ? <Tag color="blue">真实采集数据</Tag> : isBaseGen ? <Tag color="purple">真实模型生成</Tag> : isCondition ? <Tag color="cyan">真实模型退化</Tag> : <DemoTag /> }]} />
         {isBaseGen && <Card size="small" title="场景字段规则" className="top-gap"><Space wrap>{basegenSceneSummary.map((item) => <Tag key={item}>{item}</Tag>)}{basegenCustom && <Tag color="blue">自定义：{basegenCustom}</Tag>}</Space></Card>}
         {isBaseGen && basegenPreview && <Card size="small" title="随机计划预览（不加载模型）" className="top-gap"><List dataSource={basegenPreview.images} renderItem={(item) => <List.Item><Space direction="vertical" style={{ width: '100%' }}><Space wrap><Tag color="blue">seed {item.seed}</Tag><Tag>{item.width}×{item.height}</Tag>{currentBasegenDomain?.fields.filter((field) => field.kind !== 'text').map((field) => { const raw = item.scene[field.name]; const values = Array.isArray(raw) ? raw : [raw]; return <Tag key={field.name}>{field.label_zh}：{values.map((value) => optionFor(field, value)?.label_zh || value).join('、')}</Tag> })}</Space><Typography.Paragraph copyable={{ text: item.prompt }} ellipsis={{ rows: 3, expandable: true, symbol: '展开 prompt' }} style={{ marginBottom: 0 }}>{item.prompt}</Typography.Paragraph></Space></List.Item>} /></Card>}
-        {source.id !== 'local-import' && <Alert className="inline-alert" type={isBaseGen ? 'info' : 'warning'} showIcon message={isBaseGen ? '本任务将调用 BaseGen 真实生成图像' : source.id === 'adapter_condition' ? '本任务将创建真实图像的非理想条件版本' : '本任务使用固定样例验证流程'} description={isBaseGen ? '模型在独立 gen 环境中运行；纯文本生成不提供目标框等真值。' : source.id === 'adapter_condition' ? '输出记录原数据集和非理想条件参数，正式冻结前仍需抽查真值。' : '输出会保留完整数据谱系，但不能作为生成模型能力结论。'} />}
+        {source.id !== 'local-import' && <Alert className="inline-alert" type={isBaseGen || isCondition ? 'info' : 'warning'} showIcon message={isBaseGen ? '本任务将调用 BaseGen 真实生成图像' : isMotionBlur ? '本任务将调用 DiffusionBlur 执行无人机运动模糊生成' : isCondition ? '本任务将调用 DiffusionDegrade 执行无人机航拍域加雾' : '本任务使用固定样例验证流程'} description={isBaseGen ? '模型在独立 gen 环境中运行；纯文本生成不提供目标框等真值。' : isCondition ? '外部项目、环境和权重均只读；输出写入平台 Artifact，并保留输入文件名和数据谱系。' : '输出会保留完整数据谱系，但不能作为生成模型能力结论。'} />}
         <div className="wizard-actions"><Button onClick={() => { setBasegenPreview(undefined); setStep(1) }}>上一步</Button>{isBaseGen && <Button loading={previewing} onClick={previewBasegen}>预览 3 个随机场景</Button>}<Button type="primary" loading={submitting} icon={<PlayCircleOutlined />} onClick={submit}>提交构建任务</Button></div>
       </Card>}
       {step === 3 && <Space direction="vertical" size={16} style={{ width: '100%' }}><JobProgress jobId={jobId} onFinish={finish} />{finishedJob?.status === 'SUCCEEDED' && <Card><Result status="success" title={source.id === 'local-import' ? '本地图像已导入' : '数据构建任务已完成'} subTitle={finishedJob.result?.annotation_status === 'UNLABELED' ? '当前没有真值，需进入数据集完成标注后才能正式评测。' : '输出当前仍是候选真值，冻结前不会进入正式评测。'} extra={finishedJob.result?.annotation_status === 'UNLABELED' ? [<Button key="datasets" type="primary" onClick={() => navigate('datasets')}>打开数据集</Button>] : [<Button key="freeze" type="primary" icon={<LockOutlined />} onClick={freeze}>校核并冻结数据版本</Button>, <Button key="datasets" onClick={() => navigate('datasets')}>打开数据集</Button>]} /></Card>}</Space>}
@@ -1229,7 +1290,7 @@ export function DatasetsPage({ dark }: PageProps) {
     { title: '真值', dataIndex: 'annotation_status', render: (value) => <StatusTag status={value} /> },
     { title: '版本', render: (_, row) => row.frozen ? <Tag icon={<LockOutlined />} color="success">{row.version} 已冻结</Tag> : <Tag>草稿</Tag> },
     { title: '操作', render: (_, row) => <Space><Button type="link" onClick={() => setSelected(row)}>查看</Button><Button type="link" icon={<FileImageOutlined />} onClick={() => setBrowserDataset(row)}>浏览全部</Button><Button type="link" onClick={() => setAnnotationDataset(row)}>{row.frozen ? '查看标注' : '目标标注'}</Button>{!row.frozen && <Button type="link" onClick={() => freeze(row)}>冻结</Button>}{!row.frozen && <Popconfirm title="确认删除这个数据集？" description={`${row.name} · ${row.sample_count} 个样本将移入回收站。`} okText="移入回收站" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => remove(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm>}</Space> },
-  ]} /></Card><Drawer open={Boolean(selected)} width={1040} title={selected?.name} onClose={() => setSelected(undefined)}>{selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Gallery images={selected.preview_images} height={140} /><Button block icon={<FileImageOutlined />} onClick={() => { setSelected(undefined); setBrowserDataset(selected) }}>浏览全部图片</Button><Button block onClick={() => { setSelected(undefined); setAnnotationDataset(selected) }}>{selected.frozen ? '查看目标检测标注' : '开始目标检测标注'}</Button><Descriptions bordered column={2} items={[{ key: 'source', label: '来源', children: selected.source_type }, { key: 'scene', label: '场景', children: selected.scene_domain }, { key: 'weather', label: '天气', children: selected.weather }, { key: 'resolution', label: '分辨率', children: selected.resolution }, { key: 'truth', label: '真值', children: <StatusTag status={selected.annotation_status} /> }, { key: 'frozen', label: '不可变', children: selected.frozen ? '是' : '否' }, { key: 'categories', label: '检测类别', children: selected.categories.length ? <Space wrap>{selected.categories.map((item) => <Tag key={item.id}>{item.id}:{item.name}</Tag>)}</Space> : <Tag color="warning">待配置</Tag>, span: 2 }]} /><Divider>数据统计</Divider><DatasetStatisticsPanel datasetId={selected.id} dark={dark} /><Alert type="info" showIcon message="数据谱系" description="所有样本均记录来源、条件、seed、Adapter 版本和文件摘要。流程样例不会被标记为正式生成数据。" /></Space>}</Drawer><DatasetBrowser dataset={browserDataset} onClose={() => setBrowserDataset(undefined)} /><AnnotationWorkspace dataset={annotationDataset} onClose={() => setAnnotationDataset(undefined)} onChanged={reload} /></>
+      ]} /></Card><Drawer open={Boolean(selected)} width={1040} title={selected?.name} onClose={() => setSelected(undefined)}>{selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Gallery images={selected.preview_images} height={140} /><Button block icon={<FileImageOutlined />} onClick={() => { setSelected(undefined); setBrowserDataset(selected) }}>浏览全部图片</Button><Button block onClick={() => { setSelected(undefined); setAnnotationDataset(selected) }}>{selected.frozen ? '查看目标检测标注' : '开始目标检测标注'}</Button><Descriptions bordered column={2} items={[{ key: 'source', label: '来源', children: selected.source_type }, { key: 'scene', label: '场景', children: selected.scene_domain }, { key: 'weather', label: '天气', children: selected.weather }, { key: 'resolution', label: '分辨率', children: selected.resolution }, { key: 'truth', label: '真值', children: <StatusTag status={selected.annotation_status} /> }, { key: 'frozen', label: '不可变', children: selected.frozen ? '是' : '否' }, ...motionBlurDatasetItems(selected), { key: 'categories', label: '检测类别', children: selected.categories.length ? <Space wrap>{selected.categories.map((item) => <Tag key={item.id}>{item.id}:{item.name}</Tag>)}</Space> : <Tag color="warning">待配置</Tag>, span: 2 }]} /><Divider>数据统计</Divider><DatasetStatisticsPanel datasetId={selected.id} dark={dark} /><Alert type="info" showIcon message="数据谱系" description="所有样本均记录来源、条件、seed、Adapter 版本和文件摘要。流程样例不会被标记为正式生成数据。" /></Space>}</Drawer><DatasetBrowser dataset={browserDataset} onClose={() => setBrowserDataset(undefined)} /><AnnotationWorkspace dataset={annotationDataset} onClose={() => setAnnotationDataset(undefined)} onChanged={reload} /></>
 }
 
 type LocalResourceKind = 'directory' | 'entrypoint' | 'weight'
@@ -1671,7 +1732,7 @@ export function EnvironmentPage(_: PageProps) {
   const { data, loading, reload } = useResource<EnvironmentStatus | undefined>('/api/environment/status', undefined)
   if (loading || !data) return <Card loading />
   const diskPercent = Math.round(data.disk.used / data.disk.total * 100)
-  return <Space direction="vertical" size={18} style={{ width: '100%' }}><Alert type="success" showIcon message="工作区隔离已启用" description="平台不修改 base、.condarc、.bashrc 或已有 conda 环境。所有平台环境、缓存、数据库和 Artifact 均位于项目目录。" action={<Button icon={<ReloadOutlined />} onClick={reload}>重新检查</Button>} /><Row gutter={[16, 16]}><Col xs={24} md={8}><Card><Statistic title="隔离模式" value="Workspace" prefix={<SafetyCertificateOutlined />} /><Typography.Text type="secondary">写入工作区外：{data.isolation.writes_outside_workspace ? '是' : '否'}</Typography.Text></Card></Col><Col xs={24} md={8}><Card><Statistic title="GPU 状态" value={data.gpu.available ? '可用' : '当前受限'} prefix={<ThunderboltOutlined />} /><Typography.Text type="secondary">失败时不会尝试修改驱动</Typography.Text></Card></Col><Col xs={24} md={8}><Card><Statistic title="磁盘使用" value={diskPercent} suffix="%" /><Progress percent={diskPercent} showInfo={false} /><Typography.Text type="secondary">剩余 {formatBytes(data.disk.free)}</Typography.Text></Card></Col></Row><Card title="写入边界"><Descriptions bordered column={1} items={[{ key: 'runtime', label: '平台环境与缓存', children: <Typography.Text code copyable>{data.isolation.runtime_dir}</Typography.Text> }, { key: 'data', label: '数据库与 Artifact', children: <Typography.Text code copyable>{data.isolation.data_dir}</Typography.Text> }, { key: 'shell', label: 'Shell 配置修改', children: data.isolation.shell_configuration_modified ? <Tag color="error">有</Tag> : <Tag color="success">无</Tag> }, { key: 'conda', label: '外部环境策略', children: <Tag icon={<LockOutlined />} color="success">只读调用</Tag> }]} /></Card><Card title={`发现 ${data.conda.envs.length} 个 conda 环境`} extra={<Typography.Text type="secondary">仅读取 conda-meta/history 指纹</Typography.Text>}><Table rowKey="prefix" pagination={false} dataSource={data.conda.envs} columns={[{ title: '名称', dataIndex: 'name', render: (value) => <Typography.Text strong>{value}</Typography.Text> }, { title: '路径', dataIndex: 'prefix', render: (value) => <Typography.Text code copyable>{value}</Typography.Text> }, { title: '策略', render: () => <Tag icon={<LockOutlined />} color="success">external_read_only</Tag> }, { title: '环境指纹', dataIndex: 'fingerprint', render: (value) => value ? <Typography.Text code>{value}</Typography.Text> : '未找到' }, { title: '状态', dataIndex: 'exists', render: (value) => <StatusTag status={value ? 'HEALTHY' : 'UNAVAILABLE'} /> }]} /></Card>{!data.gpu.available && <Alert type="warning" showIcon message="当前进程无法访问 NVIDIA 驱动" description={data.gpu.error || '宿主机预检失败。Web 和 CPU 功能仍可使用，GPU Adapter 会被安全阻止。'} />}</Space>
+  return <Space direction="vertical" size={18} style={{ width: '100%' }}><Alert type="success" showIcon message="工作区隔离已启用" description="平台不修改 base、.condarc、.bashrc 或已有 conda 环境。所有平台环境、缓存、数据库和 Artifact 均位于项目目录。" action={<Button icon={<ReloadOutlined />} onClick={reload}>重新检查</Button>} /><Row gutter={[16, 16]}><Col xs={24} md={8}><Card><Statistic title="隔离模式" value="Workspace" prefix={<SafetyCertificateOutlined />} /><Typography.Text type="secondary">写入工作区外：{data.isolation.writes_outside_workspace ? '是' : '否'}</Typography.Text></Card></Col><Col xs={24} md={8}><Card><Statistic title="GPU 状态" value={data.gpu.available ? '可用' : '当前受限'} prefix={<ThunderboltOutlined />} /><Typography.Text type="secondary"></Typography.Text></Card></Col><Col xs={24} md={8}><Card><Statistic title="磁盘使用" value={diskPercent} suffix="%" /><Progress percent={diskPercent} showInfo={false} /><Typography.Text type="secondary">剩余 {formatBytes(data.disk.free)}</Typography.Text></Card></Col></Row><Card title="写入边界"><Descriptions bordered column={1} items={[{ key: 'runtime', label: '平台环境与缓存', children: <Typography.Text code copyable>{data.isolation.runtime_dir}</Typography.Text> }, { key: 'data', label: '数据库与 Artifact', children: <Typography.Text code copyable>{data.isolation.data_dir}</Typography.Text> }, { key: 'shell', label: 'Shell 配置修改', children: data.isolation.shell_configuration_modified ? <Tag color="error">有</Tag> : <Tag color="success">无</Tag> }, { key: 'conda', label: '外部环境策略', children: <Tag icon={<LockOutlined />} color="success">只读调用</Tag> }]} /></Card><Card title={`发现 ${data.conda.envs.length} 个 conda 环境`} extra={<Typography.Text type="secondary">仅读取 conda-meta/history 指纹</Typography.Text>}><Table rowKey="prefix" pagination={false} dataSource={data.conda.envs} columns={[{ title: '名称', dataIndex: 'name', render: (value) => <Typography.Text strong>{value}</Typography.Text> }, { title: '路径', dataIndex: 'prefix', render: (value) => <Typography.Text code copyable>{value}</Typography.Text> }, { title: '策略', render: () => <Tag icon={<LockOutlined />} color="success">external_read_only</Tag> }, { title: '环境指纹', dataIndex: 'fingerprint', render: (value) => value ? <Typography.Text code>{value}</Typography.Text> : '未找到' }, { title: '状态', dataIndex: 'exists', render: (value) => <StatusTag status={value ? 'HEALTHY' : 'UNAVAILABLE'} /> }]} /></Card>{!data.gpu.available && <Alert type="warning" showIcon message="当前进程无法访问 NVIDIA 驱动" description={data.gpu.error || '宿主机预检失败。Web 和 CPU 功能仍可使用，GPU Adapter 会被安全阻止。'} />}</Space>
 }
 
 export function PresentationPage({ onExit }: { dark: boolean; onExit: () => void }) {
