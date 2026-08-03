@@ -240,20 +240,79 @@ type BaseGenSelection =
 const RANDOM_VALUE = '__random__'
 
 const motionPresetOptions = [
-  { value: 'forward', label: '向前飞行' },
-  { value: 'backward', label: '向后飞行' },
-  { value: 'fly-left', label: '向左飞行' },
-  { value: 'fly-right', label: '向右飞行' },
-  { value: 'ascend', label: '上升' },
-  { value: 'descend', label: '下降' },
-  { value: 'yaw-left', label: '向左偏航' },
-  { value: 'yaw-right', label: '向右偏航' },
-  { value: 'tilt-up', label: '云台上倾' },
-  { value: 'tilt-down', label: '云台下倾' },
-  { value: 'tilt-left', label: '云台左倾' },
-  { value: 'tilt-right', label: '云台右倾' },
-  { value: 'vibration', label: '复合振动' },
+  { value: 'forward', label: '向前飞行', description: '画面内容向下' },
+  { value: 'backward', label: '向后飞行', description: '画面内容向上' },
+  { value: 'fly-left', label: '向左飞行', description: '画面内容向右' },
+  { value: 'fly-right', label: '向右飞行', description: '画面内容向左' },
+  { value: 'ascend', label: '上升', description: '内容向中心收缩' },
+  { value: 'descend', label: '下降', description: '内容从中心扩张' },
+  { value: 'yaw-left', label: '向左偏航', description: '画面顺时针旋转' },
+  { value: 'yaw-right', label: '向右偏航', description: '画面逆时针旋转' },
+  { value: 'tilt-up', label: '云台上倾', description: '向上透视运动' },
+  { value: 'tilt-down', label: '云台下倾', description: '向下透视运动' },
+  { value: 'tilt-left', label: '云台左倾', description: '向左透视运动' },
+  { value: 'tilt-right', label: '云台右倾', description: '向右透视运动' },
+  { value: 'vibration', label: '复合振动', description: '平移、缩放与旋转' },
 ]
+
+function MotionPresetDiagram({ motion }: { motion: string }) {
+  const markerId = `motion-arrow-${motion}`
+  const arrow = (x1: number, y1: number, x2: number, y2: number, key: string) => (
+    <line key={key} x1={x1} y1={y1} x2={x2} y2={y2} className="motion-diagram-arrow" markerEnd={`url(#${markerId})`} />
+  )
+  const paths = (() => {
+    if (motion === 'forward' || motion === 'backward') {
+      const [y1, y2] = motion === 'forward' ? [24, 72] : [72, 24]
+      return [42, 80, 118].map((x) => arrow(x, y1, x, y2, String(x)))
+    }
+    if (motion === 'fly-left' || motion === 'fly-right') {
+      const [x1, x2] = motion === 'fly-left' ? [42, 118] : [118, 42]
+      return [27, 48, 69].map((y) => arrow(x1, y, x2, y, String(y)))
+    }
+    if (motion === 'ascend') {
+      return [[28, 20, 68, 42], [132, 20, 92, 42], [28, 76, 68, 54], [132, 76, 92, 54]].map(([x1, y1, x2, y2], index) => arrow(x1, y1, x2, y2, String(index)))
+    }
+    if (motion === 'descend') {
+      return [[68, 42, 28, 20], [92, 42, 132, 20], [68, 54, 28, 76], [92, 54, 132, 76]].map(([x1, y1, x2, y2], index) => arrow(x1, y1, x2, y2, String(index)))
+    }
+    if (motion === 'yaw-left' || motion === 'yaw-right') {
+      const clockwise = motion === 'yaw-left'
+      return [
+        <path key="yaw-top" d={clockwise ? 'M 45 27 A 48 30 0 0 1 122 39' : 'M 122 39 A 48 30 0 0 0 45 27'} className="motion-diagram-arrow" markerEnd={`url(#${markerId})`} />,
+        <path key="yaw-bottom" d={clockwise ? 'M 115 70 A 48 30 0 0 1 38 57' : 'M 38 57 A 48 30 0 0 0 115 70'} className="motion-diagram-arrow" markerEnd={`url(#${markerId})`} />,
+      ]
+    }
+    if (motion === 'tilt-up' || motion === 'tilt-down') {
+      const upward = motion === 'tilt-up'
+      const values = upward
+        ? [[43, 74, 55, 27], [80, 74, 80, 23], [117, 74, 105, 27]]
+        : [[55, 23, 43, 70], [80, 23, 80, 74], [105, 23, 117, 70]]
+      return values.map(([x1, y1, x2, y2], index) => arrow(x1, y1, x2, y2, String(index)))
+    }
+    if (motion === 'tilt-left' || motion === 'tilt-right') {
+      const leftward = motion === 'tilt-left'
+      const values = leftward
+        ? [[125, 27, 42, 34], [125, 48, 35, 48], [125, 69, 42, 62]]
+        : [[35, 34, 118, 27], [35, 48, 125, 48], [35, 62, 118, 69]]
+      return values.map(([x1, y1, x2, y2], index) => arrow(x1, y1, x2, y2, String(index)))
+    }
+    return [
+      <path key="v1" d="M 26 28 C 48 10, 60 48, 82 28" className="motion-diagram-mixed" markerEnd={`url(#${markerId})`} />,
+      <path key="v2" d="M 107 20 C 140 36, 105 55, 136 70" className="motion-diagram-mixed" markerEnd={`url(#${markerId})`} />,
+      <path key="v3" d="M 30 72 C 52 48, 70 82, 96 59" className="motion-diagram-arrow" markerEnd={`url(#${markerId})`} />,
+    ]
+  })()
+  const showCenter = ['ascend', 'descend', 'yaw-left', 'yaw-right', 'vibration'].includes(motion)
+  return (
+    <svg className="motion-preset-diagram" viewBox="0 0 160 96" role="img" aria-label={`${motion} 图像表观运动示意`}>
+      <defs><marker id={markerId} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" className="motion-diagram-head" /></marker></defs>
+      <rect x="1" y="1" width="158" height="94" rx="8" className="motion-diagram-bg" />
+      <path d="M 54 1 V 95 M 106 1 V 95 M 1 32 H 159 M 1 64 H 159" className="motion-diagram-grid" />
+      {showCenter && <circle cx="80" cy="48" r="4" className="motion-diagram-center" />}
+      {paths}
+    </svg>
+  )
+}
 
 function motionBlurDatasetItems(dataset: Dataset) {
   const conditions = dataset.sensor_conditions || {}
@@ -664,7 +723,7 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
             </Form>
           </Card>
         </Col>
-        <Col xs={24} xl={12}>{source.id === 'local-import' ? <Card title="导入校验"><Timeline items={[{ color: 'blue', children: '通过系统资源管理器选择图像目录' }, { color: 'blue', children: '上传 PNG、JPEG、WebP 和 SVG 到工作区暂存区' }, { color: 'blue', children: '标注作为候选真值导入并等待校核' }, { color: 'green', children: '导入完成后自动清理暂存文件，不修改原始目录' }]} /><Alert type="info" showIcon message="浏览器安全选择" description="浏览器不会向平台暴露本机绝对路径；只上传你在资源管理器中明确选择的文件。" /></Card> : isCondition ? <Card title={isMotionBlur ? '运动模糊模型' : '加雾模型'}><Descriptions column={1} size="small" bordered items={isMotionBlur ? [{ key: 'model', label: '模型', children: 'DiffusionBlur · ID-Blau' }, { key: 'checkpoint', label: '权重', children: 'ID_Blau.pth' }, { key: 'sampler', label: '采样器', children: 'DDIM / 20 步' }, { key: 'output', label: '模型输出', children: '保持原图分辨率' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP32' }] : [{ key: 'model', label: '模型', children: 'DiffusionDegrade · UAV Fog' }, { key: 'checkpoint', label: '权重', children: 'content15 / model_2501' }, { key: 'prep', label: '模型输入', children: '缩放至 512×512' }, { key: 'output', label: '模型输出', children: '恢复原图分辨率' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP16' }]} />{isMotionBlur ? <Form layout="vertical" className="top-gap"><Form.Item label="无人机运动类型"><Select value={motionPreset} onChange={setMotionPreset} options={motionPresetOptions} /></Form.Item><Form.Item label={`运动模糊强度 ${motionStrength.toFixed(2)}`} extra="ID-Blau 归一化条件强度，不表示像素位移"><Slider value={motionStrength} onChange={setMotionStrength} min={0.01} max={0.35} step={0.01} marks={{ 0.01: '轻微', 0.14: '默认', 0.35: '强烈' }} /></Form.Item></Form> : <Form layout="vertical" className="top-gap"><Form.Item label={`加雾强度（视觉混合） ${fogStrength.toFixed(1)}`} extra="0 为原图，1 为完整模型加雾结果"><Slider value={fogStrength} onChange={setFogStrength} min={0} max={1} step={0.1} marks={{ 0: '原图', 0.5: '中等', 1: '完整加雾' }} /></Form.Item></Form>}</Card> : <Card title={isBaseGen ? '生成参数' : '传感器与成像条件'}><Form layout="vertical"><Form.Item label="图像分辨率"><Select value={resolution} onChange={setResolution} options={resolutionOptions} /></Form.Item>{isBaseGen ? <><Form.Item label="起始随机种子"><InputNumber value={generatorSeed} onChange={(value) => setGeneratorSeed(value || 0)} min={0} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="推理步数"><InputNumber value={generatorSteps} onChange={(value) => setGeneratorSteps(value || 1)} min={1} max={100} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="设备策略"><Select value={devicePolicy} onChange={setDevicePolicy} options={[{ value: 'cuda', label: '全量 CUDA（推荐）' }, { value: 'cpu-offload', label: 'CPU Offload（节省显存）' }]} /></Form.Item></> : <><Form.Item label={`运动模糊强度 ${blur.toFixed(1)}`}><Slider value={blur} onChange={setBlur} min={0} max={1} step={0.1} marks={{ 0: '清洁', 0.5: '中等', 1: '严重' }} /></Form.Item><Form.Item label="固定随机种子"><Checkbox.Group options={[1001, 1002, 1003, 1004].map((value) => ({ label: value, value }))} value={seeds} onChange={(values) => setSeeds(values as number[])} /></Form.Item></>}</Form></Card>}</Col>
+        <Col xs={24} xl={12}>{source.id === 'local-import' ? <Card title="导入校验"><Timeline items={[{ color: 'blue', children: '通过系统资源管理器选择图像目录' }, { color: 'blue', children: '上传 PNG、JPEG、WebP 和 SVG 到工作区暂存区' }, { color: 'blue', children: '标注作为候选真值导入并等待校核' }, { color: 'green', children: '导入完成后自动清理暂存文件，不修改原始目录' }]} /><Alert type="info" showIcon message="浏览器安全选择" description="浏览器不会向平台暴露本机绝对路径；只上传你在资源管理器中明确选择的文件。" /></Card> : isCondition ? <Card title={isMotionBlur ? '运动模糊模型' : '加雾模型'}><Descriptions column={1} size="small" bordered items={isMotionBlur ? [{ key: 'model', label: '模型', children: 'DiffusionBlur · ID-Blau' }, { key: 'checkpoint', label: '权重', children: 'ID_Blau.pth' }, { key: 'sampler', label: '采样器', children: 'DDIM / 20 步' }, { key: 'output', label: '模型输出', children: '保持原图分辨率' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP32' }] : [{ key: 'model', label: '模型', children: 'DiffusionDegrade · UAV Fog' }, { key: 'checkpoint', label: '权重', children: 'content15 / model_2501' }, { key: 'prep', label: '模型输入', children: '缩放至 512×512' }, { key: 'output', label: '模型输出', children: '恢复原图分辨率' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP16' }]} />{isMotionBlur ? <Form layout="vertical" className="top-gap"><Form.Item label="无人机运动类型"><div className="motion-preset-grid" role="radiogroup" aria-label="无人机运动类型">{motionPresetOptions.map((option) => <button key={option.value} type="button" role="radio" aria-checked={motionPreset === option.value} className={`motion-preset-card ${motionPreset === option.value ? 'selected' : ''}`} onClick={() => setMotionPreset(option.value)}><MotionPresetDiagram motion={option.value} /><strong>{option.label}</strong><small>{option.description}</small></button>)}</div></Form.Item><Form.Item label={`运动模糊强度 ${motionStrength.toFixed(2)}`} extra="ID-Blau 归一化条件强度，不表示像素位移"><Slider value={motionStrength} onChange={setMotionStrength} min={0.01} max={0.35} step={0.01} marks={{ 0.01: '轻微', 0.14: '默认', 0.35: '强烈' }} /></Form.Item></Form> : <Form layout="vertical" className="top-gap"><Form.Item label={`加雾强度（视觉混合） ${fogStrength.toFixed(1)}`} extra="0 为原图，1 为完整模型加雾结果"><Slider value={fogStrength} onChange={setFogStrength} min={0} max={1} step={0.1} marks={{ 0: '原图', 0.5: '中等', 1: '完整加雾' }} /></Form.Item></Form>}</Card> : <Card title={isBaseGen ? '生成参数' : '传感器与成像条件'}><Form layout="vertical"><Form.Item label="图像分辨率"><Select value={resolution} onChange={setResolution} options={resolutionOptions} /></Form.Item>{isBaseGen ? <><Form.Item label="起始随机种子"><InputNumber value={generatorSeed} onChange={(value) => setGeneratorSeed(value || 0)} min={0} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="推理步数"><InputNumber value={generatorSteps} onChange={(value) => setGeneratorSteps(value || 1)} min={1} max={100} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="设备策略"><Select value={devicePolicy} onChange={setDevicePolicy} options={[{ value: 'cuda', label: '全量 CUDA（推荐）' }, { value: 'cpu-offload', label: 'CPU Offload（节省显存）' }]} /></Form.Item></> : <><Form.Item label={`运动模糊强度 ${blur.toFixed(1)}`}><Slider value={blur} onChange={setBlur} min={0} max={1} step={0.1} marks={{ 0: '清洁', 0.5: '中等', 1: '严重' }} /></Form.Item><Form.Item label="固定随机种子"><Checkbox.Group options={[1001, 1002, 1003, 1004].map((value) => ({ label: value, value }))} value={seeds} onChange={(values) => setSeeds(values as number[])} /></Form.Item></>}</Form></Card>}</Col>
         {isCondition && <Col span={24}><Card title="选择非理想条件输入数据集"><Select value={inputDatasetId} onChange={setInputDatasetId} style={{ width: '100%' }} placeholder="选择无人机航拍域的本地导入数据集" options={datasets.data.filter((item) => item.source_type === 'REAL' && ['无人机航拍', 'low-altitude-uav'].includes(item.scene_domain)).map((item) => ({ value: item.id, label: `${item.name} · ${item.sample_count} 张 · ${item.annotation_status}`, disabled: !item.categories.length }))} /><Typography.Paragraph type="secondary" style={{ marginTop: 10, marginBottom: 0 }}>任务处理所选数据集的全部图像，并保持文件名和原始分辨率；若存在 COCO 标注，将作为候选真值一并继承。</Typography.Paragraph></Card></Col>}
         <Col span={24}><Card title="目标检测类别">{source.id === 'adapter_condition' ? inputDataset ? <Alert type="info" showIcon message={`已继承 ${inputDataset.categories.length} 个类别`} description={inputDataset.categories.map((item) => `${item.id}:${item.name}`).join(' · ')} /> : <Alert type="warning" showIcon message="请先选择输入数据集" /> : <CategoryConfiguration templates={categoryTemplates.data} templateId={categoryTemplateId} scope="dataset" customCategories={customDatasetCategories} onTemplateChange={setCategoryTemplateId} onCustomChange={setCustomDatasetCategories} />}</Card></Col>
         <Col span={24}><div className="wizard-actions"><Button onClick={() => setStep(0)}>上一步</Button><Button type="primary" disabled={!categoriesReady || (source.id === 'local-import' ? localDatasetName.trim().length < 2 || !localImageFiles.length : isBaseGen ? !currentBasegenDomain || generatorSeed < 0 || generatorSteps < 1 : isCondition ? !inputDatasetId : !seeds.length)} onClick={() => setStep(2)}>下一步：{source.id === 'local-import' ? '导入确认' : '组合预览'}</Button></div></Col>
