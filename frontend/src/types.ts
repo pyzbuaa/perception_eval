@@ -98,6 +98,8 @@ export interface DetectionBox {
   y: number
   width: number
   height: number
+  confidence?: number
+  source?: 'AUTO_MODEL' | 'MANUAL'
 }
 
 export interface AnnotationSession {

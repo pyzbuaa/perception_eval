@@ -22,6 +22,7 @@ from app.schemas import (
     AcquisitionRequest,
     AdapterRegistrationRequest,
     AnnotationSchemaUpdate,
+    AutoAnnotationRequest,
     DatasetImportRequest,
     EvaluationPlanRequest,
     LocalDetectorModelRequest,
@@ -238,7 +239,7 @@ def put_image_annotations(
         result = save_sample_annotation(
             dataset_id,
             sample_name,
-            request.model_dump(),
+            request.model_dump(exclude_none=True),
         )
     except (DatasetAnnotationError, DatasetArtifactError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -256,6 +257,39 @@ def complete_annotations(dataset_id: str) -> dict[str, Any]:
     if not result:
         raise HTTPException(status_code=404, detail="数据集不存在")
     return result
+
+
+@app.post("/api/datasets/{dataset_id}/auto-annotations", status_code=202)
+def create_auto_annotations(
+    dataset_id: str,
+    request: AutoAnnotationRequest,
+) -> dict[str, Any]:
+    dataset = db.row("SELECT * FROM datasets WHERE id=?", (dataset_id,))
+    if not dataset:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    if dataset["frozen"]:
+        raise HTTPException(status_code=409, detail="冻结数据集不能执行自动标注")
+    if dataset["annotation_status"] not in {"UNLABELED", "ANNOTATING"}:
+        raise HTTPException(
+            status_code=409,
+            detail="自动标注仅支持未标注或正在标注的数据集",
+        )
+    model = db.row("SELECT * FROM models WHERE id=?", (request.model_id,))
+    if not model:
+        raise HTTPException(status_code=404, detail="检测模型不存在")
+    if model["is_demo"] or model["status"] == "UNAVAILABLE":
+        raise HTTPException(status_code=409, detail="请选择可用的真实检测模型")
+    adapter = db.row("SELECT kind FROM adapters WHERE id=?", (model["adapter_id"],))
+    if not adapter or adapter["kind"] != "DETECTOR":
+        raise HTTPException(status_code=409, detail="模型没有可用的检测适配器")
+    try:
+        validate_evaluation_categories([dataset_id], [request.model_id])
+    except CategoryCompatibilityError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return queue_job(
+        "AUTO_ANNOTATION",
+        {"dataset_id": dataset_id, **request.model_dump()},
+    )
 
 
 @app.post("/api/datasets/import", status_code=202)
@@ -594,6 +628,12 @@ def create_plan(request: EvaluationPlanRequest) -> dict[str, Any]:
         "batch_size": request.batch_size,
         "precision": request.precision,
         "warmup": request.warmup,
+        "confidence": request.confidence,
+        "nms_iou": request.nms_iou,
+        "image_size": request.image_size,
+        "input_height": request.input_height,
+        "input_width": request.input_width,
+        "max_detections": request.max_detections,
         "timing": "cuda-synchronized",
         "official": False,
     }

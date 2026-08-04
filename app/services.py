@@ -15,7 +15,11 @@ from urllib.parse import quote
 from PIL import Image
 
 from app.category_templates import normalize_categories, normalize_category_name
-from app.command_protocol import CommandTemplateError, validate_command_arguments
+from app.command_protocol import (
+    CommandTemplateError,
+    command_placeholders,
+    validate_command_arguments,
+)
 from app.config import settings
 from app.db import (
     Database,
@@ -377,6 +381,7 @@ def register_local_detector_model(
         raise LocalModelRegistrationError(f"Python 解释器没有执行权限: {executable}")
     try:
         validate_command_arguments(values["command_arguments"])
+        placeholders = command_placeholders(values["command_arguments"])
     except CommandTemplateError as exc:
         raise LocalModelRegistrationError(str(exc)) from exc
     try:
@@ -387,6 +392,30 @@ def register_local_detector_model(
     adapter_id = new_id("adapter")
     model_id = new_id("model")
     now = utc_now()
+    defaults = {
+        "confidence": 0.25,
+        "nms_iou": 0.7,
+        "image_size": 1280,
+        "input_height": 960,
+        "input_width": 1280,
+        "max_detections": 300,
+        "batch_size": 1,
+        "warmup": 0,
+        **values.get("inference_defaults", {}),
+    }
+    inference_properties = {
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "nms_iou": {"type": "number", "minimum": 0, "maximum": 1},
+        "image_size": {"type": "integer", "minimum": 32, "maximum": 8192},
+        "input_height": {"type": "integer", "minimum": 32, "maximum": 8192},
+        "input_width": {"type": "integer", "minimum": 32, "maximum": 8192},
+        "max_detections": {"type": "integer", "minimum": 1, "maximum": 5000},
+        "batch_size": {"type": "integer", "minimum": 1, "maximum": 64},
+        "warmup": {"type": "integer", "minimum": 0, "maximum": 200},
+    }
+    for name, specification in inference_properties.items():
+        if name in placeholders:
+            specification["default"] = defaults[name]
     parameter_schema = {
         "type": "object",
         "properties": {
@@ -398,6 +427,22 @@ def register_local_detector_model(
                 "type": "string",
                 "const": str(project_directory),
             },
+            **{
+                name: specification
+                for name, specification in inference_properties.items()
+                if name in placeholders
+            },
+            **(
+                {
+                    "precision": {
+                        "type": "string",
+                        "enum": ["FP16", "FP32"],
+                        "default": values["precision"],
+                    }
+                }
+                if "precision" in placeholders
+                else {}
+            ),
         },
         "execution": {
             "mode": "command",

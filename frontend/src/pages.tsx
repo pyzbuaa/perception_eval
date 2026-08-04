@@ -32,6 +32,7 @@ import {
   Table,
   Tag,
   Timeline,
+  Tooltip,
   Typography,
   message,
 } from 'antd'
@@ -51,6 +52,7 @@ import {
   LockOutlined,
   PlayCircleOutlined,
   PlusOutlined,
+  QuestionCircleOutlined,
   ReloadOutlined,
   RightOutlined,
   RobotOutlined,
@@ -103,6 +105,45 @@ function validCategories(categories: CategoryDefinition[]) {
     && new Set(ids).size === ids.length
     && new Set(names).size === names.length
   )
+}
+
+function categoryCompatibilityIssue(dataset: Dataset, model: ModelVersion) {
+  if (!dataset.categories.length || !model.categories.length) return '类别尚未配置'
+  const datasetNames = new Set(dataset.categories.map((item) => item.name.trim().toLocaleLowerCase()))
+  const modelNames = new Set(model.categories.map((item) => item.name.trim().toLocaleLowerCase()))
+  const missing = dataset.categories.filter((item) => !modelNames.has(item.name.trim().toLocaleLowerCase())).map((item) => item.name)
+  const extra = model.categories.filter((item) => !datasetNames.has(item.name.trim().toLocaleLowerCase())).map((item) => item.name)
+  if (missing.length) return `模型缺少：${missing.join('、')}`
+  if (extra.length) return `模型包含数据集未登记类别：${extra.join('、')}`
+  return ''
+}
+
+type InferenceProperty = { default?: string | number; const?: string | number }
+
+const inferenceParameterLabels: Record<string, string> = {
+  confidence: '置信度',
+  nms_iou: 'NMS IoU',
+  image_size: '方形推理尺寸',
+  input_height: '输入高度',
+  input_width: '输入宽度',
+  max_detections: '最大检测数',
+  batch_size: '批大小',
+  warmup: '预热次数',
+  precision: '推理精度',
+}
+
+function modelInferenceProperties(model: ModelVersion | undefined, adapters: Adapter[]) {
+  const adapter = model && adapters.find((item) => item.id === model.adapter_id)
+  return (adapter?.parameter_schema?.properties || {}) as Record<string, InferenceProperty>
+}
+
+function inferenceDefault(
+  properties: Record<string, InferenceProperty>,
+  name: string,
+  fallback: number,
+) {
+  const value = properties[name]?.const ?? properties[name]?.default
+  return typeof value === 'number' ? value : fallback
 }
 
 function CategoryConfiguration({
@@ -1235,7 +1276,7 @@ function AnnotationWorkspace({ dataset, onClose, onChanged }: { dataset?: Datase
                     const selected = box.id === selectedBoxId
                     return <g key={box.id}>
                       <rect x={box.x} y={box.y} width={box.width} height={box.height} fill={`${category?.color || '#1677FF'}20`} stroke={category?.color || '#1677FF'} strokeWidth={selected ? 4 : 2} vectorEffect="non-scaling-stroke" onPointerDown={(event) => beginMove(event, box)} />
-                      <text x={box.x + 3} y={Math.max(14, box.y + 15)} fill="#fff" stroke="#000" strokeWidth={3} paintOrder="stroke" fontSize={14} pointerEvents="none">{category?.name || box.category_id}</text>
+                      <text x={box.x + 3} y={Math.max(14, box.y + 15)} fill="#fff" stroke="#000" strokeWidth={3} paintOrder="stroke" fontSize={14} pointerEvents="none">{category?.name || box.category_id}{box.confidence !== undefined ? ` ${(box.confidence * 100).toFixed(0)}%` : ''}</text>
                       {selected && editable && (['nw', 'ne', 'sw', 'se'] as const).map((handle) => {
                         const x = handle.includes('w') ? box.x : box.x + box.width
                         const y = handle.includes('n') ? box.y : box.y + box.height
@@ -1323,11 +1364,137 @@ function DatasetStatisticsPanel({ datasetId, dark }: { datasetId: string; dark: 
   </Space>
 }
 
-export function DatasetsPage({ dark }: PageProps) {
+function AutoAnnotationModal({
+  dataset,
+  models,
+  adapters,
+  onClose,
+  onCompleted,
+  onOpenAnnotations,
+  onOpenTasks,
+}: {
+  dataset?: Dataset
+  models: ModelVersion[]
+  adapters: Adapter[]
+  onClose: () => void
+  onCompleted: () => void
+  onOpenAnnotations: (dataset: Dataset) => void
+  onOpenTasks: () => void
+}) {
+  const availableModels = models.filter((model) => !model.is_demo && model.status !== 'UNAVAILABLE')
+  const [modelId, setModelId] = useState('')
+  const [confidence, setConfidence] = useState(0.25)
+  const [nmsIou, setNmsIou] = useState(0.7)
+  const [imageSize, setImageSize] = useState(1280)
+  const [inputHeight, setInputHeight] = useState(960)
+  const [inputWidth, setInputWidth] = useState(1280)
+  const [maxDetections, setMaxDetections] = useState(300)
+  const [batchSize, setBatchSize] = useState(1)
+  const [warmup, setWarmup] = useState(0)
+  const [precision, setPrecision] = useState<'FP16' | 'FP32'>('FP16')
+  const [submitting, setSubmitting] = useState(false)
+  const [jobId, setJobId] = useState<string>()
+  const [finishedJob, setFinishedJob] = useState<Job>()
+  const selectedModel = availableModels.find((model) => model.id === modelId)
+  const inferenceProperties = modelInferenceProperties(selectedModel, adapters)
+  const supports = (name: string) => Boolean(inferenceProperties[name])
+  const compatibilityIssue = dataset && selectedModel ? categoryCompatibilityIssue(dataset, selectedModel) : ''
+
+  useEffect(() => {
+    setModelId('')
+    setJobId(undefined)
+    setFinishedJob(undefined)
+  }, [dataset?.id])
+
+  const selectModel = (value: string) => {
+    setModelId(value)
+    const model = availableModels.find((item) => item.id === value)
+    const properties = modelInferenceProperties(model, adapters)
+    setPrecision(model?.precision === 'FP32' ? 'FP32' : 'FP16')
+    setConfidence(inferenceDefault(properties, 'confidence', 0.25))
+    setNmsIou(inferenceDefault(properties, 'nms_iou', 0.7))
+    setImageSize(inferenceDefault(properties, 'image_size', 1280))
+    setInputHeight(inferenceDefault(properties, 'input_height', 960))
+    setInputWidth(inferenceDefault(properties, 'input_width', 1280))
+    setMaxDetections(inferenceDefault(properties, 'max_detections', 300))
+    setBatchSize(inferenceDefault(properties, 'batch_size', 1))
+    setWarmup(inferenceDefault(properties, 'warmup', 0))
+  }
+  const submit = async () => {
+    if (!dataset || !modelId || compatibilityIssue) return
+    setSubmitting(true)
+    try {
+      const job = await post<Job>(`/api/datasets/${dataset.id}/auto-annotations`, {
+        model_id: modelId,
+        confidence,
+        nms_iou: nmsIou,
+        image_size: imageSize,
+        input_height: inputHeight,
+        input_width: inputWidth,
+        max_detections: maxDetections,
+        batch_size: batchSize,
+        warmup,
+        precision,
+      })
+      setJobId(job.id)
+      message.success('自动标注任务已提交')
+    } catch (error) {
+      message.error((error as Error).message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+  const finish = useCallback((job: Job) => {
+    setFinishedJob(job)
+    if (job.status === 'SUCCEEDED') {
+      message.success('候选框已生成，请逐图人工确认')
+      onCompleted()
+    }
+  }, [onCompleted])
+
+  return (
+    <Modal open={Boolean(dataset)} width={720} title={dataset ? `自动标注 · ${dataset.name}` : '自动标注'} onCancel={onClose} footer={null} destroyOnClose>
+      {!jobId ? <Space direction="vertical" size={16} style={{ width: '100%' }}>
+        <Alert type="info" showIcon message="模型预测只作为候选标注" description="只处理尚无标注记录的图片，不覆盖人工标注；生成后每张图片仍需人工确认，才能导出COCO真值。" />
+        <Form layout="vertical">
+          <Form.Item label="闭集检测模型" required>
+            <Select value={modelId || undefined} onChange={selectModel} placeholder="选择已注册的真实检测模型" optionFilterProp="label" options={availableModels.map((model) => {
+              const issue = dataset ? categoryCompatibilityIssue(dataset, model) : ''
+              return { value: model.id, label: `${model.name} · ${model.version}${issue ? `（${issue}）` : ''}`, disabled: Boolean(issue) }
+            })} />
+          </Form.Item>
+          {!availableModels.length && <Alert type="warning" showIcon message="没有可用的真实检测模型" description="请先在模型版本页面注册本地检测模型。" />}
+          {compatibilityIssue && <Alert type="error" showIcon message="模型与数据集类别不兼容" description={compatibilityIssue} />}
+          <Row gutter={16} className="top-gap">
+            {supports('confidence') && <Col span={12}><Form.Item label={`置信度阈值 ${confidence.toFixed(2)}`}><Slider min={0.01} max={1} step={0.01} value={confidence} onChange={setConfidence} marks={{ 0.01: '宽松', 0.5: '中等', 1: '严格' }} /></Form.Item></Col>}
+            {supports('nms_iou') && <Col span={12}><Form.Item label={`NMS IoU阈值 ${nmsIou.toFixed(2)}`}><Slider min={0.1} max={1} step={0.05} value={nmsIou} onChange={setNmsIou} marks={{ 0.1: '抑制强', 0.7: '默认', 1: '抑制弱' }} /></Form.Item></Col>}
+            {supports('image_size') && <Col span={8}><Form.Item label="方形推理尺寸"><InputNumber min={32} max={8192} step={32} value={imageSize} onChange={(value) => setImageSize(value || 32)} style={{ width: '100%' }} /></Form.Item></Col>}
+            {supports('input_height') && <Col span={8}><Form.Item label="输入高度"><InputNumber min={32} max={8192} step={32} value={inputHeight} onChange={(value) => setInputHeight(value || 32)} style={{ width: '100%' }} /></Form.Item></Col>}
+            {supports('input_width') && <Col span={8}><Form.Item label="输入宽度"><InputNumber min={32} max={8192} step={32} value={inputWidth} onChange={(value) => setInputWidth(value || 32)} style={{ width: '100%' }} /></Form.Item></Col>}
+            {supports('max_detections') && <Col span={8}><Form.Item label="每图最大检测数"><InputNumber min={1} max={5000} precision={0} value={maxDetections} onChange={(value) => setMaxDetections(value || 1)} style={{ width: '100%' }} /></Form.Item></Col>}
+            {supports('batch_size') && <Col span={8}><Form.Item label="批大小"><InputNumber min={1} max={64} value={batchSize} onChange={(value) => setBatchSize(value || 1)} style={{ width: '100%' }} /></Form.Item></Col>}
+            {supports('warmup') && <Col span={8}><Form.Item label="预热次数"><InputNumber min={0} max={200} value={warmup} onChange={(value) => setWarmup(value || 0)} style={{ width: '100%' }} /></Form.Item></Col>}
+            <Col span={8}><Form.Item label="推理精度"><Select value={precision} onChange={setPrecision} options={[{ value: 'FP16' }, { value: 'FP32' }]} /></Form.Item></Col>
+          </Row>
+        </Form>
+        <Space><Button type="primary" icon={<RobotOutlined />} loading={submitting} disabled={!modelId || Boolean(compatibilityIssue)} onClick={submit}>启动自动标注</Button><Button onClick={onClose}>取消</Button></Space>
+      </Space> : <Space direction="vertical" size={16} style={{ width: '100%' }}>
+        <JobProgress jobId={jobId} onFinish={finish} />
+        {finishedJob?.status === 'SUCCEEDED' && dataset && <Result status="success" title="候选标注已写入" subTitle={`${String(finishedJob.result?.annotated_images ?? 0)} 张图片，${String(finishedJob.result?.accepted_boxes ?? 0)} 个候选框；请进入标注工作区逐图确认。`} extra={<Button type="primary" onClick={() => onOpenAnnotations(dataset)}>打开标注工作区</Button>} />}
+        <Button onClick={onOpenTasks}>前往任务中心</Button>
+      </Space>}
+    </Modal>
+  )
+}
+
+export function DatasetsPage({ dark, navigate }: PageProps) {
   const { data, loading, reload } = useResource<Dataset[]>('/api/datasets', [])
+  const models = useResource<ModelVersion[]>('/api/models', [])
+  const adapters = useResource<Adapter[]>('/api/adapters', [])
   const [selected, setSelected] = useState<Dataset>()
   const [browserDataset, setBrowserDataset] = useState<Dataset>()
   const [annotationDataset, setAnnotationDataset] = useState<Dataset>()
+  const [autoAnnotationDataset, setAutoAnnotationDataset] = useState<Dataset>()
   const freeze = async (dataset: Dataset) => {
     try { await post(`/api/datasets/${dataset.id}/freeze`); message.success('数据版本已冻结'); reload() } catch (error) { message.error((error as Error).message) }
   }
@@ -1348,8 +1515,8 @@ export function DatasetsPage({ dark }: PageProps) {
     { title: '分辨率', dataIndex: 'resolution' }, { title: '样本', dataIndex: 'sample_count' },
     { title: '真值', dataIndex: 'annotation_status', render: (value) => <StatusTag status={value} /> },
     { title: '版本', render: (_, row) => row.frozen ? <Tag icon={<LockOutlined />} color="success">{row.version} 已冻结</Tag> : <Tag>草稿</Tag> },
-    { title: '操作', render: (_, row) => <Space><Button type="link" onClick={() => setSelected(row)}>查看</Button><Button type="link" icon={<FileImageOutlined />} onClick={() => setBrowserDataset(row)}>浏览全部</Button><Button type="link" onClick={() => setAnnotationDataset(row)}>{row.frozen ? '查看标注' : '目标标注'}</Button>{!row.frozen && <Button type="link" onClick={() => freeze(row)}>冻结</Button>}{!row.frozen && <Popconfirm title="确认删除这个数据集？" description={`${row.name} · ${row.sample_count} 个样本将移入回收站。`} okText="移入回收站" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => remove(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm>}</Space> },
-      ]} /></Card><Drawer open={Boolean(selected)} width={1040} title={selected?.name} onClose={() => setSelected(undefined)}>{selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Gallery images={selected.preview_images} height={140} /><Button block icon={<FileImageOutlined />} onClick={() => { setSelected(undefined); setBrowserDataset(selected) }}>浏览全部图片</Button><Button block onClick={() => { setSelected(undefined); setAnnotationDataset(selected) }}>{selected.frozen ? '查看目标检测标注' : '开始目标检测标注'}</Button><Descriptions bordered column={2} items={[{ key: 'source', label: '来源', children: selected.source_type }, { key: 'scene', label: '场景', children: selected.scene_domain }, { key: 'weather', label: '天气', children: selected.weather }, { key: 'resolution', label: '分辨率', children: selected.resolution }, { key: 'truth', label: '真值', children: <StatusTag status={selected.annotation_status} /> }, { key: 'frozen', label: '不可变', children: selected.frozen ? '是' : '否' }, ...motionBlurDatasetItems(selected), { key: 'categories', label: '检测类别', children: selected.categories.length ? <Space wrap>{selected.categories.map((item) => <Tag key={item.id}>{item.id}:{item.name}</Tag>)}</Space> : <Tag color="warning">待配置</Tag>, span: 2 }]} /><Divider>数据统计</Divider><DatasetStatisticsPanel datasetId={selected.id} dark={dark} /><Alert type="info" showIcon message="数据谱系" description="所有样本均记录来源、条件、seed、Adapter 版本和文件摘要。流程样例不会被标记为正式生成数据。" /></Space>}</Drawer><DatasetBrowser dataset={browserDataset} onClose={() => setBrowserDataset(undefined)} /><AnnotationWorkspace dataset={annotationDataset} onClose={() => setAnnotationDataset(undefined)} onChanged={reload} /></>
+    { title: '操作', render: (_, row) => <Space><Button type="link" onClick={() => setSelected(row)}>查看</Button><Button type="link" icon={<FileImageOutlined />} onClick={() => setBrowserDataset(row)}>浏览全部</Button><Button type="link" onClick={() => setAnnotationDataset(row)}>{row.frozen ? '查看标注' : '目标标注'}</Button>{!row.frozen && ['UNLABELED', 'ANNOTATING'].includes(row.annotation_status) && <Button type="link" icon={<RobotOutlined />} onClick={() => setAutoAnnotationDataset(row)}>自动标注</Button>}{!row.frozen && <Button type="link" onClick={() => freeze(row)}>冻结</Button>}{!row.frozen && <Popconfirm title="确认删除这个数据集？" description={`${row.name} · ${row.sample_count} 个样本将移入回收站。`} okText="移入回收站" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => remove(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm>}</Space> },
+      ]} /></Card><Drawer open={Boolean(selected)} width={1040} title={selected?.name} onClose={() => setSelected(undefined)}>{selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Gallery images={selected.preview_images} height={140} /><Button block icon={<FileImageOutlined />} onClick={() => { setSelected(undefined); setBrowserDataset(selected) }}>浏览全部图片</Button><Button block onClick={() => { setSelected(undefined); setAnnotationDataset(selected) }}>{selected.frozen ? '查看目标检测标注' : '开始目标检测标注'}</Button>{!selected.frozen && ['UNLABELED', 'ANNOTATING'].includes(selected.annotation_status) && <Button block type="primary" icon={<RobotOutlined />} onClick={() => setAutoAnnotationDataset(selected)}>使用检测模型自动标注</Button>}<Descriptions bordered column={2} items={[{ key: 'source', label: '来源', children: selected.source_type }, { key: 'scene', label: '场景', children: selected.scene_domain }, { key: 'weather', label: '天气', children: selected.weather }, { key: 'resolution', label: '分辨率', children: selected.resolution }, { key: 'truth', label: '真值', children: <StatusTag status={selected.annotation_status} /> }, { key: 'frozen', label: '不可变', children: selected.frozen ? '是' : '否' }, ...motionBlurDatasetItems(selected), { key: 'categories', label: '检测类别', children: selected.categories.length ? <Space wrap>{selected.categories.map((item) => <Tag key={item.id}>{item.id}:{item.name}</Tag>)}</Space> : <Tag color="warning">待配置</Tag>, span: 2 }]} /><Divider>数据统计</Divider><DatasetStatisticsPanel datasetId={selected.id} dark={dark} /><Alert type="info" showIcon message="数据谱系" description="所有样本均记录来源、条件、seed、Adapter 版本和文件摘要。流程样例不会被标记为正式生成数据。" /></Space>}</Drawer><DatasetBrowser dataset={browserDataset} onClose={() => setBrowserDataset(undefined)} /><AnnotationWorkspace dataset={annotationDataset} onClose={() => setAnnotationDataset(undefined)} onChanged={reload} /><AutoAnnotationModal dataset={autoAnnotationDataset} models={models.data} adapters={adapters.data} onClose={() => setAutoAnnotationDataset(undefined)} onCompleted={reload} onOpenAnnotations={(dataset) => { setAutoAnnotationDataset(undefined); setSelected(undefined); setAnnotationDataset(dataset) }} onOpenTasks={() => navigate('tasks')} /></>
 }
 
 type LocalResourceKind = 'directory' | 'entrypoint' | 'weight'
@@ -1453,6 +1620,16 @@ interface LocalModelDraft {
   working_directory: string
   runtime_prefix: string
   command_arguments: string
+  inference_defaults: {
+    confidence: number
+    nms_iou: number
+    image_size: number
+    input_height: number
+    input_width: number
+    max_detections: number
+    batch_size: number
+    warmup: number
+  }
   weight_path: string
 }
 
@@ -1470,6 +1647,16 @@ const emptyLocalModelDraft = (): LocalModelDraft => ({
   working_directory: '',
   runtime_prefix: '',
   command_arguments: '',
+  inference_defaults: {
+    confidence: 0.25,
+    nms_iou: 0.7,
+    image_size: 1280,
+    input_height: 960,
+    input_width: 1280,
+    max_detections: 300,
+    batch_size: 1,
+    warmup: 0,
+  },
   weight_path: '',
 })
 
@@ -1492,7 +1679,11 @@ export function RegistryPage({ refresh }: PageProps) {
   }>()
   const setField = <K extends keyof LocalModelDraft>(field: K, value: LocalModelDraft[K]) =>
     setDraft((current) => ({ ...current, [field]: value }))
+  const setInferenceDefault = (field: keyof LocalModelDraft['inference_defaults'], value: number | null) =>
+    setDraft((current) => ({ ...current, inference_defaults: { ...current.inference_defaults, [field]: value ?? 0 } }))
+  const commandSupports = (name: string) => draft.command_arguments.includes(`{${name}}`)
   const modelCategories = categoriesFromSelection(categoryTemplates.data, categoryTemplateId, 'model', customModelCategories)
+  const selectedInferenceProperties = modelInferenceProperties(selectedModel, adapters.data)
   const selectResource = (path: string) => {
     if (!picker) return
     if (picker.field === 'project_directory') {
@@ -1611,15 +1802,14 @@ export function RegistryPage({ refresh }: PageProps) {
             <Col span={8}><Form.Item label="模型架构" required><Input value={draft.architecture} onChange={(event) => setField('architecture', event.target.value)} maxLength={80} placeholder="例如 DETR" /></Form.Item></Col>
             <Col span={8}><Form.Item label="Backbone" required><Input value={draft.backbone} onChange={(event) => setField('backbone', event.target.value)} maxLength={80} placeholder="例如 HGNetv2-B2" /></Form.Item></Col>
             <Col span={8}><Form.Item label="检测头" required><Input value={draft.detector_head} onChange={(event) => setField('detector_head', event.target.value)} maxLength={80} placeholder="例如 D-FINE Transformer" /></Form.Item></Col>
-            <Col span={12}><Form.Item label="版本"><Input value={draft.version} onChange={(event) => setField('version', event.target.value)} maxLength={40} /></Form.Item></Col>
-            <Col span={12}><Form.Item label="精度"><Select value={draft.precision} onChange={(value) => setField('precision', value)} options={[{ value: 'FP16' }, { value: 'FP32' }]} /></Form.Item></Col>
+            <Col span={24}><Form.Item label="版本"><Input value={draft.version} onChange={(event) => setField('version', event.target.value)} maxLength={40} /></Form.Item></Col>
             <Col span={12}><Form.Item label="训练数据" required><Input value={draft.training_dataset} onChange={(event) => setField('training_dataset', event.target.value)} maxLength={120} placeholder="例如 VisDrone2019-DET" /></Form.Item></Col>
             <Col span={12}><Form.Item label="预训练数据" required><Input value={draft.pretrained_dataset} onChange={(event) => setField('pretrained_dataset', event.target.value)} maxLength={120} placeholder="例如 Objects365；没有则填写无" /></Form.Item></Col>
           </Row>
           <Form.Item label={`检测类别（${modelCategories.length} 类）`} required>
             <CategoryConfiguration templates={categoryTemplates.data} templateId={categoryTemplateId} scope="model" customCategories={customModelCategories} onTemplateChange={setCategoryTemplateId} onCustomChange={setCustomModelCategories} />
           </Form.Item>
-          <Form.Item label="模型项目目录" required>
+          <Form.Item label={<>模型项目目录 <Typography.Text code>{'{project_directory}'}</Typography.Text></>} required>
             <Space.Compact block>
               <Input readOnly value={draft.project_directory} placeholder="从服务器模型库选择目录" />
               <Button onClick={() => setPicker({ field: 'project_directory', title: '选择模型项目目录', scope: 'model', kind: 'directory', initialPath: draft.project_directory || undefined })}>选择目录</Button>
@@ -1637,14 +1827,14 @@ export function RegistryPage({ refresh }: PageProps) {
               <Button onClick={() => setPicker({ field: 'runtime_prefix', title: '选择 Conda 环境目录', scope: 'environment', kind: 'directory' })}>选择环境</Button>
             </Space.Compact>
           </Form.Item>
-          <Form.Item label="模型权重" required>
+          <Form.Item label={<>模型权重 <Typography.Text code>{'{weight_path}'}</Typography.Text></>} required>
             <Space.Compact block>
               <Input readOnly value={draft.weight_path} placeholder="选择模型权重文件" />
               <Button disabled={!draft.project_directory} onClick={() => setPicker({ field: 'weight_path', title: '选择模型权重', scope: 'model', kind: 'weight', initialPath: draft.project_directory || undefined })}>选择权重</Button>
             </Space.Compact>
           </Form.Item>
           <Form.Item
-            label="命令参数"
+            label={<Space size={6}>命令参数<Tooltip placement="right" title={<div><div>每行填写一个参数，平台不会经过Shell。</div><div>运行任务时，平台会把 {'{placeholder}'} 替换为当前模型、数据集和推理任务的实际值。</div><div>D-FINE入口脚本、config和固定数值直接填写，不加大括号。</div></div>}><QuestionCircleOutlined aria-label="命令参数说明" style={{ color: '#1677ff', cursor: 'help' }} /></Tooltip></Space>}
             required
             extra="每行一个参数。参数会原样传给可执行程序，不要输入整段 Shell 命令。"
           >
@@ -1655,8 +1845,21 @@ export function RegistryPage({ refresh }: PageProps) {
               placeholder={'tools/evaluate.py\n--weights\n{weight_path}\n--images\n{image_directory}\n--annotations\n{annotation_path}\n--output\n{predictions_path}'}
             />
           </Form.Item>
+          <Card size="small" title="推理参数默认值" extra={<Typography.Text type="secondary">命令包含对应占位符后启用；任务阶段可以覆盖</Typography.Text>}>
+            <Row gutter={12}>
+              <Col span={8}><Form.Item label="推理精度"><Select disabled={!commandSupports('precision')} value={draft.precision} onChange={(value) => setField('precision', value)} options={[{ value: 'FP16' }, { value: 'FP32' }]} /></Form.Item></Col>
+              <Col span={8}><Form.Item label="置信度"><InputNumber disabled={!commandSupports('confidence')} min={0} max={1} step={0.01} value={draft.inference_defaults.confidence} onChange={(value) => setInferenceDefault('confidence', value)} style={{ width: '100%' }} /></Form.Item></Col>
+              <Col span={8}><Form.Item label="NMS IoU"><InputNumber disabled={!commandSupports('nms_iou')} min={0} max={1} step={0.05} value={draft.inference_defaults.nms_iou} onChange={(value) => setInferenceDefault('nms_iou', value)} style={{ width: '100%' }} /></Form.Item></Col>
+              <Col span={8}><Form.Item label="方形推理尺寸"><InputNumber disabled={!commandSupports('image_size')} min={32} max={8192} step={32} value={draft.inference_defaults.image_size} onChange={(value) => setInferenceDefault('image_size', value)} style={{ width: '100%' }} /></Form.Item></Col>
+              <Col span={8}><Form.Item label="输入高度"><InputNumber disabled={!commandSupports('input_height')} min={32} max={8192} step={32} value={draft.inference_defaults.input_height} onChange={(value) => setInferenceDefault('input_height', value)} style={{ width: '100%' }} /></Form.Item></Col>
+              <Col span={8}><Form.Item label="输入宽度"><InputNumber disabled={!commandSupports('input_width')} min={32} max={8192} step={32} value={draft.inference_defaults.input_width} onChange={(value) => setInferenceDefault('input_width', value)} style={{ width: '100%' }} /></Form.Item></Col>
+              <Col span={8}><Form.Item label="每图最大检测数"><InputNumber disabled={!commandSupports('max_detections')} min={1} max={5000} value={draft.inference_defaults.max_detections} onChange={(value) => setInferenceDefault('max_detections', value)} style={{ width: '100%' }} /></Form.Item></Col>
+              <Col span={8}><Form.Item label="批大小"><InputNumber disabled={!commandSupports('batch_size')} min={1} max={64} value={draft.inference_defaults.batch_size} onChange={(value) => setInferenceDefault('batch_size', value)} style={{ width: '100%' }} /></Form.Item></Col>
+              <Col span={8}><Form.Item label="预热次数"><InputNumber disabled={!commandSupports('warmup')} min={0} max={200} value={draft.inference_defaults.warmup} onChange={(value) => setInferenceDefault('warmup', value)} style={{ width: '100%' }} /></Form.Item></Col>
+            </Row>
+          </Card>
           <Typography.Paragraph type="secondary">
-            可用占位符：<Typography.Text code>{'{weight_path}'}</Typography.Text> <Typography.Text code>{'{image_directory}'}</Typography.Text> <Typography.Text code>{'{annotation_path}'}</Typography.Text> <Typography.Text code>{'{predictions_path}'}</Typography.Text> <Typography.Text code>{'{output_directory}'}</Typography.Text> <Typography.Text code>{'{device}'}</Typography.Text> <Typography.Text code>{'{precision}'}</Typography.Text> <Typography.Text code>{'{request_path}'}</Typography.Text> <Typography.Text code>{'{result_path}'}</Typography.Text>
+            可用占位符：模型权重 <Typography.Text code>{'{weight_path}'}</Typography.Text> · 模型项目目录 <Typography.Text code>{'{project_directory}'}</Typography.Text> · 图片目录 <Typography.Text code>{'{image_directory}'}</Typography.Text> · 标注文件 <Typography.Text code>{'{annotation_path}'}</Typography.Text> · 预测结果 <Typography.Text code>{'{predictions_path}'}</Typography.Text> · 输出目录 <Typography.Text code>{'{output_directory}'}</Typography.Text> · 设备 <Typography.Text code>{'{device}'}</Typography.Text> · 推理精度 <Typography.Text code>{'{precision}'}</Typography.Text> · 批大小 <Typography.Text code>{'{batch_size}'}</Typography.Text> · 置信度 <Typography.Text code>{'{confidence}'}</Typography.Text> · NMS阈值 <Typography.Text code>{'{nms_iou}'}</Typography.Text> · 方形推理尺寸 <Typography.Text code>{'{image_size}'}</Typography.Text> · 输入高度 <Typography.Text code>{'{input_height}'}</Typography.Text> · 输入宽度 <Typography.Text code>{'{input_width}'}</Typography.Text> · 最大检测数 <Typography.Text code>{'{max_detections}'}</Typography.Text> · 预热次数 <Typography.Text code>{'{warmup}'}</Typography.Text> · 数据集ID <Typography.Text code>{'{dataset_id}'}</Typography.Text> · 模型ID <Typography.Text code>{'{model_id}'}</Typography.Text> · 请求文件 <Typography.Text code>{'{request_path}'}</Typography.Text> · 结果文件 <Typography.Text code>{'{result_path}'}</Typography.Text>
           </Typography.Paragraph>
           <Space>
             <Button type="primary" loading={registering} disabled={!ready} onClick={register}>注册模型</Button>
@@ -1686,6 +1889,7 @@ export function RegistryPage({ refresh }: PageProps) {
               { key: 'status', label: '状态', children: <StatusTag status={selectedModel.status} /> },
               { key: 'kind', label: '记录类型', children: selectedModel.is_demo ? <DemoTag /> : <Tag color="purple">本地真实模型</Tag> },
               { key: 'runtime', label: '运行环境', children: <StatusTag status={adapters.data.find((item) => item.id === selectedModel.adapter_id)?.status || (adapters.loading ? 'CHECKING' : 'UNAVAILABLE')} />, span: 2 },
+              { key: 'inference', label: '可变推理参数', children: Object.entries(selectedInferenceProperties).filter(([name]) => inferenceParameterLabels[name]).length ? <Space wrap>{Object.entries(selectedInferenceProperties).filter(([name]) => inferenceParameterLabels[name]).map(([name, specification]) => <Tag key={name}>{inferenceParameterLabels[name]}：{String(specification.default ?? specification.const ?? '任务指定')}</Tag>)}</Space> : <Tag>未声明</Tag>, span: 2 },
               { key: 'categories', label: '检测类别', children: selectedModel.categories.length ? <Space wrap>{selectedModel.categories.map((item) => <Tag key={item.id}>{item.id}:{item.name}</Tag>)}</Space> : <Tag color="warning">待配置</Tag>, span: 2 },
               { key: 'weight', label: '权重路径', children: selectedModel.weight_path ? <Typography.Text code copyable>{selectedModel.weight_path}</Typography.Text> : '未记录', span: 2 },
               { key: 'sha', label: '权重 SHA-256', children: selectedModel.weight_sha256 ? <Typography.Text code copyable>{selectedModel.weight_sha256}</Typography.Text> : '未记录', span: 2 },
@@ -1712,15 +1916,42 @@ export function RegistryPage({ refresh }: PageProps) {
 export function EvaluationPage({ navigate, refresh }: PageProps) {
   const datasets = useResource<Dataset[]>('/api/datasets', [])
   const models = useResource<ModelVersion[]>('/api/models', [])
+  const adapters = useResource<Adapter[]>('/api/adapters', [])
   const [datasetIds, setDatasetIds] = useState<string[]>([])
   const [modelIds, setModelIds] = useState<string[]>([])
   const [precision, setPrecision] = useState('FP16')
+  const [confidence, setConfidence] = useState(0.25)
+  const [nmsIou, setNmsIou] = useState(0.7)
+  const [imageSize, setImageSize] = useState(1280)
+  const [inputHeight, setInputHeight] = useState(960)
+  const [inputWidth, setInputWidth] = useState(1280)
+  const [maxDetections, setMaxDetections] = useState(300)
+  const [batchSize, setBatchSize] = useState(1)
+  const [warmup, setWarmup] = useState(0)
   const [jobId, setJobId] = useState<string>()
   const [submitting, setSubmitting] = useState(false)
   const selectedModels = models.data.filter((item) => modelIds.includes(item.id))
   const selectedDatasets = datasets.data.filter((item) => datasetIds.includes(item.id))
   const hasRealDetector = selectedModels.some((item) => !item.is_demo)
+  const selectedInferenceProperties = selectedModels.filter((item) => !item.is_demo).map((model) => modelInferenceProperties(model, adapters.data))
+  const supportsInference = (name: string) => selectedInferenceProperties.some((properties) => Boolean(properties[name]))
+  const selectedDefault = (name: string, fallback: number) => {
+    const properties = selectedInferenceProperties.find((item) => Boolean(item[name]))
+    return properties ? inferenceDefault(properties, name, fallback) : fallback
+  }
   useEffect(() => { if (hasRealDetector && precision === 'INT8') setPrecision('FP16') }, [hasRealDetector, precision])
+  useEffect(() => {
+    const properties = selectedInferenceProperties[0]
+    if (!properties) return
+    setConfidence(selectedDefault('confidence', 0.25))
+    setNmsIou(selectedDefault('nms_iou', 0.7))
+    setImageSize(selectedDefault('image_size', 1280))
+    setInputHeight(selectedDefault('input_height', 960))
+    setInputWidth(selectedDefault('input_width', 1280))
+    setMaxDetections(selectedDefault('max_detections', 300))
+    setBatchSize(selectedDefault('batch_size', 1))
+    setWarmup(selectedDefault('warmup', 0))
+  }, [modelIds.join(','), adapters.data])
   const count = datasetIds.length * modelIds.length
   const categoryIssues = selectedDatasets.flatMap((dataset) => selectedModels.flatMap((model) => {
     if (!dataset.categories.length || !model.categories.length) return [`${dataset.name} × ${model.name}：类别尚未配置`]
@@ -1731,7 +1962,7 @@ export function EvaluationPage({ navigate, refresh }: PageProps) {
     if (!missing.length && !extra.length) return []
     return [`${dataset.name} × ${model.name}：${missing.length ? `模型缺少 ${missing.join('、')}` : ''}${missing.length && extra.length ? '；' : ''}${extra.length ? `模型多出 ${extra.join('、')}` : ''}`]
   }))
-  const submit = async () => { setSubmitting(true); try { const plan = await post<{ id: string }>('/api/evaluation-plans', { name: `感知效能评测 ${new Date().toLocaleString('zh-CN')}`, dataset_ids: datasetIds, model_ids: modelIds, seeds: [1001], blur_levels: [0], batch_size: 1, precision, warmup: 0 }); const job = await post<Job>(`/api/evaluation-plans/${plan.id}/runs`); setJobId(job.id); refresh(); message.success('评测矩阵已提交') } catch (error) { message.error((error as Error).message) } finally { setSubmitting(false) } }
+  const submit = async () => { setSubmitting(true); try { const plan = await post<{ id: string }>('/api/evaluation-plans', { name: `感知效能评测 ${new Date().toLocaleString('zh-CN')}`, dataset_ids: datasetIds, model_ids: modelIds, seeds: [1001], blur_levels: [0], batch_size: batchSize, precision, warmup, confidence, nms_iou: nmsIou, image_size: imageSize, input_height: inputHeight, input_width: inputWidth, max_detections: maxDetections }); const job = await post<Job>(`/api/evaluation-plans/${plan.id}/runs`); setJobId(job.id); refresh(); message.success('评测矩阵已提交') } catch (error) { message.error((error as Error).message) } finally { setSubmitting(false) } }
   return <Space direction="vertical" size={18} style={{ width: '100%' }}>
     <Alert
       type={hasRealDetector ? 'info' : 'warning'}
@@ -1742,7 +1973,17 @@ export function EvaluationPage({ navigate, refresh }: PageProps) {
     <Row gutter={[16, 16]}>
       <Col xs={24} xl={12}><Card title="数据版本"><Select mode="multiple" value={datasetIds} onChange={setDatasetIds} optionFilterProp="label" style={{ width: '100%' }} options={datasets.data.map((item) => ({ value: item.id, label: `${item.name}${item.categories.length ? '' : '（类别待配置）'}`, disabled: !item.frozen || !item.categories.length }))} /><Divider /><Typography.Text type="secondary">真实检测要求数据集已冻结，并具有 COCO 或 VisDrone 目标框标注。</Typography.Text></Card></Col>
       <Col xs={24} xl={12}><Card title="模型版本"><Select mode="multiple" value={modelIds} onChange={setModelIds} style={{ width: '100%' }} options={models.data.map((item) => ({ value: item.id, label: `${item.name}${item.is_demo ? '（流程样例）' : '（真实推理）'}${item.categories.length ? '' : '（类别待配置）'}`, disabled: item.status === 'UNAVAILABLE' || !item.categories.length }))} /><Divider />{hasRealDetector ? <Tag color="purple">本地真实模型</Tag> : <Space><DemoTag /><Typography.Text type="secondary">可选择已注册的本地检测模型。</Typography.Text></Space>}</Card></Col>
-      <Col span={24}><Card title="标准化推理协议"><Form layout="vertical"><Form.Item label="精度模式"><Segmented block value={precision} onChange={(value) => setPrecision(String(value))} options={[{ value: 'FP32', label: 'FP32' }, { value: 'FP16', label: 'FP16' }, { value: 'INT8', label: 'INT8', disabled: hasRealDetector }]} /></Form.Item></Form></Card></Col>
+      <Col span={24}><Card title="本次推理参数" extra={<Typography.Text type="secondary">仅覆盖模型声明支持的参数；最终值写入运行记录</Typography.Text>}><Form layout="vertical"><Row gutter={16}>
+        <Col span={24}><Form.Item label="精度模式"><Segmented block value={precision} onChange={(value) => setPrecision(String(value))} options={[{ value: 'FP32', label: 'FP32' }, { value: 'FP16', label: 'FP16' }, { value: 'INT8', label: 'INT8', disabled: hasRealDetector }]} /></Form.Item></Col>
+        {supportsInference('confidence') && <Col xs={24} md={12}><Form.Item label={`置信度阈值 ${confidence.toFixed(2)}`}><Slider min={0.01} max={1} step={0.01} value={confidence} onChange={setConfidence} /></Form.Item></Col>}
+        {supportsInference('nms_iou') && <Col xs={24} md={12}><Form.Item label={`NMS IoU阈值 ${nmsIou.toFixed(2)}`}><Slider min={0.1} max={1} step={0.05} value={nmsIou} onChange={setNmsIou} /></Form.Item></Col>}
+        {supportsInference('image_size') && <Col xs={12} md={6}><Form.Item label="方形推理尺寸"><InputNumber min={32} max={8192} step={32} value={imageSize} onChange={(value) => setImageSize(value || 32)} style={{ width: '100%' }} /></Form.Item></Col>}
+        {supportsInference('input_height') && <Col xs={12} md={6}><Form.Item label="输入高度"><InputNumber min={32} max={8192} step={32} value={inputHeight} onChange={(value) => setInputHeight(value || 32)} style={{ width: '100%' }} /></Form.Item></Col>}
+        {supportsInference('input_width') && <Col xs={12} md={6}><Form.Item label="输入宽度"><InputNumber min={32} max={8192} step={32} value={inputWidth} onChange={(value) => setInputWidth(value || 32)} style={{ width: '100%' }} /></Form.Item></Col>}
+        {supportsInference('max_detections') && <Col xs={12} md={6}><Form.Item label="每图最大检测数"><InputNumber min={1} max={5000} value={maxDetections} onChange={(value) => setMaxDetections(value || 1)} style={{ width: '100%' }} /></Form.Item></Col>}
+        {supportsInference('batch_size') && <Col xs={12} md={6}><Form.Item label="批大小"><InputNumber min={1} max={64} value={batchSize} onChange={(value) => setBatchSize(value || 1)} style={{ width: '100%' }} /></Form.Item></Col>}
+        {supportsInference('warmup') && <Col xs={12} md={6}><Form.Item label="预热次数"><InputNumber min={0} max={200} value={warmup} onChange={(value) => setWarmup(value || 0)} style={{ width: '100%' }} /></Form.Item></Col>}
+      </Row></Form></Card></Col>
     </Row>
     {categoryIssues.length > 0 && <Alert type="error" showIcon message="类别不一致，无法启动评测" description={<Space direction="vertical" size={2}>{categoryIssues.map((item) => <Typography.Text key={item}>{item}</Typography.Text>)}</Space>} />}
     <Card className="matrix-preview"><Row align="middle" gutter={[18, 18]}><Col flex="auto"><Typography.Title level={4}>组合矩阵预览</Typography.Title><Typography.Text type="secondary">{datasetIds.length} 数据版本 × {modelIds.length} 模型</Typography.Text></Col><Col><Statistic value={count} suffix="次运行" /></Col><Col><Button type="primary" size="large" icon={<PlayCircleOutlined />} disabled={!count || categoryIssues.length > 0} loading={submitting} onClick={submit}>启动批量评测</Button></Col></Row></Card>

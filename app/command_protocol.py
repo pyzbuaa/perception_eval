@@ -12,6 +12,8 @@ COMMAND_PLACEHOLDERS = {
     "device",
     "image_directory",
     "image_size",
+    "input_height",
+    "input_width",
     "max_detections",
     "model_id",
     "nms_iou",
@@ -21,6 +23,7 @@ COMMAND_PLACEHOLDERS = {
     "project_directory",
     "request_path",
     "result_path",
+    "warmup",
     "weight_path",
 }
 
@@ -55,13 +58,24 @@ def validate_command_arguments(arguments: list[str]) -> None:
                 )
 
 
+def command_placeholders(arguments: list[str]) -> set[str]:
+    validate_command_arguments(arguments)
+    formatter = Formatter()
+    return {
+        field_name
+        for argument in arguments
+        for _, field_name, _, _ in formatter.parse(argument)
+        if field_name is not None
+    }
+
+
 def render_command(
     executable: str,
     arguments: list[str],
     values: dict[str, Any],
 ) -> list[str]:
-    validate_command_arguments(arguments)
-    missing = COMMAND_PLACEHOLDERS.difference(values)
+    used = command_placeholders(arguments)
+    missing = used.difference(values)
     if missing:
         raise CommandTemplateError(
             f"命令缺少占位符值: {', '.join(sorted(missing))}"

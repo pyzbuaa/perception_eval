@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
 import signal
@@ -53,6 +54,8 @@ class JobAgent:
                 result = self._run_import(job)
             elif job["type"] == "EVALUATION":
                 result = self._run_evaluation(job)
+            elif job["type"] == "AUTO_ANNOTATION":
+                result = self._run_auto_annotation(job)
             else:
                 raise ValueError(f"未知任务类型: {job['type']}")
             self._finish(job["id"], result)
@@ -643,6 +646,377 @@ class JobAgent:
             "annotation_files": annotation_count,
         }
 
+    def _run_auto_annotation(self, job: dict[str, Any]) -> dict[str, Any]:
+        payload = job["payload"]
+        dataset = self.db.row(
+            "SELECT * FROM datasets WHERE id=?", (payload["dataset_id"],)
+        )
+        model = self.db.row(
+            "SELECT * FROM models WHERE id=?", (payload["model_id"],)
+        )
+        if not dataset or not model:
+            raise ValueError("数据集或检测模型不存在")
+        if dataset["frozen"]:
+            raise ValueError("冻结数据集不能执行自动标注")
+        if dataset["annotation_status"] not in {"UNLABELED", "ANNOTATING"}:
+            raise ValueError("自动标注仅支持未标注或正在标注的数据集")
+        if model["is_demo"] or model["status"] == "UNAVAILABLE":
+            raise ValueError("自动标注必须使用可用的真实检测模型")
+
+        adapter = self.db.row(
+            "SELECT * FROM adapters WHERE id=?", (model["adapter_id"],)
+        )
+        if not adapter or adapter["kind"] != "DETECTOR":
+            raise ValueError(f"模型没有可用的检测适配器: {model['name']}")
+        if not model.get("weight_path") or not Path(model["weight_path"]).is_file():
+            raise FileNotFoundError(f"模型权重不存在: {model.get('weight_path')}")
+
+        compatibility = category_compatibility(dataset["id"], model["id"], self.db)
+        if not compatibility["compatible"]:
+            raise ValueError(compatibility["reason"])
+        model_to_dataset = {
+            int(model_id): int(dataset_id)
+            for model_id, dataset_id in compatibility["model_to_dataset"].items()
+        }
+        model_categories = normalize_categories(json_load(model["categories"], []))
+
+        artifact_root = self.settings.artifact_dir.resolve()
+        dataset_directory = (
+            artifact_root / str(dataset.get("artifact_path") or "")
+        ).resolve()
+        if (
+            dataset_directory == artifact_root
+            or not dataset_directory.is_relative_to(artifact_root)
+            or not dataset_directory.is_dir()
+        ):
+            raise ValueError(f"数据集 Artifact 不可用: {dataset['name']}")
+        raster_files = [
+            path
+            for path in sorted(dataset_directory.iterdir())
+            if path.is_file()
+            and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        ]
+        if not raster_files:
+            raise ValueError("数据集没有可供检测模型处理的栅格图片")
+        existing_names = {
+            row["sample_name"]
+            for row in self.db.rows(
+                "SELECT sample_name FROM sample_annotations WHERE dataset_id=?",
+                (dataset["id"],),
+            )
+        }
+        eligible_files = [path for path in raster_files if path.name not in existing_names]
+        if not eligible_files:
+            raise ValueError("数据集中的图片都已有标注，未执行自动覆盖")
+
+        images: list[dict[str, Any]] = []
+        image_dimensions: dict[int, tuple[str, int, int]] = {}
+        for image_id, path in enumerate(eligible_files, start=1):
+            try:
+                with Image.open(path) as opened:
+                    width, height = opened.size
+            except OSError as exc:
+                raise ValueError(f"无法读取图片: {path.name}") from exc
+            images.append(
+                {
+                    "id": image_id,
+                    "file_name": path.name,
+                    "width": width,
+                    "height": height,
+                }
+            )
+            image_dimensions[image_id] = (path.name, width, height)
+
+        job_directory = self.settings.task_dir / job["id"]
+        output_directory = self.settings.artifact_dir / "auto-annotations" / job["id"]
+        job_directory.mkdir(parents=True, exist_ok=True)
+        output_directory.mkdir(parents=True, exist_ok=True)
+        manifest_path = job_directory / "images.json"
+        manifest_path.write_text(
+            json_dump(
+                {
+                    "info": {"description": f"{dataset['name']} 自动标注图片清单"},
+                    "images": images,
+                    "annotations": [],
+                    "categories": model_categories,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        schema = json_load(adapter.get("parameter_schema"), {})
+        properties = schema.get("properties", {})
+
+        def adapter_parameter(name: str, fallback: Any) -> Any:
+            specification = properties.get(name, {})
+            return specification.get("const", specification.get("default", fallback))
+
+        def task_parameter(name: str, fallback: Any) -> Any:
+            default = adapter_parameter(name, fallback)
+            return payload.get(name, default) if name in properties else default
+
+        confidence = float(task_parameter("confidence", 0.25))
+        nms_iou = float(task_parameter("nms_iou", 0.7))
+        image_size = int(task_parameter("image_size", 1280))
+        input_height = int(task_parameter("input_height", image_size))
+        input_width = int(task_parameter("input_width", image_size))
+        max_detections = int(task_parameter("max_detections", 300))
+        batch_size = int(task_parameter("batch_size", 1))
+        warmup = int(task_parameter("warmup", 0))
+        precision = str(task_parameter("precision", model["precision"]))
+
+        execution = schema.get("execution", {})
+        command_mode = execution.get("mode") == "command"
+        predictions_filename = str(
+            execution.get("predictions_filename", "predictions.json")
+        )
+        prediction_relative = Path(predictions_filename)
+        if prediction_relative.is_absolute() or ".." in prediction_relative.parts:
+            raise ValueError("检测结果路径必须位于自动标注输出目录内")
+        predictions_path = (output_directory / prediction_relative).resolve()
+        request_path = job_directory / "request.json"
+        result_path = job_directory / "result.json"
+        run_id = new_id("annotation")
+        request = {
+            "protocol_version": "1.0",
+            "job_id": job["id"],
+            "run_id": run_id,
+            "seed": 0,
+            "model": {
+                "id": model["id"],
+                "catalog_model_id": adapter_parameter("catalog_model_id", model["id"]),
+                "project_directory": adapter_parameter("project_directory", None),
+                "weight_path": model["weight_path"],
+                "weight_sha256": model.get("weight_sha256"),
+            },
+            "dataset": {
+                "id": dataset["id"],
+                "image_directory": str(dataset_directory),
+                "annotation_path": str(manifest_path),
+            },
+            "inference": {
+                "device": "cuda:0",
+                "precision": precision,
+                "batch_size": batch_size,
+                "warmup": warmup,
+                "confidence": confidence,
+                "nms_iou": nms_iou,
+                "image_size": image_size,
+                "input_height": input_height,
+                "input_width": input_width,
+                "max_detections": max_detections,
+            },
+            "category_aliases": {"motor": "motorcycle"},
+            "output_directory": str(output_directory),
+        }
+        if command_mode:
+            executable = Path(str(execution.get("executable", "")))
+            working_directory = Path(str(execution.get("working_directory", "")))
+            arguments = execution.get("arguments", [])
+            if not executable.is_file():
+                raise FileNotFoundError(
+                    f"检测命令可执行程序不存在: {executable}"
+                )
+            if not working_directory.is_dir():
+                raise FileNotFoundError(
+                    f"检测命令工作目录不存在: {working_directory}"
+                )
+            if not isinstance(arguments, list) or not all(
+                isinstance(value, str) for value in arguments
+            ):
+                raise ValueError("检测命令参数必须是字符串数组")
+            placeholders = {
+                "annotation_path": str(manifest_path),
+                "batch_size": str(batch_size),
+                "confidence": str(confidence),
+                "dataset_id": str(dataset["id"]),
+                "device": "cuda:0",
+                "image_directory": str(dataset_directory),
+                "image_size": str(image_size),
+                "input_height": str(input_height),
+                "input_width": str(input_width),
+                "max_detections": str(max_detections),
+                "model_id": str(model["id"]),
+                "nms_iou": str(nms_iou),
+                "output_directory": str(output_directory),
+                "precision": precision,
+                "predictions_path": str(predictions_path),
+                "project_directory": str(request["model"]["project_directory"] or ""),
+                "request_path": str(request_path),
+                "result_path": str(result_path),
+                "warmup": str(warmup),
+                "weight_path": str(model["weight_path"]),
+            }
+            try:
+                command = render_command(str(executable), arguments, placeholders)
+            except CommandTemplateError as exc:
+                raise ValueError(str(exc)) from exc
+            process_directory = working_directory
+        else:
+            entrypoint_value = adapter.get("entrypoint")
+            if not entrypoint_value:
+                raise ValueError("检测适配器没有配置入口脚本")
+            entrypoint = Path(entrypoint_value)
+            if not entrypoint.is_absolute():
+                entrypoint = self.settings.root_dir / entrypoint
+            if not entrypoint.is_file():
+                raise FileNotFoundError(f"检测适配器入口不存在: {entrypoint}")
+            request_path.write_text(json_dump(request), encoding="utf-8")
+            command = self._adapter_command(adapter, entrypoint, request_path, result_path)
+            process_directory = job_directory
+
+        environment = os.environ.copy()
+        environment.update(self._isolated_cache_environment(job_directory))
+        environment.update(
+            {
+                "DRONEDETS_ROOT": str(self.settings.dronedets_root),
+                "PYTHONUNBUFFERED": "1",
+            }
+        )
+        self._progress(job["id"], 15, "启动自动标注模型")
+        started = time.monotonic()
+        returncode, log_tail = self._run_adapter_process(
+            job["id"], command, process_directory, environment
+        )
+        duration_ms = (time.monotonic() - started) * 1000
+        if returncode != 0:
+            raise RuntimeError(
+                f"检测适配器退出码 {returncode}: {log_tail[-500:]}"
+            )
+        if not command_mode:
+            if not result_path.is_file():
+                raise FileNotFoundError("检测适配器没有生成 result.json")
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            if result.get("protocol_version") != "1.0":
+                raise ValueError("检测适配器结果协议版本不受支持")
+            if result.get("job_id") != job["id"] or result.get("run_id") != run_id:
+                raise ValueError("检测适配器结果与当前自动标注任务不匹配")
+            if result.get("status") != "succeeded":
+                raise ValueError(f"检测适配器返回失败状态: {result.get('status')}")
+            if int(result.get("image_count", -1)) != len(images):
+                raise ValueError("检测适配器处理图片数与自动标注清单不一致")
+            result_relative = Path(str(result.get("predictions_path", "")))
+            if result_relative.is_absolute() or ".." in result_relative.parts:
+                raise ValueError("检测结果路径必须位于自动标注输出目录内")
+            predictions_path = (output_directory / result_relative).resolve()
+        if (
+            not predictions_path.is_relative_to(output_directory.resolve())
+            or not predictions_path.is_file()
+        ):
+            raise FileNotFoundError("检测模型没有生成有效的 predictions.json")
+
+        self._progress(job["id"], 75, "校验并导入候选框")
+        predictions = json.loads(predictions_path.read_text(encoding="utf-8"))
+        if not isinstance(predictions, list):
+            raise ValueError("检测结果必须是 COCO predictions 数组")
+        boxes_by_image: dict[int, list[dict[str, Any]]] = {
+            image_id: [] for image_id in image_dimensions
+        }
+        for index, prediction in enumerate(predictions, start=1):
+            if not isinstance(prediction, dict):
+                raise ValueError("COCO prediction 必须是对象")
+            try:
+                image_id = int(prediction["image_id"])
+                model_category_id = int(prediction["category_id"])
+                score = float(prediction["score"])
+                bbox = [float(value) for value in prediction["bbox"]]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("COCO prediction 缺少有效的 image_id、category_id、score 或 bbox") from exc
+            if image_id not in image_dimensions:
+                raise ValueError(f"模型输出了清单之外的图片 ID: {image_id}")
+            if model_category_id not in model_to_dataset:
+                raise ValueError(f"模型输出了未登记类别 {model_category_id}")
+            if len(bbox) != 4 or not all(math.isfinite(value) for value in [score, *bbox]):
+                raise ValueError("COCO prediction 包含无效数值")
+            if not 0 <= score <= 1:
+                raise ValueError("COCO prediction 的 score 必须位于 0 到 1 之间")
+            if score < confidence:
+                continue
+            _, image_width, image_height = image_dimensions[image_id]
+            x, y, width, height = bbox
+            left = max(0.0, min(float(image_width), x))
+            top = max(0.0, min(float(image_height), y))
+            right = max(left, min(float(image_width), x + width))
+            bottom = max(top, min(float(image_height), y + height))
+            if right <= left or bottom <= top:
+                continue
+            boxes_by_image[image_id].append(
+                {
+                    "id": f"auto_{job['id'].split('_')[-1]}_{index}",
+                    "category_id": model_to_dataset[model_category_id],
+                    "x": round(left, 2),
+                    "y": round(top, 2),
+                    "width": round(right - left, 2),
+                    "height": round(bottom - top, 2),
+                    "confidence": round(score, 6),
+                    "source": "AUTO_MODEL",
+                }
+            )
+        for image_boxes in boxes_by_image.values():
+            image_boxes.sort(key=lambda item: item["confidence"], reverse=True)
+            del image_boxes[max_detections:]
+        accepted = sum(len(image_boxes) for image_boxes in boxes_by_image.values())
+
+        now = utc_now()
+        inserted_images = 0
+        with self.db.connect() as connection:
+            current = connection.execute(
+                "SELECT frozen FROM datasets WHERE id=?", (dataset["id"],)
+            ).fetchone()
+            if not current or current["frozen"]:
+                raise ValueError("数据集已不存在或已冻结，候选框未写入")
+            for image_id, (sample_name, width, height) in image_dimensions.items():
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO sample_annotations
+                    (dataset_id,sample_name,width,height,boxes,completed,updated_at)
+                    VALUES (?,?,?,?,?,0,?)
+                    """,
+                    (
+                        dataset["id"],
+                        sample_name,
+                        width,
+                        height,
+                        json_dump(boxes_by_image[image_id]),
+                        now,
+                    ),
+                )
+                inserted_images += int(cursor.rowcount > 0)
+            if inserted_images:
+                connection.execute(
+                    "UPDATE datasets SET annotation_status='ANNOTATING' WHERE id=?",
+                    (dataset["id"],),
+                )
+        return {
+            "dataset_id": dataset["id"],
+            "model_id": model["id"],
+            "model_name": model["name"],
+            "annotation_status": "ANNOTATING" if inserted_images else dataset["annotation_status"],
+            "processed_images": len(images),
+            "annotated_images": inserted_images,
+            "skipped_existing_images": (
+                len(raster_files) - len(eligible_files) + len(images) - inserted_images
+            ),
+            "accepted_boxes": accepted,
+            "effective_inference": {
+                "confidence": confidence,
+                "nms_iou": nms_iou,
+                "image_size": image_size,
+                "input_height": input_height,
+                "input_width": input_width,
+                "max_detections": max_detections,
+                "batch_size": batch_size,
+                "warmup": warmup,
+                "precision": precision,
+                "device": "cuda:0",
+            },
+            "category_mapping": compatibility["model_to_dataset"],
+            "predictions_path": predictions_path.relative_to(
+                self.settings.artifact_dir
+            ).as_posix(),
+            "duration_ms": round(duration_ms, 3),
+        }
+
     def _run_evaluation(self, job: dict[str, Any]) -> dict[str, Any]:
         payload = job["payload"]
         plan = self.db.row("SELECT * FROM evaluation_plans WHERE id=?", (payload["plan_id"],))
@@ -865,15 +1239,22 @@ class JobAgent:
             return specification.get("const", specification.get("default", fallback))
 
         protocol = json_load(plan.get("protocol"), {})
+
+        def task_parameter(name: str, fallback: Any) -> Any:
+            default = parameter(name, fallback)
+            return protocol.get(name, default) if name in properties else default
+
         config = {
             "batch_size": int(protocol.get("batch_size", 1)),
             "precision": str(protocol.get("precision", model["precision"])),
             "warmup": int(protocol.get("warmup", 20)),
             "blur_level": float(blur),
-            "confidence": float(parameter("confidence", 0.001)),
-            "nms_iou": float(parameter("nms_iou", 0.7)),
-            "image_size": int(parameter("image_size", 1280)),
-            "max_detections": int(parameter("max_detections", 300)),
+            "confidence": float(task_parameter("confidence", 0.001)),
+            "nms_iou": float(task_parameter("nms_iou", 0.7)),
+            "image_size": int(task_parameter("image_size", 1280)),
+            "input_height": int(task_parameter("input_height", 1280)),
+            "input_width": int(task_parameter("input_width", 1280)),
+            "max_detections": int(task_parameter("max_detections", 300)),
             "metric_protocol": "pycocotools-2.0.11",
             "adapter_id": adapter["id"],
             "annotation_conversion": annotation_conversion,
@@ -909,6 +1290,8 @@ class JobAgent:
                 "confidence": config["confidence"],
                 "nms_iou": config["nms_iou"],
                 "image_size": config["image_size"],
+                "input_height": config["input_height"],
+                "input_width": config["input_width"],
                 "max_detections": config["max_detections"],
             },
             "category_aliases": {"motor": "motorcycle"},
@@ -953,6 +1336,8 @@ class JobAgent:
                 "device": "cuda:0",
                 "image_directory": str(image_directory),
                 "image_size": str(config["image_size"]),
+                "input_height": str(config["input_height"]),
+                "input_width": str(config["input_width"]),
                 "max_detections": str(config["max_detections"]),
                 "model_id": str(model["id"]),
                 "nms_iou": str(config["nms_iou"]),
@@ -966,6 +1351,7 @@ class JobAgent:
                 ),
                 "request_path": str(request_path),
                 "result_path": str(result_path),
+                "warmup": str(config["warmup"]),
                 "weight_path": str(model["weight_path"]),
             }
             try:

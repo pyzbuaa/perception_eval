@@ -51,6 +51,8 @@ class DetectionBox(BaseModel):
     y: float = Field(ge=0)
     width: float = Field(gt=0)
     height: float = Field(gt=0)
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    source: Literal["AUTO_MODEL", "MANUAL"] | None = None
 
 
 class SampleAnnotationUpdate(BaseModel):
@@ -58,6 +60,30 @@ class SampleAnnotationUpdate(BaseModel):
     height: int = Field(ge=1, le=100000)
     boxes: list[DetectionBox] = Field(default_factory=list, max_length=5000)
     completed: bool = False
+
+
+class AutoAnnotationRequest(BaseModel):
+    model_id: str = Field(min_length=1, max_length=120)
+    confidence: float = Field(default=0.25, ge=0, le=1)
+    nms_iou: float = Field(default=0.7, ge=0, le=1)
+    image_size: int = Field(default=1280, ge=32, le=8192)
+    input_height: int = Field(default=960, ge=32, le=8192)
+    input_width: int = Field(default=1280, ge=32, le=8192)
+    max_detections: int = Field(default=300, ge=1, le=5000)
+    batch_size: int = Field(default=1, ge=1, le=64)
+    warmup: int = Field(default=0, ge=0, le=200)
+    precision: Literal["FP32", "FP16"] = "FP16"
+
+
+class DetectorInferenceDefaults(BaseModel):
+    confidence: float = Field(default=0.25, ge=0, le=1)
+    nms_iou: float = Field(default=0.7, ge=0, le=1)
+    image_size: int = Field(default=1280, ge=32, le=8192)
+    input_height: int = Field(default=960, ge=32, le=8192)
+    input_width: int = Field(default=1280, ge=32, le=8192)
+    max_detections: int = Field(default=300, ge=1, le=5000)
+    batch_size: int = Field(default=1, ge=1, le=64)
+    warmup: int = Field(default=0, ge=0, le=200)
 
 
 class ModelCreateRequest(BaseModel):
@@ -93,6 +119,9 @@ class LocalDetectorModelRequest(BaseModel):
     working_directory: str
     runtime_prefix: str
     command_arguments: list[str] = Field(min_length=1, max_length=100)
+    inference_defaults: DetectorInferenceDefaults = Field(
+        default_factory=DetectorInferenceDefaults
+    )
     weight_path: str
 
 
@@ -105,6 +134,12 @@ class EvaluationPlanRequest(BaseModel):
     batch_size: int = Field(default=1, ge=1, le=64)
     precision: Literal["FP32", "FP16", "INT8"] = "FP16"
     warmup: int = Field(default=20, ge=0, le=200)
+    confidence: float = Field(default=0.25, ge=0, le=1)
+    nms_iou: float = Field(default=0.7, ge=0, le=1)
+    image_size: int = Field(default=1280, ge=32, le=8192)
+    input_height: int = Field(default=960, ge=32, le=8192)
+    input_width: int = Field(default=1280, ge=32, le=8192)
+    max_detections: int = Field(default=300, ge=1, le=5000)
 
 
 class AdapterRegistrationRequest(BaseModel):

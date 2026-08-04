@@ -16,7 +16,12 @@ import app.main as main_module
 from adapters.basegen_generator import prepare_plan
 from adapters.diffusiondegrade_fog import blend_fog
 from adapters.dronedets_detector import category_mapping
-from app.command_protocol import CommandTemplateError, validate_command_arguments
+from app.command_protocol import (
+    CommandTemplateError,
+    command_placeholders,
+    render_command,
+    validate_command_arguments,
+)
 from app.category_templates import list_category_templates, template_categories
 from app.config import ROOT_DIR, Settings
 from app.db import Database, json_dump, utc_now
@@ -270,6 +275,224 @@ def test_category_compatibility_maps_ids_and_rejects_name_mismatch(
         )
 
 
+def test_auto_annotation_runs_registered_detector_and_preserves_existing_boxes(
+    tmp_path: Path,
+) -> None:
+    database, app_settings = make_database(tmp_path)
+    detector_script = tmp_path / "closed_set_detector.py"
+    detector_script.write_text(
+        """
+import argparse
+import json
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--annotations", required=True)
+parser.add_argument("--output", required=True)
+args = parser.parse_args()
+manifest = json.load(open(args.annotations, encoding="utf-8"))
+predictions = []
+for image in manifest["images"]:
+    predictions.extend([
+        {"image_id": image["id"], "category_id": 9, "bbox": [-2, 3, 20, 14], "score": 0.91},
+        {"image_id": image["id"], "category_id": 9, "bbox": [2, 2, 5, 5], "score": 0.1},
+    ])
+json.dump(predictions, open(args.output, "w", encoding="utf-8"))
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    weight_path = tmp_path / "detector.pt"
+    weight_path.write_bytes(b"closed-set-weight")
+    artifact_directory = app_settings.artifact_dir / "custom" / "auto-label"
+    artifact_directory.mkdir(parents=True)
+    Image.new("RGB", (32, 24), (10, 20, 30)).save(
+        artifact_directory / "new.jpg"
+    )
+    Image.new("RGB", (32, 24), (30, 20, 10)).save(
+        artifact_directory / "manual.jpg"
+    )
+    now = utc_now()
+    adapter_schema = {
+        "type": "object",
+        "properties": {},
+        "execution": {
+            "mode": "command",
+            "working_directory": str(tmp_path),
+            "executable": sys.executable,
+            "arguments": [
+                str(detector_script),
+                "--annotations",
+                "{annotation_path}",
+                "--output",
+                "{predictions_path}",
+            ],
+            "predictions_filename": "predictions.json",
+        },
+    }
+    with database.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO adapters
+            (id,name,kind,version,maturity,runtime_kind,runtime_prefix,policy,
+             entrypoint,requires_gpu,status,description,parameter_schema,
+             created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "adapter_auto_test",
+                "测试闭集检测模型",
+                "DETECTOR",
+                "v1",
+                "REGISTERED",
+                "platform",
+                None,
+                "read_only",
+                sys.executable,
+                0,
+                "REGISTERED",
+                "测试自动标注",
+                json_dump(adapter_schema),
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO models
+            (id,name,family,architecture,backbone,detector_head,class_count,
+             categories,category_template,training_dataset,pretrained_dataset,
+             version,precision,adapter_id,weight_path,weight_sha256,is_demo,
+             status,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "model_auto_test",
+                "测试闭集检测模型",
+                "TestDetector",
+                "One-stage",
+                "TestNet",
+                "TestHead",
+                1,
+                json_dump([{"id": 9, "name": "car"}]),
+                "custom",
+                "test",
+                "test",
+                "v1",
+                "FP32",
+                "adapter_auto_test",
+                str(weight_path),
+                "test-sha",
+                0,
+                "REGISTERED",
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO datasets
+            (id,name,version,source_type,scene_domain,weather,sensor_conditions,
+             resolution,sample_count,annotation_status,frozen,artifact_path,
+             category_template,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "dataset_auto_test",
+                "自动标注测试集",
+                "draft",
+                "REAL",
+                "无人机航拍",
+                "晴朗",
+                "{}",
+                "32×24",
+                2,
+                "ANNOTATING",
+                0,
+                "custom/auto-label",
+                "custom",
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO dataset_annotation_schemas(dataset_id,categories,updated_at)
+            VALUES (?,?,?)
+            """,
+            (
+                "dataset_auto_test",
+                json_dump([{"id": 3, "name": "car", "color": "#1677FF"}]),
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO sample_annotations
+            (dataset_id,sample_name,width,height,boxes,completed,updated_at)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                "dataset_auto_test",
+                "manual.jpg",
+                32,
+                24,
+                json_dump(
+                    [
+                        {
+                            "id": "manual_1",
+                            "category_id": 3,
+                            "x": 1,
+                            "y": 1,
+                            "width": 4,
+                            "height": 4,
+                        }
+                    ]
+                ),
+                0,
+                now,
+            ),
+        )
+
+    job = queue_job(
+        "AUTO_ANNOTATION",
+        {
+            "dataset_id": "dataset_auto_test",
+            "model_id": "model_auto_test",
+            "confidence": 0.25,
+            "nms_iou": 0.7,
+            "image_size": 1280,
+            "max_detections": 300,
+            "precision": "FP32",
+        },
+        database,
+    )
+    assert JobAgent(database, app_settings).process_one()
+    completed = database.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
+    assert completed["status"] == "SUCCEEDED"
+    result = json.loads(completed["result"])
+    assert result["processed_images"] == 1
+    assert result["annotated_images"] == 1
+    assert result["accepted_boxes"] == 1
+    generated = get_sample_annotation(
+        "dataset_auto_test", "new.jpg", database
+    )
+    assert generated["completed"] is False
+    assert generated["boxes"] == [
+        {
+            "id": generated["boxes"][0]["id"],
+            "category_id": 3,
+            "x": 0.0,
+            "y": 3.0,
+            "width": 18.0,
+            "height": 14.0,
+            "confidence": 0.91,
+            "source": "AUTO_MODEL",
+        }
+    ]
+    existing = get_sample_annotation(
+        "dataset_auto_test", "manual.jpg", database
+    )
+    assert existing["boxes"][0]["id"] == "manual_1"
+
+
 def test_local_detector_model_registration_uses_bounded_resources(
     tmp_path: Path,
 ) -> None:
@@ -338,9 +561,25 @@ def test_local_detector_model_registration_uses_bounded_resources(
                 "platform_adapter.py",
                 "--weights",
                 "{weight_path}",
+                "--confidence",
+                "{confidence}",
+                "--input-height",
+                "{input_height}",
+                "--input-width",
+                "{input_width}",
                 "--output",
                 "{predictions_path}",
             ],
+            "inference_defaults": {
+                "confidence": 0.3,
+                "nms_iou": 0.7,
+                "image_size": 1280,
+                "input_height": 960,
+                "input_width": 1280,
+                "max_detections": 300,
+                "batch_size": 1,
+                "warmup": 0,
+            },
             "weight_path": str(project / "best.pt"),
         },
         database,
@@ -362,8 +601,20 @@ def test_local_detector_model_registration_uses_bounded_resources(
     schema = json.loads(adapter["parameter_schema"])
     assert schema["execution"]["mode"] == "command"
     assert schema["execution"]["arguments"][-1] == "{predictions_path}"
+    assert schema["properties"]["confidence"]["default"] == 0.3
+    assert schema["properties"]["input_height"]["default"] == 960
+    assert schema["properties"]["input_width"]["default"] == 1280
+    assert "nms_iou" not in schema["properties"]
     with pytest.raises(CommandTemplateError, match="不支持的命令占位符"):
         validate_command_arguments(["--output", "{unknown_path}"])
+    assert command_placeholders(["--confidence", "{confidence}"]) == {
+        "confidence"
+    }
+    assert render_command(
+        "/usr/bin/example",
+        ["--confidence", "{confidence}"],
+        {"confidence": 0.4},
+    ) == ["/usr/bin/example", "--confidence", "0.4"]
     deleted = delete_model(model["id"], database)
     assert deleted["deleted"] is True
     assert deleted["adapter_deleted"] is True
@@ -403,6 +654,7 @@ def test_structured_detector_command_only_requires_coco_predictions(
                 "parser = argparse.ArgumentParser()",
                 "parser.add_argument('--annotation', required=True)",
                 "parser.add_argument('--output', required=True)",
+                "parser.add_argument('--confidence', type=float, required=True)",
                 "args = parser.parse_args()",
                 "ground_truth = json.loads(Path(args.annotation).read_text())",
                 "annotation = ground_truth['annotations'][0]",
@@ -450,6 +702,8 @@ def test_structured_detector_command_only_requires_coco_predictions(
                 "{annotation_path}",
                 "--output",
                 "{predictions_path}",
+                "--confidence",
+                "{confidence}",
             ],
             "weight_path": str(weight),
         },
@@ -533,7 +787,14 @@ def test_structured_detector_command_only_requires_coco_predictions(
             json_dump([model["id"]]),
             json_dump([1001]),
             json_dump([0]),
-            json_dump({"batch_size": 1, "precision": "FP16", "warmup": 0}),
+            json_dump(
+                {
+                    "batch_size": 1,
+                    "precision": "FP16",
+                    "warmup": 0,
+                    "confidence": 0.42,
+                }
+            ),
             utc_now(),
         ),
     )
@@ -555,8 +816,10 @@ def test_structured_detector_command_only_requires_coco_predictions(
     )
     assert run["map"] == pytest.approx(1)
     assert run["latency_p50"] > 0
-    assert json.loads(run["config"])["category_mapping"] == {"0": 1}
-    assert "未生成 result.json" in json.loads(run["config"])["warnings"][0]
+    config = json.loads(run["config"])
+    assert config["category_mapping"] == {"0": 1}
+    assert config["confidence"] == pytest.approx(0.42)
+    assert "未生成 result.json" in config["warnings"][0]
 
 
 def test_dronedets_category_mapping_and_coco_metrics(tmp_path: Path) -> None:
