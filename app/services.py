@@ -94,8 +94,7 @@ def list_datasets(database: Database = db) -> list[dict[str, Any]]:
             if directory.exists():
                 row["preview_images"] = [
                     f"/artifacts/{path.relative_to(settings.artifact_dir).as_posix()}"
-                    for path in sorted(directory.iterdir())
-                    if path.suffix.lower() in {".svg", ".png", ".jpg", ".jpeg", ".webp"}
+                    for path in _dataset_image_files(directory)
                 ][:6]
         yield row
 
@@ -117,6 +116,10 @@ class BaseGenCatalogError(ValueError):
 
 
 class DatasetAnnotationError(ValueError):
+    pass
+
+
+class DatasetImportError(ValueError):
     pass
 
 
@@ -250,6 +253,115 @@ LOCAL_WEIGHT_SUFFIXES = {
     ".safetensors",
     ".torchscript",
 }
+
+LOCAL_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".svg"}
+
+
+def _dataset_image_files(directory: Path) -> list[Path]:
+    return [
+        path
+        for path in sorted(directory.rglob("*"))
+        if path.is_file()
+        and path.suffix.lower() in LOCAL_IMAGE_SUFFIXES
+        and "annotations" not in path.relative_to(directory).parts
+    ]
+
+
+def _dataset_sample_name(directory: Path, path: Path) -> str:
+    return path.relative_to(directory).as_posix()
+
+
+def _match_dataset_sample_name(value: str, names: set[str]) -> str | None:
+    normalized = Path(value.replace("\\", "/")).as_posix()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if normalized in names:
+        return normalized
+    suffix_matches = [
+        name for name in names if normalized.endswith(f"/{name}")
+    ]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    basename = Path(normalized).name
+    matches = [name for name in names if Path(name).name == basename]
+    return matches[0] if len(matches) == 1 else None
+
+
+def list_local_dataset_resources(
+    path: str | None,
+    kind: str,
+    app_settings=None,
+) -> dict[str, Any]:
+    app_settings = app_settings or settings
+    if kind not in {"directory", "annotation"}:
+        raise DatasetImportError(f"不支持的数据资源类型: {kind}")
+    root = app_settings.dataset_library_root.expanduser().resolve()
+    if not root.is_dir():
+        raise DatasetImportError(f"本地数据根目录不存在: {root}")
+    current = Path(path).expanduser().resolve() if path else root
+    if not current.is_relative_to(root) or not current.is_dir():
+        raise DatasetImportError(f"目录超出允许范围: {current}")
+    entries = []
+    for child in sorted(
+        current.iterdir(),
+        key=lambda item: (not item.is_dir(), item.name.casefold()),
+    ):
+        try:
+            resolved = child.resolve()
+        except OSError:
+            continue
+        if not resolved.is_relative_to(root):
+            continue
+        if child.is_dir():
+            entries.append(
+                {"name": child.name, "path": str(child), "is_directory": True}
+            )
+        elif kind == "annotation" and child.suffix.lower() == ".json":
+            entries.append(
+                {"name": child.name, "path": str(child), "is_directory": False}
+            )
+    return {
+        "scope": "dataset",
+        "kind": kind,
+        "root": str(root),
+        "current": str(current),
+        "parent": str(current.parent) if current != root else None,
+        "entries": entries,
+    }
+
+
+def resolve_local_dataset_import(
+    values: dict[str, Any],
+    app_settings=None,
+) -> tuple[Path, Path | None]:
+    app_settings = app_settings or settings
+    root = app_settings.dataset_library_root.expanduser().resolve()
+    if not root.is_dir():
+        raise DatasetImportError(f"本地数据根目录不存在: {root}")
+    source = Path(str(values.get("directory") or "")).expanduser().resolve()
+    if not source.is_relative_to(root) or not source.is_dir():
+        raise DatasetImportError(f"图像目录必须位于 {root} 内")
+    if not any(
+        path.is_file() and path.suffix.lower() in LOCAL_IMAGE_SUFFIXES
+        for path in source.rglob("*")
+    ):
+        raise DatasetImportError("所选目录中没有支持的图像")
+    annotation_value = values.get("annotation_path")
+    if not annotation_value:
+        return source, None
+    annotation = Path(str(annotation_value)).expanduser().resolve()
+    if not annotation.is_relative_to(root):
+        raise DatasetImportError(f"标注路径必须位于 {root} 内")
+    annotation_format = str(values.get("annotation_format") or "COCO").upper()
+    if annotation_format == "COCO":
+        if not annotation.is_file() or annotation.suffix.lower() != ".json":
+            raise DatasetImportError("COCO 标注必须选择 JSON 文件")
+    elif annotation_format in {"YOLO", "VISDRONE"}:
+        if not annotation.is_dir():
+            raise DatasetImportError(f"{annotation_format} 标注必须选择目录")
+    else:
+        raise DatasetImportError("标注格式不受支持")
+    return source, annotation
 
 
 def list_local_model_resources(
@@ -618,12 +730,7 @@ def list_dataset_samples(
         if directory == artifact_root or not directory.is_relative_to(artifact_root):
             raise DatasetArtifactError("数据集 Artifact 路径超出受控目录")
         if directory.is_dir():
-            files = [
-                path
-                for path in sorted(directory.iterdir())
-                if path.is_file()
-                and path.suffix.lower() in {".svg", ".png", ".jpg", ".jpeg", ".webp"}
-            ]
+            files = _dataset_image_files(directory)
     page = files[offset : offset + limit]
     visualizations = _sample_visualizations(
         dataset_id,
@@ -641,10 +748,10 @@ def list_dataset_samples(
         "has_more": offset + len(page) < len(files),
         "items": [
             {
-                "name": path.name,
-                "url": f"/artifacts/{quote(path.resolve().relative_to(database.settings.artifact_dir.resolve()).as_posix(), safe='/')}",
+                "name": _dataset_sample_name(directory, path),
+                "url": f"/artifacts/{quote(path.relative_to(database.settings.artifact_dir.resolve()).as_posix(), safe='/')}",
                 **visualizations.get(
-                    path.name,
+                    _dataset_sample_name(directory, path),
                     {
                         "width": 0,
                         "height": 0,
@@ -664,7 +771,7 @@ def _sample_visualizations(
     files: list[Path],
     database: Database,
 ) -> dict[str, dict[str, Any]]:
-    if not files:
+    if not files or not directory:
         return {}
     colors = [
         "#1677FF",
@@ -678,13 +785,22 @@ def _sample_visualizations(
     ]
     dimensions: dict[str, tuple[int, int]] = {}
     output: dict[str, dict[str, Any]] = {}
-    names = {path.name for path in files}
+    sample_names = {
+        path: _dataset_sample_name(directory, path)
+        for path in files
+    }
+    names = set(sample_names.values())
+    all_names = {
+        _dataset_sample_name(directory, path)
+        for path in _dataset_image_files(directory)
+    }
     for path in files:
+        name = sample_names[path]
         try:
             with Image.open(path) as image:
-                dimensions[path.name] = (image.width, image.height)
+                dimensions[name] = (image.width, image.height)
         except OSError:
-            dimensions[path.name] = (0, 0)
+            dimensions[name] = (0, 0)
 
     categories = {
         int(category["id"]): {
@@ -754,16 +870,22 @@ def _sample_visualizations(
             }
             for category in coco.get("categories", [])
         }
-        images_by_id = {
-            int(image["id"]): image
-            for image in coco.get("images", [])
-            if Path(str(image.get("file_name", ""))).name in names
-        }
+        images_by_id = {}
+        coco_names = {}
+        for image in coco.get("images", []):
+            name = _match_dataset_sample_name(
+                str(image.get("file_name", "")),
+                all_names,
+            )
+            if name in names:
+                image_id = int(image["id"])
+                images_by_id[image_id] = image
+                coco_names[image_id] = name
         annotations_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for annotation in coco.get("annotations", []):
             annotations_by_image[int(annotation["image_id"])].append(annotation)
         for image_id, image in images_by_id.items():
-            name = Path(str(image["file_name"])).name
+            name = coco_names[image_id]
             if name in output:
                 continue
             width = int(image.get("width") or dimensions.get(name, (0, 0))[0])
@@ -816,7 +938,8 @@ def _sample_visualizations(
         if not root.is_dir():
             continue
         for path in sorted(root.rglob("*.txt")):
-            label_files.setdefault(path.stem, (path, source))
+            key = path.relative_to(root).with_suffix("").as_posix()
+            label_files.setdefault(key, (path, source))
     if label_files:
         visdrone_categories = {
             0: "ignored region",
@@ -833,9 +956,30 @@ def _sample_visualizations(
             11: "others",
         }
         for path in files:
-            if path.name in output:
+            name = sample_names[path]
+            if name in output:
                 continue
-            label_entry = label_files.get(path.stem)
+            label_key = Path(name).with_suffix("").as_posix()
+            label_entry = label_files.get(label_key)
+            if not label_entry:
+                path_matches = [
+                    entry
+                    for key, entry in label_files.items()
+                    if key.endswith(f"/{label_key}")
+                    or label_key.endswith(f"/{key}")
+                ]
+                label_entry = path_matches[0] if len(path_matches) == 1 else None
+            if not label_entry:
+                basename_matches = [
+                    entry
+                    for key, entry in label_files.items()
+                    if Path(key).name == Path(label_key).name
+                ]
+                label_entry = (
+                    basename_matches[0]
+                    if len(basename_matches) == 1
+                    else None
+                )
             if not label_entry:
                 continue
             label_path, configured_source = label_entry
@@ -852,7 +996,7 @@ def _sample_visualizations(
                 if len(fields) >= 8:
                     source = "VISDRONE"
             boxes = []
-            width, height = dimensions.get(path.name, (0, 0))
+            width, height = dimensions.get(name, (0, 0))
             for line in lines:
                 if source == "VISDRONE":
                     fields = line.split(",")
@@ -911,7 +1055,7 @@ def _sample_visualizations(
                         "height": box_height,
                     }
                 )
-            output[path.name] = {
+            output[name] = {
                 "width": width,
                 "height": height,
                 "boxes": boxes,
@@ -919,9 +1063,10 @@ def _sample_visualizations(
             }
 
     for path in files:
-        if path.name not in output:
-            width, height = dimensions.get(path.name, (0, 0))
-            output[path.name] = {
+        name = sample_names[path]
+        if name not in output:
+            width, height = dimensions.get(name, (0, 0))
+            output[name] = {
                 "width": width,
                 "height": height,
                 "boxes": [],
@@ -946,12 +1091,7 @@ def _dataset_images(
         raise DatasetArtifactError("数据集 Artifact 路径超出受控目录")
     files = []
     if directory.is_dir():
-        files = [
-            path
-            for path in sorted(directory.iterdir())
-            if path.is_file()
-            and path.suffix.lower() in {".svg", ".png", ".jpg", ".jpeg", ".webp"}
-        ]
+        files = _dataset_image_files(directory)
     return dataset, directory, files
 
 
@@ -1068,8 +1208,9 @@ def get_annotation_session(
     samples = []
     artifact_root = database.settings.artifact_dir.resolve()
     for path in files:
-        row = rows.get(path.name)
-        visualization = imported.get(path.name, {})
+        name = _dataset_sample_name(directory, path)
+        row = rows.get(name)
+        visualization = imported.get(name, {})
         completed = (
             bool(row["completed"])
             if row
@@ -1077,9 +1218,9 @@ def get_annotation_session(
         )
         samples.append(
             {
-                "name": path.name,
+                "name": name,
                 "url": (
-                    f"/artifacts/{quote(path.resolve().relative_to(artifact_root).as_posix(), safe='/')}"
+                    f"/artifacts/{quote(path.relative_to(artifact_root).as_posix(), safe='/')}"
                 ),
                 "completed": completed,
                 "box_count": (
@@ -1109,7 +1250,14 @@ def get_sample_annotation(
     if not resolved:
         return None
     dataset, directory, files = resolved
-    sample_path = next((path for path in files if path.name == sample_name), None)
+    sample_path = next(
+        (
+            path
+            for path in files
+            if directory and _dataset_sample_name(directory, path) == sample_name
+        ),
+        None,
+    )
     if not sample_path:
         return None
     row = database.row(
@@ -1214,10 +1362,12 @@ def save_sample_annotation(
     resolved = _dataset_images(dataset_id, database)
     if not resolved:
         return None
-    dataset, _, files = resolved
+    dataset, directory, files = resolved
     if dataset["frozen"]:
         raise DatasetAnnotationError("冻结数据集的标注不可修改")
-    if sample_name not in {path.name for path in files}:
+    if not directory or sample_name not in {
+        _dataset_sample_name(directory, path) for path in files
+    }:
         return None
     width = int(payload["width"])
     height = int(payload["height"])
@@ -1287,9 +1437,10 @@ def complete_dataset_annotations(
         )
     }
     incomplete = [
-        path.name
+        _dataset_sample_name(directory, path)
         for path in files
-        if path.name not in rows or not rows[path.name]["completed"]
+        if _dataset_sample_name(directory, path) not in rows
+        or not rows[_dataset_sample_name(directory, path)]["completed"]
     ]
     if incomplete:
         raise DatasetAnnotationError(
@@ -1302,11 +1453,12 @@ def complete_dataset_annotations(
     annotations = []
     annotation_id = 1
     for image_id, path in enumerate(files, start=1):
-        row = rows[path.name]
+        name = _dataset_sample_name(directory, path)
+        row = rows[name]
         images.append(
             {
                 "id": image_id,
-                "file_name": path.name,
+                "file_name": name,
                 "width": row["width"],
                 "height": row["height"],
             }
@@ -1648,6 +1800,94 @@ def overview(database: Database = db) -> dict[str, Any]:
     }
 
 
+INFERENCE_COMPARISON_KEYS = (
+    "precision",
+    "batch_size",
+    "warmup",
+    "confidence",
+    "nms_iou",
+    "image_size",
+    "input_height",
+    "input_width",
+    "max_detections",
+    "blur_level",
+    "metric_protocol",
+    "timing",
+)
+
+
+def _comparison_config(
+    config: dict[str, Any],
+    model_precision: str | None = None,
+) -> dict[str, Any]:
+    comparable = {
+        key: config[key]
+        for key in INFERENCE_COMPARISON_KEYS
+        if key in config
+    }
+    if "precision" not in comparable and model_precision:
+        comparable["precision"] = model_precision
+    if "input_height" in comparable and "input_width" in comparable:
+        comparable["input_resolution"] = (
+            f"{comparable['input_width']}×{comparable['input_height']}"
+        )
+    elif "image_size" in comparable:
+        comparable["input_resolution"] = (
+            f"{comparable['image_size']}×{comparable['image_size']}"
+        )
+    return comparable
+
+
+def _condition_metadata(
+    weather: str,
+    sensor_conditions: dict[str, Any],
+) -> dict[str, Any]:
+    source_dataset_id = sensor_conditions.get("source_dataset_id")
+    if "fog_strength" in sensor_conditions:
+        return {
+            "condition_type": "雾",
+            "condition_strength": float(sensor_conditions["fog_strength"]),
+            "source_dataset_id": source_dataset_id,
+        }
+    if "fog_density" in sensor_conditions:
+        return {
+            "condition_type": "雾",
+            "condition_strength": float(sensor_conditions["fog_density"]),
+            "source_dataset_id": source_dataset_id,
+        }
+    if "motion_blur_strength" in sensor_conditions:
+        return {
+            "condition_type": "无人机运动模糊",
+            "condition_strength": float(sensor_conditions["motion_blur_strength"]),
+            "source_dataset_id": source_dataset_id,
+        }
+    motion_blur = sensor_conditions.get("motion_blur")
+    if isinstance(motion_blur, (int, float)) and not isinstance(motion_blur, bool):
+        return {
+            "condition_type": "运动模糊",
+            "condition_strength": float(motion_blur),
+            "source_dataset_id": source_dataset_id,
+        }
+    degradation = sensor_conditions.get("degradation")
+    if degradation:
+        return {
+            "condition_type": str(degradation),
+            "condition_strength": None,
+            "source_dataset_id": source_dataset_id,
+        }
+    if weather not in {"", "晴朗", "未记录"}:
+        return {
+            "condition_type": weather,
+            "condition_strength": None,
+            "source_dataset_id": source_dataset_id,
+        }
+    return {
+        "condition_type": "基准",
+        "condition_strength": 0.0,
+        "source_dataset_id": source_dataset_id,
+    }
+
+
 def query_results(
     scene: str | None = None,
     condition: str | None = None,
@@ -1685,18 +1925,79 @@ def query_results(
         tuple(parameters),
     )
     decoded = [decode_row(row) for row in rows]
-    groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in decoded:
-        groups[(row["dataset_id"], row["model_id"])].append(row)
+        comparison_config = _comparison_config(
+            row.get("config") or {},
+            row.get("model_precision"),
+        )
+        configuration_signature = json.dumps(
+            comparison_config,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        hardware_signature = json.dumps(
+            {
+                "environment_fingerprint": row.get("environment_fingerprint"),
+                "hardware_profile": row.get("hardware_profile") or {},
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        groups[
+            (
+                row["dataset_id"],
+                row["model_id"],
+                configuration_signature,
+                hardware_signature,
+            )
+        ].append(row)
     summaries: list[dict[str, Any]] = []
     for values in groups.values():
         map_values = [item["map"] for item in values]
-        latency_values = [item["latency_p50"] for item in values]
         first = values[0]
         mean = sum(map_values) / len(map_values)
         variance = sum((value - mean) ** 2 for value in map_values) / len(map_values)
+        inference_config = _comparison_config(
+            first.get("config") or {},
+            first.get("model_precision"),
+        )
+        configuration_id = hashlib.sha256(
+            json.dumps(
+                inference_config,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:12]
+        hardware_id = hashlib.sha256(
+            json.dumps(
+                {
+                    "environment_fingerprint": first.get("environment_fingerprint"),
+                    "hardware_profile": first.get("hardware_profile") or {},
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()[:12]
+        condition = _condition_metadata(
+            str(first["weather"]),
+            first.get("sensor_conditions") or {},
+        )
+
+        def metric_mean(name: str) -> float:
+            return sum(float(item[name]) for item in values) / len(values)
+
         summaries.append(
             {
+                "comparison_id": (
+                    f"{first['dataset_id']}:{first['model_id']}:{configuration_id}:"
+                    f"{hardware_id}"
+                ),
+                "configuration_id": configuration_id,
                 "dataset_id": first["dataset_id"],
                 "dataset_name": first["dataset_name"],
                 "model_id": first["model_id"],
@@ -1710,11 +2011,25 @@ def query_results(
                 "source_type": first["source_type"],
                 "is_demo": first["is_demo"],
                 "is_official": all(item["is_official"] for item in values),
+                "inference_config": inference_config,
+                "hardware_profile": first.get("hardware_profile") or {},
+                "environment_fingerprint": first.get("environment_fingerprint"),
+                **condition,
                 "map_mean": round(mean, 4),
                 "map_std": round(math.sqrt(variance), 4),
-                "latency_mean": round(sum(latency_values) / len(latency_values), 2),
+                "map50_mean": round(metric_mean("map50"), 4),
+                "map75_mean": round(metric_mean("map75"), 4),
+                "precision_mean": round(metric_mean("precision"), 4),
+                "recall_mean": round(metric_mean("recall"), 4),
+                "f1_mean": round(metric_mean("f1"), 4),
+                "latency_mean": round(metric_mean("latency_p50"), 2),
+                "latency_p95_mean": round(metric_mean("latency_p95"), 2),
+                "fps_mean": round(metric_mean("fps"), 2),
+                "peak_memory_mean": round(metric_mean("peak_memory"), 2),
                 "delta_map_mean": round(sum(item["delta_map"] or 0 for item in values) / len(values), 4),
                 "seed_count": len(values),
+                "seeds": sorted({int(item["seed"]) for item in values}),
+                "run_ids": [item["run_id"] for item in values],
                 "curves": first["curves"],
             }
         )
@@ -1724,6 +2039,29 @@ def query_results(
         "conditions": sorted({row["weather"] for row in decoded}),
         "resolutions": sorted({row["resolution"] for row in decoded}),
         "models": sorted({row["model_name"] for row in decoded}),
+        "model_options": sorted(
+            {
+                (row["model_id"], row["model_name"])
+                for row in decoded
+            },
+            key=lambda item: item[1],
+        ),
+        "dataset_options": sorted(
+            {
+                (row["dataset_id"], row["dataset_name"])
+                for row in decoded
+            },
+            key=lambda item: item[1],
+        ),
+        "condition_types": sorted(
+            {summary["condition_type"] for summary in summaries}
+        ),
+        "hardware": sorted(
+            {
+                str(row.get("environment_fingerprint") or "unknown")
+                for row in decoded
+            }
+        ),
     }
     return {"count": len(decoded), "groups": summaries, "runs": decoded, "dimensions": dimensions}
 

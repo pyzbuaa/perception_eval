@@ -26,7 +26,15 @@ from app.command_protocol import CommandTemplateError, render_command
 from app.config import Settings, settings
 from app.db import Database, db, json_dump, json_load, make_curves, make_metrics, new_id, utc_now
 from app.detection_metrics import evaluate_coco_predictions
-from app.services import category_compatibility, validate_evaluation_categories
+from app.services import (
+    DatasetImportError,
+    _dataset_image_files,
+    _match_dataset_sample_name,
+    _dataset_sample_name,
+    category_compatibility,
+    resolve_local_dataset_import,
+    validate_evaluation_categories,
+)
 
 
 class JobAgent:
@@ -166,13 +174,14 @@ class JobAgent:
             input_directory = self.settings.artifact_dir / input_dataset["artifact_path"]
             input_images = [
                 str(path)
-                for path in sorted(input_directory.iterdir())
+                for path in _dataset_image_files(input_directory)
                 if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
             ]
             if not input_images:
                 raise ValueError("输入数据集没有可处理的 PNG/JPEG/WebP 图像；SVG 流程样例不用于像素退化")
             source_annotation_directory = input_directory / "annotations"
             request["input_images"] = input_images
+            request["input_directory"] = str(input_directory)
             request["input_dataset_id"] = input_dataset_id
             request["sample_count"] = len(input_images)
             request["has_source_annotations"] = (
@@ -194,6 +203,7 @@ class JobAgent:
                         "resolution": resolution,
                         "source_dataset_id": input_dataset_id,
                         "degradation": "DiffusionDegrade UAV Fog",
+                        "fog_strength": fog_strength,
                     },
                 }
                 request["model_parameters"] = {
@@ -330,7 +340,10 @@ class JobAgent:
                         f"缺少生成元数据: {sample['metadata_path']}"
                     )
         if is_condition:
-            expected_names = {Path(value).name for value in request["input_images"]}
+            expected_names = {
+                _dataset_sample_name(input_directory, Path(value))
+                for value in request["input_images"]
+            }
             output_names = {str(sample["image_path"]) for sample in samples}
             if output_names != expected_names:
                 raise ValueError("退化输出文件名与输入数据集不一致，无法继承标注")
@@ -512,9 +525,22 @@ class JobAgent:
             )
         except ValueError as exc:
             raise ValueError(f"数据集类别无效: {exc}") from exc
-        source = Path(payload["directory"]).expanduser().resolve()
-        if not source.is_dir():
-            raise FileNotFoundError(f"导入目录不存在: {source}")
+        staged_upload_root = payload.get("staged_upload_root")
+        if staged_upload_root:
+            source = Path(payload["directory"]).expanduser().resolve()
+            resolved_annotation = (
+                Path(payload["annotation_path"]).expanduser().resolve()
+                if payload.get("annotation_path")
+                else None
+            )
+        else:
+            try:
+                source, resolved_annotation = resolve_local_dataset_import(
+                    payload,
+                    self.settings,
+                )
+            except DatasetImportError as exc:
+                raise ValueError(str(exc)) from exc
         candidates = sorted(
             path
             for path in source.rglob("*")
@@ -526,19 +552,32 @@ class JobAgent:
         target.mkdir(parents=True, exist_ok=True)
         for index, path in enumerate(candidates):
             self._check_cancelled(job["id"])
-            image_target = target / path.name
+            relative = Path(path.name) if staged_upload_root else path.relative_to(source)
+            image_target = target / relative
             if image_target.exists():
                 raise ValueError(
-                    f"图像目录中存在重复文件名，无法匹配标注: {path.name}"
+                    f"图像目标路径重复: {relative.as_posix()}"
                 )
-            shutil.copy2(path, image_target)
-            self._progress(job["id"], 10 + 70 * (index + 1) / len(candidates), f"复制图像 {index + 1}/{len(candidates)}")
+            image_target.parent.mkdir(parents=True, exist_ok=True)
+            if staged_upload_root:
+                shutil.copy2(path, image_target)
+                action = "保存上传图像"
+            else:
+                image_target.symlink_to(path.resolve())
+                action = "引用图像"
+            self._progress(
+                job["id"],
+                10 + 70 * (index + 1) / len(candidates),
+                f"{action} {index + 1}/{len(candidates)}",
+            )
         annotation = payload.get("annotation_path")
         annotation_status = "UNLABELED"
         annotation_count = 0
         if annotation:
-            annotation_path = Path(annotation).expanduser().resolve()
+            assert resolved_annotation is not None
+            annotation_path = resolved_annotation
             if annotation_path.is_file():
+                normalized_annotation: dict[str, Any] | None = None
                 if annotation_path.suffix.lower() == ".json":
                     annotation_payload = json.loads(
                         annotation_path.read_text(encoding="utf-8")
@@ -557,11 +596,42 @@ class JobAgent:
                         raise ValueError(
                             "COCO 标注中的类别 ID/名称与所选类别模板不一致"
                         )
+                    artifact_names = {
+                        path.relative_to(target).as_posix()
+                        for path in _dataset_image_files(target)
+                    }
+                    matched_names = set()
+                    for image in annotation_payload.get("images", []):
+                        matched = _match_dataset_sample_name(
+                            str(image.get("file_name", "")),
+                            artifact_names,
+                        )
+                        if not matched:
+                            raise ValueError(
+                                "COCO 标注图片无法与导入目录唯一匹配；"
+                                "存在重名图片时 file_name 必须包含相对路径"
+                            )
+                        if matched in matched_names:
+                            raise ValueError("COCO 标注中存在重复的图片路径")
+                        matched_names.add(matched)
+                        image["file_name"] = matched
+                    normalized_annotation = annotation_payload
                     annotation_target = target / "annotations" / "instances.json"
                     annotation_target.parent.mkdir(parents=True, exist_ok=True)
                 else:
                     annotation_target = target / annotation_path.name
-                shutil.copy2(annotation_path, annotation_target)
+                if normalized_annotation is None:
+                    shutil.copy2(annotation_path, annotation_target)
+                else:
+                    annotation_target.write_text(
+                        json.dumps(
+                            normalized_annotation,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
                 annotation_status = "CANDIDATE"
                 annotation_count = 1
             elif annotation_path.is_dir():
@@ -626,7 +696,6 @@ class JobAgent:
                 """,
                 (dataset_id, json_dump(dataset_categories), now),
             )
-        staged_upload_root = payload.get("staged_upload_root")
         if staged_upload_root:
             allowed_root = (
                 self.settings.task_dir / "import_uploads"
@@ -692,9 +761,8 @@ class JobAgent:
             raise ValueError(f"数据集 Artifact 不可用: {dataset['name']}")
         raster_files = [
             path
-            for path in sorted(dataset_directory.iterdir())
-            if path.is_file()
-            and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+            for path in _dataset_image_files(dataset_directory)
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
         ]
         if not raster_files:
             raise ValueError("数据集没有可供检测模型处理的栅格图片")
@@ -705,27 +773,32 @@ class JobAgent:
                 (dataset["id"],),
             )
         }
-        eligible_files = [path for path in raster_files if path.name not in existing_names]
+        eligible_files = [
+            path
+            for path in raster_files
+            if _dataset_sample_name(dataset_directory, path) not in existing_names
+        ]
         if not eligible_files:
             raise ValueError("数据集中的图片都已有标注，未执行自动覆盖")
 
         images: list[dict[str, Any]] = []
         image_dimensions: dict[int, tuple[str, int, int]] = {}
         for image_id, path in enumerate(eligible_files, start=1):
+            sample_name = _dataset_sample_name(dataset_directory, path)
             try:
                 with Image.open(path) as opened:
                     width, height = opened.size
             except OSError as exc:
-                raise ValueError(f"无法读取图片: {path.name}") from exc
+                raise ValueError(f"无法读取图片: {sample_name}") from exc
             images.append(
                 {
                     "id": image_id,
-                    "file_name": path.name,
+                    "file_name": sample_name,
                     "width": width,
                     "height": height,
                 }
             )
-            image_dimensions[image_id] = (path.name, width, height)
+            image_dimensions[image_id] = (sample_name, width, height)
 
         job_directory = self.settings.task_dir / job["id"]
         output_directory = self.settings.artifact_dir / "auto-annotations" / job["id"]

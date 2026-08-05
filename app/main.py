@@ -35,6 +35,7 @@ from app.services import (
     DatasetAnnotationError,
     DatasetArtifactError,
     DatasetDeletionError,
+    DatasetImportError,
     JobDeletionError,
     LocalModelRegistrationError,
     ModelDeletionError,
@@ -53,6 +54,7 @@ from app.services import (
     list_dataset_samples,
     list_datasets,
     list_jobs,
+    list_local_dataset_resources,
     list_local_model_resources,
     list_models,
     overview,
@@ -60,6 +62,7 @@ from app.services import (
     query_results,
     queue_job,
     register_local_detector_model,
+    resolve_local_dataset_import,
     save_sample_annotation,
     update_annotation_schema,
     validate_evaluation_categories,
@@ -218,7 +221,7 @@ def put_annotation_schema(
     return result
 
 
-@app.get("/api/datasets/{dataset_id}/samples/{sample_name}/annotations")
+@app.get("/api/datasets/{dataset_id}/samples/{sample_name:path}/annotations")
 def get_image_annotations(dataset_id: str, sample_name: str) -> dict[str, Any]:
     try:
         result = get_sample_annotation(dataset_id, sample_name)
@@ -229,7 +232,7 @@ def get_image_annotations(dataset_id: str, sample_name: str) -> dict[str, Any]:
     return result
 
 
-@app.put("/api/datasets/{dataset_id}/samples/{sample_name}/annotations")
+@app.put("/api/datasets/{dataset_id}/samples/{sample_name:path}/annotations")
 def put_image_annotations(
     dataset_id: str,
     sample_name: str,
@@ -297,6 +300,9 @@ def import_dataset(request: DatasetImportRequest) -> dict[str, Any]:
     payload = request.model_dump()
     try:
         payload["categories"] = normalize_categories(payload["categories"])
+        source, annotation = resolve_local_dataset_import(payload, settings)
+        payload["directory"] = str(source)
+        payload["annotation_path"] = str(annotation) if annotation else None
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return queue_job("DATASET_IMPORT", payload)
@@ -558,6 +564,17 @@ def get_local_model_resources(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@app.get("/api/local-dataset-resources")
+def get_local_dataset_resources(
+    path: str | None = None,
+    kind: str = Query(default="directory"),
+) -> dict[str, Any]:
+    try:
+        return list_local_dataset_resources(path, kind, settings)
+    except DatasetImportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.post("/api/local-detector-models", status_code=201)
 def create_local_detector_model(
     request: LocalDetectorModelRequest,
@@ -748,7 +765,11 @@ def get_environment_status() -> dict[str, Any]:
 
 
 settings.ensure_directories()
-app.mount("/artifacts", StaticFiles(directory=settings.artifact_dir), name="artifacts")
+app.mount(
+    "/artifacts",
+    StaticFiles(directory=settings.artifact_dir, follow_symlink=True),
+    name="artifacts",
+)
 
 frontend_dist = settings.root_dir / "frontend" / "dist"
 if frontend_dist.is_dir():

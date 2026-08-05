@@ -22,8 +22,9 @@ class AcquisitionRequest(BaseModel):
 
 class DatasetImportRequest(BaseModel):
     name: str = Field(min_length=2, max_length=120)
-    directory: str
+    directory: str = Field(min_length=1)
     annotation_path: str | None = None
+    annotation_format: Literal["COCO", "YOLO", "VISDRONE"] = "COCO"
     scene_domain: str = "未分类"
     category_template: str = Field(min_length=1, max_length=40)
     categories: list["CategoryInput"] = Field(min_length=1, max_length=1000)
@@ -134,7 +135,7 @@ class EvaluationPlanRequest(BaseModel):
     batch_size: int = Field(default=1, ge=1, le=64)
     precision: Literal["FP32", "FP16", "INT8"] = "FP16"
     warmup: int = Field(default=20, ge=0, le=200)
-    confidence: float = Field(default=0.25, ge=0, le=1)
+    confidence: float = Field(default=0.001, ge=0, le=1)
     nms_iou: float = Field(default=0.7, ge=0, le=1)
     image_size: int = Field(default=1280, ge=32, le=8192)
     input_height: int = Field(default=960, ge=32, le=8192)

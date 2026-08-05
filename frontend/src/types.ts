@@ -188,6 +188,8 @@ export interface BaseGenSceneSchema {
 }
 
 export interface ResultGroup {
+  comparison_id: string
+  configuration_id: string
   dataset_id: string
   dataset_name: string
   model_id: string
@@ -201,11 +203,27 @@ export interface ResultGroup {
   source_type: string
   is_demo: boolean
   is_official: boolean
+  inference_config: Record<string, string | number | boolean>
+  hardware_profile: Record<string, unknown>
+  environment_fingerprint?: string
+  condition_type: string
+  condition_strength: number | null
+  source_dataset_id?: string
   map_mean: number
   map_std: number
+  map50_mean: number
+  map75_mean: number
+  precision_mean: number
+  recall_mean: number
+  f1_mean: number
   latency_mean: number
+  latency_p95_mean: number
+  fps_mean: number
+  peak_memory_mean: number
   delta_map_mean: number
   seed_count: number
+  seeds: number[]
+  run_ids: string[]
   curves: { recall: number[]; precision: number[] }
 }
 
@@ -218,6 +236,10 @@ export interface ResultResponse {
     conditions: string[]
     resolutions: string[]
     models: string[]
+    model_options: Array<[string, string]>
+    dataset_options: Array<[string, string]>
+    condition_types: string[]
+    hardware: string[]
   }
 }
 

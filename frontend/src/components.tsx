@@ -89,20 +89,54 @@ export function Gallery({ images, height = 112 }: { images: string[]; height?: n
   )
 }
 
-export function ParetoChart({ groups, dark = false, height = 310 }: { groups: ResultGroup[]; dark?: boolean; height?: number }) {
+export function ParetoChart({ groups, dark = false, height = 310, onSelect }: { groups: ResultGroup[]; dark?: boolean; height?: number; onSelect?: (group: ResultGroup) => void }) {
+  const frontierIds = useMemo(() => {
+    let bestMap = Number.NEGATIVE_INFINITY
+    return new Set(
+      [...groups]
+        .sort((left, right) => left.latency_mean - right.latency_mean || right.map_mean - left.map_mean)
+        .filter((group) => {
+          if (group.map_mean <= bestMap) return false
+          bestMap = group.map_mean
+          return true
+        })
+        .map((group) => group.comparison_id),
+    )
+  }, [groups])
+  const frontier = useMemo(() => groups.filter((group) => frontierIds.has(group.comparison_id)).sort((left, right) => left.latency_mean - right.latency_mean), [groups, frontierIds])
   const option = useMemo(() => ({
     backgroundColor: 'transparent',
-    tooltip: { trigger: 'item', formatter: (params: { data: [number, number, string] }) => `${params.data[2]}<br/>时延 ${params.data[0]} ms<br/>mAP ${(params.data[1] * 100).toFixed(1)}%` },
-    grid: { left: 52, right: 24, top: 24, bottom: 45 },
+    tooltip: { trigger: 'item', formatter: (params: { data?: { value?: [number, number, number]; model?: string; dataset?: string; config?: string } }) => params.data?.value ? `${params.data.model}<br/>${params.data.dataset}<br/>配置 ${params.data.config}<br/>时延 ${params.data.value[0]} ms<br/>mAP ${(params.data.value[1] * 100).toFixed(2)}%<br/>显存 ${params.data.value[2]} MB` : 'Pareto前沿' },
+    legend: { top: 0, type: 'scroll', textStyle: { color: dark ? '#c6d1df' : '#4b5565' } },
+    grid: { left: 58, right: 24, top: 48, bottom: 45 },
     xAxis: { name: '时延 / ms', nameLocation: 'middle', nameGap: 30, splitLine: { lineStyle: { color: dark ? '#263449' : '#eef1f5' } }, axisLabel: { color: dark ? '#9dafc7' : '#687386' } },
-    yAxis: { name: 'mAP', min: 0.45, max: 0.9, splitLine: { lineStyle: { color: dark ? '#263449' : '#eef1f5' } }, axisLabel: { formatter: (v: number) => `${Math.round(v * 100)}%`, color: dark ? '#9dafc7' : '#687386' } },
-    series: [{
-      type: 'scatter', symbolSize: 15,
-      data: groups.map((item) => [item.latency_mean, item.map_mean, item.model_name]),
-      itemStyle: { color: '#22b8cf', borderColor: dark ? '#d6fbff' : '#087f9c', borderWidth: 1 },
-    }],
-  }), [groups, dark])
-  return <ReactECharts option={option} style={{ height }} />
+    yAxis: { name: 'mAP', scale: true, splitLine: { lineStyle: { color: dark ? '#263449' : '#eef1f5' } }, axisLabel: { formatter: (v: number) => `${Math.round(v * 100)}%`, color: dark ? '#9dafc7' : '#687386' } },
+    series: [
+      {
+        name: 'Pareto前沿',
+        type: 'line',
+        showSymbol: false,
+        silent: true,
+        lineStyle: { color: '#fa8c16', width: 2, type: 'dashed' },
+        data: frontier.map((group) => [group.latency_mean, group.map_mean]),
+      },
+      ...[...new Set(groups.map((group) => group.model_name))].map((modelName) => ({
+        name: modelName.split('·')[0],
+        type: 'scatter',
+        symbolSize: (value: number[]) => Math.max(12, Math.min(25, 12 + (value[2] || 0) / 1000)),
+        data: groups.filter((group) => group.model_name === modelName).map((group) => ({
+          value: [group.latency_mean, group.map_mean, group.peak_memory_mean] as [number, number, number],
+          comparisonId: group.comparison_id,
+          model: group.model_name,
+          dataset: group.dataset_name,
+          config: group.configuration_id,
+          symbol: group.inference_config.precision === 'FP32' ? 'diamond' : 'circle',
+          itemStyle: frontierIds.has(group.comparison_id) ? { borderColor: '#fa8c16', borderWidth: 4 } : { borderWidth: 1 },
+        })),
+      })),
+    ],
+  }), [groups, dark, frontier, frontierIds])
+  return <ReactECharts option={option} onEvents={onSelect ? { click: (params: { data?: { comparisonId?: string } }) => { const group = groups.find((item) => item.comparison_id === params.data?.comparisonId); if (group) onSelect(group) } } : undefined} style={{ height }} />
 }
 
 export function PRChart({ groups, dark = false, height = 290 }: { groups: ResultGroup[]; dark?: boolean; height?: number }) {

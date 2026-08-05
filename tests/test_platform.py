@@ -29,6 +29,7 @@ from app.detection_metrics import evaluate_coco_predictions
 from app.services import (
     DatasetAnnotationError,
     DatasetDeletionError,
+    DatasetImportError,
     CategoryCompatibilityError,
     JobDeletionError,
     LocalModelRegistrationError,
@@ -43,11 +44,13 @@ from app.services import (
     get_basegen_scene_schema,
     get_sample_annotation,
     list_dataset_samples,
+    list_local_dataset_resources,
     list_local_model_resources,
     preview_basegen_plan,
     query_results,
     queue_job,
     register_local_detector_model,
+    resolve_local_dataset_import,
     save_sample_annotation,
     update_annotation_schema,
     validate_evaluation_categories,
@@ -56,7 +59,11 @@ from app.worker import JobAgent
 
 
 def make_database(tmp_path: Path) -> tuple[Database, Settings]:
-    app_settings = Settings(root_dir=ROOT_DIR, data_dir=tmp_path / "data")
+    app_settings = Settings(
+        root_dir=ROOT_DIR,
+        data_dir=tmp_path / "data",
+        dataset_library_root=tmp_path,
+    )
     database = Database(app_settings)
     database.initialize()
     return database, app_settings
@@ -535,7 +542,6 @@ def test_local_detector_model_registration_uses_bounded_resources(
             "directory",
             app_settings,
         )
-
     model = register_local_detector_model(
         {
             "name": "自定义检测模型",
@@ -626,6 +632,150 @@ def test_local_detector_model_registration_uses_bounded_resources(
     assert database.row(
         "SELECT id FROM adapters WHERE id=?", (model["adapter_id"],)
     ) is None
+
+
+def test_local_dataset_resources_are_bounded_and_validate_import_paths(
+    tmp_path: Path,
+) -> None:
+    _, app_settings = make_database(tmp_path)
+    image_directory = tmp_path / "library" / "images"
+    annotation_file = tmp_path / "library" / "instances.json"
+    image_directory.mkdir(parents=True)
+    Image.new("RGB", (32, 24), (30, 90, 150)).save(
+        image_directory / "sample.jpg"
+    )
+    annotation_file.write_text("{}", encoding="utf-8")
+    (tmp_path / "library" / "notes.txt").write_text("ignored", encoding="utf-8")
+
+    listing = list_local_dataset_resources(
+        str(tmp_path / "library"),
+        "annotation",
+        app_settings,
+    )
+    assert [item["name"] for item in listing["entries"]] == [
+        "images",
+        "instances.json",
+    ]
+    source, annotation = resolve_local_dataset_import(
+        {
+            "directory": str(image_directory),
+            "annotation_path": str(annotation_file),
+            "annotation_format": "COCO",
+        },
+        app_settings,
+    )
+    assert source == image_directory
+    assert annotation == annotation_file
+
+    with pytest.raises(DatasetImportError, match="允许范围"):
+        list_local_dataset_resources(
+            str(tmp_path.parent),
+            "directory",
+            app_settings,
+        )
+    with pytest.raises(DatasetImportError, match="必须位于"):
+        resolve_local_dataset_import(
+            {"directory": str(tmp_path.parent)},
+            app_settings,
+        )
+
+
+def test_local_dataset_import_references_images_without_copying_source(
+    tmp_path: Path,
+) -> None:
+    database, app_settings = make_database(tmp_path)
+    source_directory = tmp_path / "reference-source"
+    source_directory.mkdir()
+    source_image = source_directory / "sample.png"
+    Image.new("RGB", (32, 24), (30, 90, 150)).save(source_image)
+
+    job = queue_job(
+        "DATASET_IMPORT",
+        {
+            "name": "引用模式数据集",
+            "directory": str(source_directory),
+            "annotation_path": None,
+            "scene_domain": "无人机航拍",
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
+        },
+        database,
+    )
+    assert JobAgent(database, app_settings).process_one()
+    completed = database.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
+    assert completed["status"] == "SUCCEEDED"
+    dataset = database.row("SELECT * FROM datasets WHERE name='引用模式数据集'")
+    linked_image = (
+        app_settings.artifact_dir / dataset["artifact_path"] / "sample.png"
+    )
+    assert linked_image.is_symlink()
+    assert linked_image.resolve() == source_image
+
+    result = delete_dataset(dataset["id"], database)
+    assert result and result["deleted"] is True
+    assert source_image.is_file()
+
+
+def test_local_dataset_import_preserves_duplicate_names_in_subdirectories(
+    tmp_path: Path,
+) -> None:
+    database, app_settings = make_database(tmp_path)
+    source_directory = tmp_path / "nested-source"
+    for folder, color in (("A", (180, 40, 40)), ("B", (40, 80, 180))):
+        directory = source_directory / folder
+        directory.mkdir(parents=True)
+        Image.new("RGB", (32, 24), color).save(directory / "sample.png")
+    annotation_path = tmp_path / "nested-instances.json"
+    annotation_path.write_text(
+        json.dumps(
+            {
+                "images": [
+                    {"id": 1, "file_name": "A/sample.png", "width": 32, "height": 24},
+                    {"id": 2, "file_name": "B/sample.png", "width": 32, "height": 24},
+                ],
+                "annotations": [
+                    {"id": 1, "image_id": 1, "category_id": 1, "bbox": [2, 3, 8, 6]},
+                    {"id": 2, "image_id": 2, "category_id": 1, "bbox": [4, 5, 10, 7]},
+                ],
+                "categories": [{"id": 1, "name": "car"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = queue_job(
+        "DATASET_IMPORT",
+        {
+            "name": "子目录同名图像",
+            "directory": str(source_directory),
+            "annotation_path": str(annotation_path),
+            "annotation_format": "COCO",
+            "scene_domain": "无人机航拍",
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
+        },
+        database,
+    )
+
+    assert JobAgent(database, app_settings).process_one()
+    completed = database.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
+    assert completed["status"] == "SUCCEEDED"
+    dataset = database.row("SELECT * FROM datasets WHERE name='子目录同名图像'")
+    artifact = app_settings.artifact_dir / dataset["artifact_path"]
+    assert (artifact / "A/sample.png").is_symlink()
+    assert (artifact / "B/sample.png").is_symlink()
+    page = list_dataset_samples(dataset["id"], 0, 50, database)
+    assert [item["name"] for item in page["items"]] == [
+        "A/sample.png",
+        "B/sample.png",
+    ]
+    assert [item["boxes"][0]["x"] for item in page["items"]] == [
+        pytest.approx(2 / 32),
+        pytest.approx(4 / 32),
+    ]
+    first = get_sample_annotation(dataset["id"], "A/sample.png", database)
+    second = get_sample_annotation(dataset["id"], "B/sample.png", database)
+    assert first and first["boxes"][0]["x"] == pytest.approx(2)
+    assert second and second["boxes"][0]["x"] == pytest.approx(4)
 
 
 def test_model_deletion_rejects_historical_references(
@@ -893,6 +1043,87 @@ def test_result_query_keeps_resolution_as_group_dimension(tmp_path: Path) -> Non
     assert len(result["groups"]) == 6
     assert {group["resolution"] for group in result["groups"]} == {"1920×1080"}
     assert all(group["seed_count"] == 3 for group in result["groups"])
+
+
+def test_result_query_does_not_merge_different_inference_configs(
+    tmp_path: Path,
+) -> None:
+    database, _ = make_database(tmp_path)
+    now = utc_now()
+    database.execute(
+        """
+        INSERT INTO runs
+        (id,plan_id,job_id,dataset_id,model_id,seed,status,config,
+         environment_fingerprint,hardware_profile,created_at,finished_at)
+        VALUES (?,?,?,?,?,?, 'SUCCEEDED', ?,?,?,?,?)
+        """,
+        (
+            "run_different_resolution",
+            None,
+            None,
+            "dataset_aerial_clean",
+            "model_yolov5s_demo",
+            2001,
+            json_dump(
+                {
+                    "batch_size": 1,
+                    "warmup": 20,
+                    "blur_level": 0,
+                    "image_size": 640,
+                }
+            ),
+            "reference-demo-environment",
+            json_dump({"device": "流程样例设备", "comparable": True}),
+            now,
+            now,
+        ),
+    )
+    database.execute(
+        """
+        INSERT INTO results
+        (id,run_id,map,map50,map75,precision,recall,f1,latency_p50,
+         latency_p95,fps,peak_memory,delta_map,metrics,curves,is_official,
+         created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "result_different_resolution",
+            "run_different_resolution",
+            0.75,
+            0.85,
+            0.70,
+            0.80,
+            0.78,
+            0.79,
+            9.0,
+            11.0,
+            111.11,
+            1800.0,
+            -0.04,
+            json_dump({}),
+            json_dump({"recall": [0, 1], "precision": [1, 0]}),
+            0,
+            now,
+        ),
+    )
+
+    result = query_results(scene="无人机航拍", database=database)
+    comparable = [
+        group
+        for group in result["groups"]
+        if group["dataset_id"] == "dataset_aerial_clean"
+        and group["model_id"] == "model_yolov5s_demo"
+    ]
+    assert len(comparable) == 2
+    assert sorted(group["seed_count"] for group in comparable) == [1, 3]
+    resized = next(
+        group
+        for group in comparable
+        if group["inference_config"].get("image_size") == 640
+    )
+    assert resized["inference_config"]["input_resolution"] == "640×640"
+    assert resized["map50_mean"] == pytest.approx(0.85)
+    assert resized["latency_p95_mean"] == pytest.approx(11)
 
 
 def test_replay_adapter_job_creates_dataset_draft(tmp_path: Path) -> None:
@@ -1697,6 +1928,9 @@ def test_local_import_can_feed_diffusiondegrade_fog(
     imported = database.row("SELECT * FROM datasets WHERE name='真实航拍导入'")
     assert imported and imported["source_type"] == "REAL"
     imported_directory = app_settings.artifact_dir / imported["artifact_path"]
+    imported_image = imported_directory / "aerial.png"
+    assert imported_image.is_symlink()
+    assert imported_image.resolve() == source_directory / "aerial.png"
     annotation_directory = imported_directory / "annotations"
     annotation_directory.mkdir()
     (annotation_directory / "instances.json").write_text(
@@ -1786,6 +2020,7 @@ def test_local_import_can_feed_diffusiondegrade_fog(
     assert transformed["scene_domain"] == "无人机航拍"
     assert transformed["weather"] == "雾"
     assert transformed["annotation_status"] == "CANDIDATE"
+    assert json.loads(transformed["sensor_conditions"])["fog_strength"] == pytest.approx(0.6)
     outputs = list((app_settings.artifact_dir / transformed["artifact_path"]).glob("*.png"))
     assert len(outputs) == 1
     assert (

@@ -86,6 +86,12 @@ class Settings:
             "/home/yons/miniforge3/envs",
         )
     )
+    dataset_library_root: Path = Path(
+        os.environ.get(
+            "PERCEPTION_EVAL_DATASET_LIBRARY_ROOT",
+            "/",
+        )
+    )
     adapter_timeout_seconds: int = int(
         os.environ.get("PERCEPTION_EVAL_ADAPTER_TIMEOUT_SECONDS", "7200")
     )

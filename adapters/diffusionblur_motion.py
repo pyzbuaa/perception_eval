@@ -93,14 +93,18 @@ def run(request_path: Path, result_path: Path) -> None:
     if request.get("protocol_version") != "1.0":
         raise ValueError("仅支持 1.0 版 Adapter 协议")
     motion, strength, sample_timesteps = parse_parameters(request)
-    inputs = [Path(value).expanduser().resolve() for value in request.get("input_images", [])]
+    input_links = [
+        Path(value).expanduser().absolute()
+        for value in request.get("input_images", [])
+    ]
+    inputs = [path.resolve() for path in input_links]
     count = int(request.get("sample_count", len(inputs)))
     if count < 1 or count != len(inputs):
         raise ValueError("无人机运动模糊必须处理输入数据集中的全部图像")
     if not all(path.is_file() for path in inputs):
         raise FileNotFoundError("输入数据集中存在无法读取的图像")
-    if len({path.name for path in inputs}) != len(inputs):
-        raise ValueError("输入图像文件名重复，无法保持标注文件名映射")
+    input_directory = Path(request["input_directory"]).expanduser().resolve()
+    relatives = [path.relative_to(input_directory) for path in input_links]
 
     output_directory = Path(request["output_directory"]).expanduser().resolve()
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -115,7 +119,7 @@ def run(request_path: Path, result_path: Path) -> None:
     seeds = request.get("seeds") or [request.get("seed", 2023)]
     started = time.perf_counter()
     samples: list[dict[str, Any]] = []
-    for index, input_path in enumerate(inputs):
+    for index, (input_path, relative) in enumerate(zip(inputs, relatives)):
         seed = int(seeds[index % len(seeds)]) + index
         with Image.open(input_path) as opened:
             input_image = np.array(opened.convert("RGB"), dtype=np.uint8, copy=True)
@@ -128,12 +132,13 @@ def run(request_path: Path, result_path: Path) -> None:
             sample_timesteps=sample_timesteps,
             seed=seed,
         )[:height, :width]
-        output_path = output_directory / input_path.name
+        output_path = output_directory / relative
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(output).save(output_path)
         samples.append(
             {
                 "sample_id": f"{request['job_id']}-{index + 1}",
-                "image_path": output_path.name,
+                "image_path": relative.as_posix(),
                 "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
                 "width": width,
                 "height": height,

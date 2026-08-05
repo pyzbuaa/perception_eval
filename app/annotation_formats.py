@@ -40,13 +40,15 @@ def convert_visdrone_to_coco(
     description: str,
 ) -> dict[str, Any]:
     label_files = {
-        path.stem: path
+        path.relative_to(label_directory).with_suffix("").as_posix(): path
         for path in sorted(label_directory.rglob("*.txt"))
     }
     image_paths = [
         path
-        for path in sorted(image_directory.iterdir())
-        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        for path in sorted(image_directory.rglob("*"))
+        if path.is_file()
+        and path.suffix.lower() in IMAGE_SUFFIXES
+        and "annotations" not in path.relative_to(image_directory).parts
     ]
     if not image_paths:
         raise ValueError("VisDrone 转换没有找到图像")
@@ -59,17 +61,38 @@ def convert_visdrone_to_coco(
     ignored_count = 0
     missing_label_count = 0
     for image_id, image_path in enumerate(image_paths, start=1):
+        relative_image = image_path.relative_to(image_directory)
         with Image.open(image_path) as image:
             width, height = image.width, image.height
         images.append(
             {
                 "id": image_id,
-                "file_name": image_path.name,
+                "file_name": relative_image.as_posix(),
                 "width": width,
                 "height": height,
             }
         )
-        label_path = label_files.get(image_path.stem)
+        label_key = relative_image.with_suffix("").as_posix()
+        label_path = label_files.get(label_key)
+        if not label_path:
+            path_matches = [
+                path
+                for key, path in label_files.items()
+                if key.endswith(f"/{label_key}")
+                or label_key.endswith(f"/{key}")
+            ]
+            label_path = path_matches[0] if len(path_matches) == 1 else None
+        if not label_path:
+            basename_matches = [
+                path
+                for key, path in label_files.items()
+                if Path(key).name == relative_image.stem
+            ]
+            label_path = (
+                basename_matches[0]
+                if len(basename_matches) == 1
+                else None
+            )
         if not label_path:
             missing_label_count += 1
             continue

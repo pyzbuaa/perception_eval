@@ -232,6 +232,12 @@ Conda 环境：/home/yons/miniforge3/envs
 可以在启动前通过 `PERCEPTION_EVAL_MODEL_LIBRARY_ROOT` 和
 `PERCEPTION_EVAL_MODEL_ENVIRONMENT_ROOT` 修改这两个只读浏览根目录。
 
+本地数据导入直接读取服务器上的目录，不经过浏览器上传。默认从文件系统根目录
+`/` 开始浏览；可通过
+`PERCEPTION_EVAL_DATASET_LIBRARY_ROOT` 修改允许访问的数据根目录。导入任务仍会在
+平台 Artifact 中创建图像符号链接并保存派生标注，不复制源图像，也不会修改源数据。
+源图像被移动、改名或删除后，对应平台数据集将不可用。
+
 命令参数在页面中每行填写一个，平台直接以参数数组启动进程，不使用 `shell=True`。
 例如：
 
