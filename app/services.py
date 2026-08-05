@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -14,7 +15,11 @@ from urllib.parse import quote
 
 from PIL import Image
 
-from app.category_templates import normalize_categories, normalize_category_name
+from app.category_templates import (
+    normalize_categories,
+    normalize_category_name,
+    template_categories,
+)
 from app.command_protocol import (
     CommandTemplateError,
     command_placeholders,
@@ -362,6 +367,128 @@ def resolve_local_dataset_import(
     else:
         raise DatasetImportError("标注格式不受支持")
     return source, annotation
+
+
+def _parse_yolo_category_file(annotation_directory: Path) -> tuple[Path, list[dict[str, Any]]]:
+    names_files = sorted(annotation_directory.rglob("*.names"))
+    if names_files:
+        path = names_files[0]
+        names = [
+            line.strip()
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if names:
+            return path, [
+                {"id": index, "name": name}
+                for index, name in enumerate(names)
+            ]
+
+    yaml_files = sorted(
+        annotation_directory.rglob("*.yaml")
+    ) + sorted(annotation_directory.rglob("*.yml"))
+    for path in yaml_files:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.startswith("names:"):
+                continue
+            inline = stripped.partition(":")[2].strip()
+            if inline:
+                try:
+                    parsed = ast.literal_eval(inline)
+                except (SyntaxError, ValueError):
+                    parsed = [item.strip(" '\"") for item in inline.strip("[]").split(",")]
+                if isinstance(parsed, dict):
+                    categories = [
+                        {"id": int(category_id), "name": str(name)}
+                        for category_id, name in parsed.items()
+                    ]
+                elif isinstance(parsed, (list, tuple)):
+                    categories = [
+                        {"id": category_id, "name": str(name)}
+                        for category_id, name in enumerate(parsed)
+                    ]
+                else:
+                    categories = []
+                if categories:
+                    return path, normalize_categories(categories)
+
+            block: list[dict[str, Any]] = []
+            for item in lines[index + 1 :]:
+                if item and not item[0].isspace():
+                    break
+                value = item.strip()
+                if not value or value.startswith("#"):
+                    continue
+                if value.startswith("-"):
+                    block.append(
+                        {
+                            "id": len(block),
+                            "name": value[1:].strip().strip("'\""),
+                        }
+                    )
+                    continue
+                category_id, separator, name = value.partition(":")
+                if separator and category_id.strip().isdigit():
+                    block.append(
+                        {
+                            "id": int(category_id.strip()),
+                            "name": name.split("#", 1)[0].strip().strip("'\""),
+                        }
+                    )
+            if block:
+                return path, normalize_categories(block)
+    raise DatasetImportError(
+        "YOLO 标注目录中没有可读取的类别定义；请提供 data.yaml、*.yaml 或 *.names"
+    )
+
+
+def read_dataset_annotation_categories(
+    annotation_path: str | Path,
+    annotation_format: str,
+    app_settings=None,
+) -> dict[str, Any]:
+    app_settings = app_settings or settings
+    root = app_settings.dataset_library_root.expanduser().resolve()
+    path = Path(annotation_path).expanduser().resolve()
+    if not path.is_relative_to(root):
+        raise DatasetImportError(f"标注路径必须位于 {root} 内")
+    annotation_format = annotation_format.upper()
+    if annotation_format == "COCO":
+        if not path.is_file() or path.suffix.lower() != ".json":
+            raise DatasetImportError("COCO 标注必须选择 JSON 文件")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DatasetImportError(f"COCO 标注文件无法读取: {exc}") from exc
+        try:
+            categories = normalize_categories(payload.get("categories", []))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DatasetImportError(f"COCO 标注没有有效的 categories: {exc}") from exc
+        return {
+            "categories": categories,
+            "category_template": "annotation",
+            "source": str(path),
+        }
+    if annotation_format == "VISDRONE":
+        if not path.is_dir():
+            raise DatasetImportError("VISDRONE 标注必须选择目录")
+        return {
+            "categories": template_categories("visdrone", "dataset"),
+            "category_template": "visdrone",
+            "source": "VisDrone 标准类别模板",
+        }
+    if annotation_format == "YOLO":
+        if not path.is_dir():
+            raise DatasetImportError("YOLO 标注必须选择目录")
+        category_path, categories = _parse_yolo_category_file(path)
+        return {
+            "categories": categories,
+            "category_template": "annotation",
+            "source": str(category_path),
+        }
+    raise DatasetImportError("标注格式不受支持")
 
 
 def list_local_model_resources(

@@ -27,7 +27,7 @@ class DatasetImportRequest(BaseModel):
     annotation_format: Literal["COCO", "YOLO", "VISDRONE"] = "COCO"
     scene_domain: str = "未分类"
     category_template: str = Field(min_length=1, max_length=40)
-    categories: list["CategoryInput"] = Field(min_length=1, max_length=1000)
+    categories: list["CategoryInput"] = Field(default_factory=list, max_length=1000)
 
 
 class CategoryInput(BaseModel):

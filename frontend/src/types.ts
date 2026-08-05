@@ -52,6 +52,12 @@ export interface CategoryTemplate {
   }>
 }
 
+export interface DatasetAnnotationCategories {
+  categories: CategoryDefinition[]
+  category_template: string
+  source: string
+}
+
 export interface DatasetSamplePage {
   dataset_id: string
   dataset_name: string

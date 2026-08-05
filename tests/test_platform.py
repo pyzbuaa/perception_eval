@@ -49,12 +49,14 @@ from app.services import (
     preview_basegen_plan,
     query_results,
     queue_job,
+    read_dataset_annotation_categories,
     register_local_detector_model,
     resolve_local_dataset_import,
     save_sample_annotation,
     update_annotation_schema,
     validate_evaluation_categories,
 )
+from app.schemas import DatasetImportRequest
 from app.worker import JobAgent
 
 
@@ -678,6 +680,85 @@ def test_local_dataset_resources_are_bounded_and_validate_import_paths(
             {"directory": str(tmp_path.parent)},
             app_settings,
         )
+
+
+def test_annotated_dataset_categories_are_read_from_annotation_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, app_settings = make_database(tmp_path)
+    image_directory = tmp_path / "annotated-images"
+    image_directory.mkdir()
+    Image.new("RGB", (32, 24), (30, 90, 150)).save(
+        image_directory / "sample.png"
+    )
+    coco_path = tmp_path / "instances.json"
+    coco_path.write_text(
+        json.dumps(
+            {
+                "images": [{"id": 1, "file_name": "sample.png"}],
+                "annotations": [],
+                "categories": [
+                    {"id": 3, "name": "car"},
+                    {"id": 8, "name": "truck"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    detected = read_dataset_annotation_categories(
+        coco_path,
+        "COCO",
+        app_settings,
+    )
+    assert detected["categories"] == [
+        {"id": 3, "name": "car"},
+        {"id": 8, "name": "truck"},
+    ]
+
+    yolo_directory = tmp_path / "yolo-labels"
+    yolo_directory.mkdir()
+    (yolo_directory / "data.yaml").write_text(
+        "names:\n  0: pedestrian\n  1: car\n",
+        encoding="utf-8",
+    )
+    detected = read_dataset_annotation_categories(
+        yolo_directory,
+        "YOLO",
+        app_settings,
+    )
+    assert detected["categories"] == [
+        {"id": 0, "name": "pedestrian"},
+        {"id": 1, "name": "car"},
+    ]
+
+    captured: dict[str, object] = {}
+
+    def capture_job(job_type: str, payload: dict[str, object]) -> dict[str, str]:
+        captured["job_type"] = job_type
+        captured["payload"] = payload
+        return {"id": "job_annotation_categories", "status": "QUEUED"}
+
+    monkeypatch.setattr(main_module, "settings", app_settings)
+    monkeypatch.setattr(main_module, "queue_job", capture_job)
+    main_module.import_dataset(
+        DatasetImportRequest(
+            name="类别自动读取",
+            directory=str(image_directory),
+            annotation_path=str(coco_path),
+            annotation_format="COCO",
+            scene_domain="无人机航拍",
+            category_template="custom",
+            categories=[{"id": 0, "name": "wrong"}],
+        )
+    )
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["categories"] == [
+        {"id": 3, "name": "car"},
+        {"id": 8, "name": "truck"},
+    ]
+    assert payload["category_template"] == "annotation"
 
 
 def test_local_dataset_import_references_images_without_copying_source(

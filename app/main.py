@@ -61,6 +61,7 @@ from app.services import (
     preview_basegen_plan,
     query_results,
     queue_job,
+    read_dataset_annotation_categories,
     register_local_detector_model,
     resolve_local_dataset_import,
     save_sample_annotation,
@@ -299,10 +300,19 @@ def create_auto_annotations(
 def import_dataset(request: DatasetImportRequest) -> dict[str, Any]:
     payload = request.model_dump()
     try:
-        payload["categories"] = normalize_categories(payload["categories"])
         source, annotation = resolve_local_dataset_import(payload, settings)
         payload["directory"] = str(source)
         payload["annotation_path"] = str(annotation) if annotation else None
+        if annotation:
+            detected = read_dataset_annotation_categories(
+                annotation,
+                payload["annotation_format"],
+                settings,
+            )
+            payload["categories"] = detected["categories"]
+            payload["category_template"] = detected["category_template"]
+        else:
+            payload["categories"] = normalize_categories(payload["categories"])
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return queue_job("DATASET_IMPORT", payload)
@@ -571,6 +581,21 @@ def get_local_dataset_resources(
 ) -> dict[str, Any]:
     try:
         return list_local_dataset_resources(path, kind, settings)
+    except DatasetImportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/local-dataset-annotation-categories")
+def get_local_dataset_annotation_categories(
+    annotation_path: str = Query(min_length=1),
+    annotation_format: str = Query(default="COCO"),
+) -> dict[str, Any]:
+    try:
+        return read_dataset_annotation_categories(
+            annotation_path,
+            annotation_format,
+            settings,
+        )
     except DatasetImportError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

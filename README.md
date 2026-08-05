@@ -219,6 +219,9 @@ export DIFFUSION_BLUR_CHECKPOINT=/absolute/path/to/ID_Blau.pth
 数据构建和模型注册均需选择目标检测类别。平台内置 COCO 2017、
 VisDrone 和 Pascal VOC 类别模板；自定义类别可逐项填写，也可从 JSON 类别数组、
 COCO JSON 的 `categories` 字段或每行 `id,name` 的 CSV/TXT 文件读取。
+本地导入包含标注时，平台直接从 COCO `categories`、YOLO `data.yaml`/`.names`
+或 VisDrone 标准模板读取类别，页面只展示确认；未提供标注时，必须选择模板或
+手动配置计划检测的类别。
 VisDrone 和 Pascal VOC 模板生成的 COCO 类别 ID 均从 0 开始；VisDrone 原始 TXT
 中的 1–10 类别编号会在导入时自动转换为 0–9。
 评测要求数据集与模型的类别名称集合完全一致，ID 可以不同；平台在运行时
