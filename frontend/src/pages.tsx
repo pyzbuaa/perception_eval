@@ -1692,12 +1692,53 @@ const emptyLocalModelDraft = (): LocalModelDraft => ({
   weight_path: '',
 })
 
+type LocalCommandExecution = {
+  mode?: string
+  working_directory?: string
+  arguments?: string[]
+}
+
+function copiedLocalModelDraft(model: ModelVersion, adapter: Adapter): LocalModelDraft | undefined {
+  const properties = (adapter.parameter_schema?.properties || {}) as Record<string, InferenceProperty>
+  const execution = (adapter.parameter_schema?.execution || {}) as LocalCommandExecution
+  const projectDirectory = properties.project_directory?.const
+  if (execution.mode !== 'command' || !Array.isArray(execution.arguments) || typeof projectDirectory !== 'string') return undefined
+  const precision = model.precision === 'FP32' ? 'FP32' : 'FP16'
+  return {
+    name: `${model.name} 副本`,
+    family: model.family,
+    architecture: model.architecture,
+    backbone: model.backbone,
+    detector_head: model.detector_head,
+    training_dataset: model.training_dataset,
+    pretrained_dataset: model.pretrained_dataset,
+    version: model.version,
+    precision,
+    project_directory: projectDirectory,
+    working_directory: execution.working_directory || projectDirectory,
+    runtime_prefix: adapter.runtime_prefix || '',
+    command_arguments: execution.arguments.join('\n'),
+    inference_defaults: {
+      confidence: inferenceDefault(properties, 'confidence', 0.25),
+      nms_iou: inferenceDefault(properties, 'nms_iou', 0.7),
+      image_size: inferenceDefault(properties, 'image_size', 1280),
+      input_height: inferenceDefault(properties, 'input_height', 960),
+      input_width: inferenceDefault(properties, 'input_width', 1280),
+      max_detections: inferenceDefault(properties, 'max_detections', 300),
+      batch_size: inferenceDefault(properties, 'batch_size', 1),
+      warmup: inferenceDefault(properties, 'warmup', 0),
+    },
+    weight_path: model.weight_path || '',
+  }
+}
+
 export function RegistryPage({ refresh }: PageProps) {
   const adapters = useResource<Adapter[]>('/api/adapters', [])
   const models = useResource<ModelVersion[]>('/api/models', [])
   const categoryTemplates = useResource<CategoryTemplate[]>('/api/category-templates', [])
   const [registerOpen, setRegisterOpen] = useState(false)
   const [registering, setRegistering] = useState(false)
+  const [copySourceName, setCopySourceName] = useState<string>()
   const [selectedModel, setSelectedModel] = useState<ModelVersion>()
   const [categoryTemplateId, setCategoryTemplateId] = useState('visdrone')
   const [customModelCategories, setCustomModelCategories] = useState<CategoryDefinition[]>([{ id: 0, name: '' }])
@@ -1716,6 +1757,30 @@ export function RegistryPage({ refresh }: PageProps) {
   const commandSupports = (name: string) => draft.command_arguments.includes(`{${name}}`)
   const modelCategories = categoriesFromSelection(categoryTemplates.data, categoryTemplateId, 'model', customModelCategories)
   const selectedInferenceProperties = modelInferenceProperties(selectedModel, adapters.data)
+  const openBlankRegistration = () => {
+    setDraft(emptyLocalModelDraft())
+    setCategoryTemplateId('visdrone')
+    setCustomModelCategories([{ id: 0, name: '' }])
+    setCopySourceName(undefined)
+    setRegisterOpen(true)
+  }
+  const copyRegistration = (model: ModelVersion) => {
+    const adapter = adapters.data.find((item) => item.id === model.adapter_id)
+    const copiedDraft = adapter && copiedLocalModelDraft(model, adapter)
+    if (!copiedDraft) {
+      message.error('该模型没有可复制的本地命令配置')
+      return
+    }
+    const templateId = categoryTemplates.data.some((item) => item.id === model.category_template)
+      ? model.category_template
+      : 'custom'
+    setDraft(copiedDraft)
+    setCategoryTemplateId(templateId)
+    setCustomModelCategories(model.categories.map((item) => ({ ...item })))
+    setCopySourceName(model.name)
+    setSelectedModel(undefined)
+    setRegisterOpen(true)
+  }
   const selectResource = (path: string) => {
     if (!picker) return
     if (picker.field === 'project_directory') {
@@ -1770,6 +1835,7 @@ export function RegistryPage({ refresh }: PageProps) {
       setDraft(emptyLocalModelDraft())
       setCategoryTemplateId('visdrone')
       setCustomModelCategories([{ id: 0, name: '' }])
+      setCopySourceName(undefined)
       await Promise.all([models.reload(), adapters.reload()])
     } catch (error) {
       message.error((error as Error).message)
@@ -1793,7 +1859,7 @@ export function RegistryPage({ refresh }: PageProps) {
     && draft.weight_path,
   )
   const modelsCard = (
-    <Card extra={<Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterOpen(true)}>注册本地检测模型</Button>}>
+    <Card extra={<Button type="primary" icon={<PlusOutlined />} onClick={openBlankRegistration}>注册本地检测模型</Button>}>
       <Table rowKey="id" loading={models.loading} dataSource={models.data} scroll={{ x: 1650 }} onRow={(row) => ({ onClick: () => setSelectedModel(row), style: { cursor: 'pointer' } })} columns={[
         { title: '模型', dataIndex: 'name', render: (value, row) => <Space><Typography.Text strong>{value}</Typography.Text>{row.is_demo && <DemoTag />}</Space> },
         { title: '模型族', dataIndex: 'family' },
@@ -1808,7 +1874,7 @@ export function RegistryPage({ refresh }: PageProps) {
         { title: '权重', dataIndex: 'weight_path', render: (value) => value ? <Typography.Text ellipsis={{ tooltip: value }} style={{ maxWidth: 180 }}>{String(value).split('/').pop()}</Typography.Text> : '—' },
         { title: '状态', dataIndex: 'status', render: (value) => <StatusTag status={value} /> },
         { title: '运行环境', render: (_, row) => <StatusTag status={adapters.data.find((item) => item.id === row.adapter_id)?.status || (adapters.loading ? 'CHECKING' : 'UNAVAILABLE')} /> },
-        { title: '操作', render: (_, row) => <span onClick={(event) => event.stopPropagation()}><Space><Button type="link" onClick={() => health(row.adapter_id)}>健康检查</Button><Popconfirm title="确认删除这个模型？" description="仅删除平台注册记录，不删除模型项目、环境或权重；存在评测引用时会拒绝删除。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => removeModel(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm></Space></span> },
+        { title: '操作', render: (_, row) => <span onClick={(event) => event.stopPropagation()}><Space>{!row.is_demo && <Button type="link" onClick={() => copyRegistration(row)}>复制注册</Button>}<Button type="link" onClick={() => health(row.adapter_id)}>健康检查</Button><Popconfirm title="确认删除这个模型？" description="仅删除平台注册记录，不删除模型项目、环境或权重；存在评测引用时会拒绝删除。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => removeModel(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm></Space></span> },
       ]} />
     </Card>
   )
@@ -1818,14 +1884,14 @@ export function RegistryPage({ refresh }: PageProps) {
       <Drawer
         open={registerOpen}
         width={760}
-        title="注册本地检测模型"
+        title={copySourceName ? `基于“${copySourceName}”复制注册` : '注册本地检测模型'}
         onClose={() => setRegisterOpen(false)}
       >
         <Alert
           type="info"
           showIcon
-          message="配置结构化执行命令"
-          description="平台按参数数组直接启动进程，不经过 Shell。命令只需在指定位置生成 COCO predictions.json；同一项目的不同模型可以登记不同权重和参数。"
+          message={copySourceName ? '已复制已有模型配置' : '配置结构化执行命令'}
+          description={copySourceName ? '请重点检查模型名称、版本、结构差异、权重和命令中的固定配置参数，然后注册为新的模型记录。' : '平台按参数数组直接启动进程，不经过 Shell。命令只需在指定位置生成 COCO predictions.json；同一项目的不同模型可以登记不同权重和参数。'}
         />
         <Form layout="vertical" className="top-gap">
           <Row gutter={12}>
@@ -1903,6 +1969,7 @@ export function RegistryPage({ refresh }: PageProps) {
         open={Boolean(selectedModel)}
         width={720}
         title={selectedModel ? `${selectedModel.name} · 模型参数` : '模型参数'}
+        extra={selectedModel && !selectedModel.is_demo ? <Button onClick={() => copyRegistration(selectedModel)}>复制注册</Button> : undefined}
         onClose={() => setSelectedModel(undefined)}
       >
         {selectedModel && (
