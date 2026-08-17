@@ -92,7 +92,7 @@ export BASEGEN_CONDA_PREFIX=/absolute/path/to/conda/env
 整数。同一份字段规则和起始 seed 会得到相同的场景组合。首个任务可能需要将模型权重
 下载到 `.runtime/cache/huggingface`。
 
-可以先在“数据构建”的 `Z-Image-Turbo` 来源卡片中执行健康检查，或调用：
+可以先在“数据构建”的 `Z-Image-Turbo` 来源卡片中执行接口测试，或调用：
 
 ```bash
 curl -X POST http://127.0.0.1:18080/api/adapters/adapter_basegen/health-check
@@ -314,7 +314,7 @@ export DRONEDETS_YOLOV8M_WEIGHT=/absolute/path/to/best.pt
 使用步骤：
 
 1. 在“数据集”页面完成目标检测标注，导出 COCO `instances.json`，然后冻结数据集。
-2. 在“模型版本”页面对 `DroneDets · YOLOv8m VisDrone` 执行健康检查。
+2. 在“模型版本”页面对 `DroneDets · YOLOv8m VisDrone` 执行接口测试。
 3. 在“评测中心”选择已冻结数据集和该真实模型；首版支持 FP16/FP32、batch size 1。
 4. 启动评测，在“任务中心”查看推理进度，在“效能探索”查看 mAP、AP50、AP75、PR、
    时延、FPS 和显存指标。

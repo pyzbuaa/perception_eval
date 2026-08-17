@@ -268,7 +268,7 @@ export function OverviewPage({ dark, navigate, overview }: PageProps & { overvie
 const sourceCards = [
   { id: 'local-import', source: 'REAL', icon: <ImportOutlined />, title: '本地数据导入', description: '导入本地 PNG/JPEG图像及可选 COCO/YOLO/VisDrone格式标注文件。', recommended: true },
   { id: 'adapter_basegen', source: 'GENERATIVE', icon: <RobotOutlined />, title: '基础图像生成', description: '调用生成式模型生成感知数据。' },
-  { id: 'adapter_condition', source: 'REAL_TRANSFORMED', icon: <CloudOutlined />, title: '非理想条件生成', description: '为无人机航拍图像生成有雾域或运动模糊版本。' },
+  { id: 'adapter_condition', source: 'REAL_TRANSFORMED', icon: <CloudOutlined />, title: '非理想条件生成', description: '运动模糊、弱光、...' },
   { id: 'airsim-future', source: 'SIMULATOR', icon: <CodeOutlined />, title: 'AirSim / UE', description: '通过独立 RPC 服务采集图像与真值。', disabled: true },
   { id: 'adapter_replay', source: 'REPLAY_FIXTURE', icon: <PlayCircleOutlined />, title: '测试回放', description: '固定样例验证生成任务、标注与评测闭环。', recommended: true },
 ]
@@ -603,7 +603,7 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
     try {
       const adapterId = id === 'adapter_condition' ? conditionAdapterId : id
       const result = await post<{ healthy: boolean }>(`/api/adapters/${adapterId}/health-check`)
-      result.healthy ? message.success('数据来源健康检查通过') : message.warning('数据来源当前不可用')
+      result.healthy ? message.success('数据来源接口测试通过') : message.warning('数据来源当前不可用')
       await sourceRuntimes.reload()
     } catch (error) {
       message.error((error as Error).message)
@@ -706,11 +706,11 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
   return (
     <Space direction="vertical" size={18} style={{ width: '100%' }}>
       <Steps current={step} items={(source.id === 'local-import' ? ['选择来源', '导入配置', '导入确认', '执行导入', '真值冻结'] : ['选择来源', '配置条件', '组合预览', '执行与浏览', '真值冻结']).map((title) => ({ title }))} />
-      {step === 0 && <Card title="选择数据来源" extra={<Tag color="purple">BaseGen 已接入</Tag>}>
+      {step === 0 && <Card title="选择数据来源">
         <Row gutter={[16, 16]}>{sourceCards.map((item) => {
           const runtimeId = item.id === 'adapter_condition' ? conditionAdapterId : item.id
           const runtime = sourceRuntimes.data.find((entry) => entry.id === runtimeId)
-          return <Col xs={24} md={12} xl={6} key={item.id}><Card hoverable={!item.disabled} className={`source-card ${source.id === item.id ? 'source-selected' : ''} ${item.disabled ? 'source-disabled' : ''}`} onClick={() => selectSource(item)}><div className="source-icon">{item.icon}</div><Space><Typography.Title level={4}>{item.title}</Typography.Title>{item.recommended && <Tag color="cyan">推荐</Tag>}</Space><Typography.Paragraph type="secondary">{item.description}</Typography.Paragraph><Space wrap>{item.id === 'local-import' ? <StatusTag status="HEALTHY" /> : item.disabled ? <Tag>未接入</Tag> : <><StatusTag status={runtime?.status || (sourceRuntimes.loading ? 'CHECKING' : 'UNAVAILABLE')} /><Button size="small" onClick={(event) => { event.stopPropagation(); healthSource(item.id) }}>健康检查</Button></>}</Space></Card></Col>
+          return <Col xs={24} md={12} xl={6} key={item.id}><Card hoverable={!item.disabled} className={`source-card ${source.id === item.id ? 'source-selected' : ''} ${item.disabled ? 'source-disabled' : ''}`} onClick={() => selectSource(item)}><div className="source-icon">{item.icon}</div><Space><Typography.Title level={4}>{item.title}</Typography.Title>{item.recommended && <Tag color="cyan">推荐</Tag>}</Space><Typography.Paragraph type="secondary">{item.description}</Typography.Paragraph><Space wrap>{item.id === 'local-import' ? <StatusTag status="HEALTHY" /> : item.disabled ? <Tag>未接入</Tag> : <><StatusTag status={runtime?.status || (sourceRuntimes.loading ? 'CHECKING' : 'UNAVAILABLE')} /><Button size="small" onClick={(event) => { event.stopPropagation(); healthSource(item.id) }}>接口测试</Button></>}</Space></Card></Col>
         })}</Row>
         <div className="wizard-actions"><Button type="primary" onClick={() => setStep(1)}>下一步：{source.id === 'local-import' ? '导入配置' : '配置条件'} <ArrowRightOutlined /></Button></div>
       </Card>}
@@ -1801,7 +1801,7 @@ export function RegistryPage({ refresh }: PageProps) {
   const health = async (id: string) => {
     try {
       const result = await post<{ healthy: boolean }>(`/api/adapters/${id}/health-check`)
-      result.healthy ? message.success('模型运行环境健康检查通过') : message.warning('模型运行环境当前不可用')
+      result.healthy ? message.success('模型运行环境接口测试通过') : message.warning('模型运行环境当前不可用')
       await adapters.reload()
     } catch (error) {
       message.error((error as Error).message)
@@ -1874,7 +1874,7 @@ export function RegistryPage({ refresh }: PageProps) {
         { title: '权重', dataIndex: 'weight_path', render: (value) => value ? <Typography.Text ellipsis={{ tooltip: value }} style={{ maxWidth: 180 }}>{String(value).split('/').pop()}</Typography.Text> : '—' },
         { title: '状态', dataIndex: 'status', render: (value) => <StatusTag status={value} /> },
         { title: '运行环境', render: (_, row) => <StatusTag status={adapters.data.find((item) => item.id === row.adapter_id)?.status || (adapters.loading ? 'CHECKING' : 'UNAVAILABLE')} /> },
-        { title: '操作', render: (_, row) => <span onClick={(event) => event.stopPropagation()}><Space>{!row.is_demo && <Button type="link" onClick={() => copyRegistration(row)}>复制注册</Button>}<Button type="link" onClick={() => health(row.adapter_id)}>健康检查</Button><Popconfirm title="确认删除这个模型？" description="仅删除平台注册记录，不删除模型项目、环境或权重；存在评测引用时会拒绝删除。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => removeModel(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm></Space></span> },
+        { title: '操作', render: (_, row) => <span onClick={(event) => event.stopPropagation()}><Space>{!row.is_demo && <Button type="link" onClick={() => copyRegistration(row)}>复制注册</Button>}<Button type="link" onClick={() => health(row.adapter_id)}>接口测试</Button><Popconfirm title="确认删除这个模型？" description="仅删除平台注册记录，不删除模型项目、环境或权重；存在评测引用时会拒绝删除。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => removeModel(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm></Space></span> },
       ]} />
     </Card>
   )
