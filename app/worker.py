@@ -140,7 +140,7 @@ class JobAgent:
             "sample_count": payload.get("sample_count", 12),
             "conditions": payload.get("conditions", {}),
             "model_parameters": payload.get("model_parameters", {}),
-            "source_type": payload.get("source_type", "REPLAY_FIXTURE"),
+            "source_type": payload.get("source_type", "GENERATIVE"),
             "output_directory": str(artifact_dir),
         }
         condition_adapter_ids = {"adapter_condition", "adapter_motion_blur"}
@@ -383,7 +383,7 @@ class JobAgent:
                     dataset_id,
                     payload["name"],
                     "v1",
-                    payload.get("source_type", "REPLAY_FIXTURE"),
+                    payload.get("source_type", "GENERATIVE"),
                     scene.get("domain_label", scene.get("domain", "无人机航拍")),
                     scene.get("weather", "晴朗"),
                     json_dump(sensor),
@@ -669,8 +669,8 @@ class JobAgent:
                 """
                 INSERT INTO datasets
                 (id,name,version,source_type,scene_domain,weather,sensor_conditions,resolution,
-                 sample_count,annotation_status,frozen,artifact_path,category_template,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 sample_count,annotation_status,frozen,artifact_path,source_path,category_template,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     dataset_id,
@@ -685,6 +685,7 @@ class JobAgent:
                     annotation_status,
                     0,
                     target.relative_to(self.settings.artifact_dir).as_posix(),
+                    None if staged_upload_root else str(source),
                     str(payload.get("category_template") or "custom"),
                     now,
                 ),

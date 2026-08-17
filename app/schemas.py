@@ -9,8 +9,8 @@ class AcquisitionRequest(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     adapter_id: str
     source_type: Literal[
-        "GENERATIVE", "SIMULATOR", "REAL", "REAL_TRANSFORMED", "REPLAY_FIXTURE"
-    ] = "REPLAY_FIXTURE"
+        "GENERATIVE", "SIMULATOR", "REAL", "REAL_TRANSFORMED"
+    ] = "GENERATIVE"
     sample_count: int = Field(default=12, ge=1, le=1000)
     seeds: list[int] = Field(default_factory=lambda: [1001, 1002, 1003], min_length=1)
     conditions: dict[str, Any] = Field(default_factory=dict)
@@ -25,7 +25,7 @@ class DatasetImportRequest(BaseModel):
     directory: str = Field(min_length=1)
     annotation_path: str | None = None
     annotation_format: Literal["COCO", "YOLO", "VISDRONE"] = "COCO"
-    scene_domain: str = "未分类"
+    scene_domain: str = Field(default="未分类", min_length=1, max_length=80)
     category_template: str = Field(min_length=1, max_length=40)
     categories: list["CategoryInput"] = Field(default_factory=list, max_length=1000)
 

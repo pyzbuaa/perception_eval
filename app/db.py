@@ -98,6 +98,10 @@ class Database:
                 "ALTER TABLE datasets ADD COLUMN category_template "
                 "TEXT NOT NULL DEFAULT 'unconfigured'"
             )
+        if "source_path" not in existing:
+            connection.execute(
+                "ALTER TABLE datasets ADD COLUMN source_path TEXT"
+            )
         rows = connection.execute(
             """
             SELECT id,sensor_conditions FROM datasets
@@ -198,21 +202,6 @@ class Database:
                     ),
                 ),
                 (
-                    "adapter_replay",
-                    "回放生成器",
-                    "GENERATOR",
-                    "1.0.0",
-                    "CONTRACT_OK",
-                    "platform",
-                    None,
-                    "read_only",
-                    "adapters/replay_generator.py",
-                    0,
-                    "HEALTHY",
-                    "固定样例回放，仅用于软件流程验证，不代表生成模型能力。",
-                    json_dump(REPLAY_SCHEMA),
-                ),
-                (
                     "adapter_condition",
                     "DiffusionDegrade · 无人机加雾",
                     "OPERATOR",
@@ -267,6 +256,7 @@ class Database:
                 """,
                 [item + (now, now) for item in adapters],
             )
+            connection.execute("DELETE FROM adapters WHERE id='adapter_replay'")
             connection.execute(
                 """
                 UPDATE adapters
@@ -304,13 +294,6 @@ class Database:
                     json_dump(MOTION_BLUR_SCHEMA),
                     now,
                 ),
-            )
-            connection.execute(
-                """
-                UPDATE adapters SET entrypoint='adapters/replay_generator.py',updated_at=?
-                WHERE id='adapter_replay' AND entrypoint!='adapters/replay_generator.py'
-                """,
-                (now,),
             )
             connection.execute(
                 """
@@ -732,14 +715,6 @@ def demo_svg(index: int, sky: str, ground: str, road: str, blur: float) -> str:
 </svg>"""
 
 
-REPLAY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "scene_style": {"type": "string", "enum": ["aerial", "satellite", "urban"]},
-        "sample_count": {"type": "integer", "minimum": 1, "maximum": 1000},
-    },
-}
-
 CONDITION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -851,6 +826,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     annotation_status TEXT NOT NULL,
     frozen INTEGER NOT NULL DEFAULT 0,
     artifact_path TEXT,
+    source_path TEXT,
     category_template TEXT NOT NULL DEFAULT 'unconfigured',
     created_at TEXT NOT NULL
 );

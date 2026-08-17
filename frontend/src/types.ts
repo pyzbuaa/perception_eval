@@ -32,6 +32,10 @@ export interface Dataset {
   frozen: boolean
   category_template: string
   categories: CategoryDefinition[]
+  artifact_path?: string
+  dataset_path?: string
+  source_path?: string
+  platform_path?: string
   preview_images: string[]
   created_at: string
 }

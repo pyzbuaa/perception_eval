@@ -93,12 +93,22 @@ def list_datasets(database: Database = db) -> list[dict[str, Any]]:
             json_load(category_row["categories"], []) if category_row else []
         )
         relative = row.get("artifact_path")
+        row["dataset_path"] = None
+        row["platform_path"] = None
         row["preview_images"] = []
         if relative:
-            directory = settings.artifact_dir / relative
+            directory = database.settings.artifact_dir / relative
+            platform_path = directory.resolve()
+            source_path = row.get("source_path")
+            if not source_path and row.get("source_type") == "REAL" and directory.is_dir():
+                inferred = _referenced_dataset_source(directory)
+                source_path = str(inferred) if inferred else None
+            row["source_path"] = source_path
+            row["platform_path"] = str(platform_path)
+            row["dataset_path"] = source_path or str(platform_path)
             if directory.exists():
                 row["preview_images"] = [
-                    f"/artifacts/{path.relative_to(settings.artifact_dir).as_posix()}"
+                    f"/artifacts/{path.relative_to(database.settings.artifact_dir).as_posix()}"
                     for path in _dataset_image_files(directory)
                 ][:6]
         yield row
@@ -270,6 +280,31 @@ def _dataset_image_files(directory: Path) -> list[Path]:
         and path.suffix.lower() in LOCAL_IMAGE_SUFFIXES
         and "annotations" not in path.relative_to(directory).parts
     ]
+
+
+def _referenced_dataset_source(directory: Path) -> Path | None:
+    roots: set[Path] = set()
+    for path in sorted(directory.rglob("*")):
+        if (
+            not path.is_symlink()
+            or path.suffix.lower() not in LOCAL_IMAGE_SUFFIXES
+            or "annotations" in path.relative_to(directory).parts
+        ):
+            continue
+        relative = path.relative_to(directory)
+        target = path.readlink()
+        target = (
+            target.resolve()
+            if target.is_absolute()
+            else (path.parent / target).resolve()
+        )
+        root = target
+        for _ in relative.parts:
+            root = root.parent
+        if (root / relative).resolve() != target:
+            return None
+        roots.add(root)
+    return next(iter(roots)) if len(roots) == 1 else None
 
 
 def _dataset_sample_name(directory: Path, path: Path) -> str:

@@ -43,6 +43,7 @@ from app.services import (
     get_annotation_session,
     get_basegen_scene_schema,
     get_sample_annotation,
+    list_datasets,
     list_dataset_samples,
     list_local_dataset_resources,
     list_local_model_resources,
@@ -77,10 +78,13 @@ def test_database_seeds_traceable_demo_data(tmp_path: Path) -> None:
     assert database.row("SELECT COUNT(*) AS n FROM models")["n"] == 4
     assert database.row("SELECT COUNT(*) AS n FROM results")["n"] == 27
     assert database.row("SELECT COUNT(*) AS n FROM results WHERE is_official=1")["n"] == 0
+    datasets = list(list_datasets(database))
+    assert all(Path(item["dataset_path"]).is_absolute() for item in datasets)
     adapter = database.row("SELECT * FROM adapters WHERE id='adapter_basegen'")
     assert adapter
     assert adapter["runtime_kind"] == "conda_external"
     assert adapter["requires_gpu"] == 1
+    assert database.row("SELECT * FROM adapters WHERE id='adapter_replay'") is None
     detector = database.row(
         "SELECT * FROM adapters WHERE id='adapter_dronedets_yolov8m'"
     )
@@ -121,7 +125,7 @@ def test_database_does_not_restore_deleted_demo_data(tmp_path: Path) -> None:
 
     for table in ("datasets", "models", "evaluation_plans", "runs", "results", "jobs"):
         assert database.row(f"SELECT COUNT(*) AS n FROM {table}")["n"] == 0
-    assert database.row("SELECT COUNT(*) AS n FROM adapters")["n"] == 6
+    assert database.row("SELECT COUNT(*) AS n FROM adapters")["n"] == 5
 
 
 def test_diffusiondegrade_fog_strength_blends_source_and_model_output() -> None:
@@ -786,11 +790,19 @@ def test_local_dataset_import_references_images_without_copying_source(
     completed = database.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
     assert completed["status"] == "SUCCEEDED"
     dataset = database.row("SELECT * FROM datasets WHERE name='引用模式数据集'")
+    assert dataset["source_path"] == str(source_directory)
     linked_image = (
         app_settings.artifact_dir / dataset["artifact_path"] / "sample.png"
     )
     assert linked_image.is_symlink()
     assert linked_image.resolve() == source_image
+    database.execute(
+        "UPDATE datasets SET source_path=NULL WHERE id=?",
+        (dataset["id"],),
+    )
+    listed = next(item for item in list_datasets(database) if item["id"] == dataset["id"])
+    assert listed["dataset_path"] == str(source_directory)
+    assert listed["platform_path"] == str(linked_image.parent)
 
     result = delete_dataset(dataset["id"], database)
     assert result and result["deleted"] is True
@@ -1207,38 +1219,43 @@ def test_result_query_does_not_merge_different_inference_configs(
     assert resized["latency_p95_mean"] == pytest.approx(11)
 
 
-def test_replay_adapter_job_creates_dataset_draft(tmp_path: Path) -> None:
-    database, app_settings = make_database(tmp_path)
-    job = queue_job(
-        "ACQUISITION",
-        {
-            "name": "测试航拍回放",
-            "adapter_id": "adapter_replay",
-            "source_type": "REPLAY_FIXTURE",
-            "sample_count": 4,
-            "seeds": [1001, 1002, 1003],
-            "conditions": {
-                "scene": {"domain": "无人机航拍", "weather": "晴朗"},
-                "sensor": {"resolution": "1920×1080", "motion_blur": 0.2},
-            },
-            "model_parameters": {},
-            "category_template": "custom",
-            "categories": [{"id": 1, "name": "car"}],
-        },
-        database,
-    )
-    assert JobAgent(database, app_settings).process_one()
-    completed = database.row("SELECT * FROM jobs WHERE id=?", (job["id"],))
-    assert completed["status"] == "SUCCEEDED"
-    dataset = database.row("SELECT * FROM datasets WHERE name='测试航拍回放'")
-    assert dataset["sample_count"] == 4
-    assert dataset["annotation_status"] == "CANDIDATE"
-    assert dataset["frozen"] == 0
-
-
 def test_external_conda_adapter_uses_registered_python(tmp_path: Path) -> None:
     database, app_settings = make_database(tmp_path)
     runtime_prefix = Path(sys.executable).parent.parent
+    adapter_script = tmp_path / "external_generator.py"
+    adapter_script.write_text(
+        """
+import argparse
+import hashlib
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("command")
+parser.add_argument("--request", type=Path, required=True)
+parser.add_argument("--result", type=Path, required=True)
+args = parser.parse_args()
+request = json.loads(args.request.read_text(encoding="utf-8"))
+output = Path(request["output_directory"])
+output.mkdir(parents=True, exist_ok=True)
+samples = []
+for index in range(int(request["sample_count"])):
+    name = f"sample-{index + 1}.png"
+    path = output / name
+    path.write_bytes(b"test-image")
+    samples.append({
+        "image_path": name,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    })
+args.result.write_text(json.dumps({
+    "protocol_version": "1.0",
+    "job_id": request["job_id"],
+    "status": "succeeded",
+    "samples": samples,
+}), encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     now = utc_now()
     database.execute(
         """
@@ -1256,7 +1273,7 @@ def test_external_conda_adapter_uses_registered_python(tmp_path: Path) -> None:
             "conda_external",
             str(runtime_prefix),
             "read_only",
-            "adapters/replay_generator.py",
+            str(adapter_script),
             0,
             "HEALTHY",
             "",
@@ -1270,7 +1287,7 @@ def test_external_conda_adapter_uses_registered_python(tmp_path: Path) -> None:
         {
             "name": "外部环境生成",
             "adapter_id": "adapter_external_test",
-            "source_type": "REPLAY_FIXTURE",
+            "source_type": "GENERATIVE",
             "sample_count": 2,
             "seeds": [7],
             "conditions": {
