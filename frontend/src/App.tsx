@@ -58,7 +58,7 @@ const routeTitles: Record<RouteKey, { title: string; subtitle: string }> = {
   datasets: { title: '数据集', subtitle: '查看真值状态、数据谱系和不可变版本' },
   registry: { title: '模型版本', subtitle: '注册模型信息、权重和只读执行环境' },
   evaluation: { title: '评测中心', subtitle: '配置模型矩阵与标准化时延协议' },
-  explorer: { title: '效能探索', subtitle: '按条件查询、对比精度、时延与鲁棒性' },
+  explorer: { title: '效能模型库', subtitle: '按条件查询、对比精度、时延与鲁棒性' },
   tasks: { title: '任务中心', subtitle: '跟踪生成、导入和评测任务的完整生命周期' },
   environment: { title: '系统环境', subtitle: '验证工作区隔离、conda 指纹与 GPU 状态' },
 }
@@ -111,7 +111,7 @@ function AppShell() {
     { key: 'datasets', icon: <DatabaseOutlined />, label: '数据集' },
     { key: 'registry', icon: <RobotOutlined />, label: '模型版本' },
     { key: 'evaluation', icon: <ExperimentOutlined />, label: '评测中心' },
-    { key: 'explorer', icon: <BarChartOutlined />, label: '效能探索' },
+    { key: 'explorer', icon: <BarChartOutlined />, label: '效能模型库' },
     { key: 'tasks', icon: <PlayCircleOutlined />, label: '任务中心' },
     { key: 'environment', icon: <SettingOutlined />, label: '系统环境' },
   ]

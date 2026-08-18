@@ -670,7 +670,7 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
     setLocalDataPicker(undefined)
   }
   const acquisitionPayload = () => ({
-    name: `${domain} · ${isMotionBlur ? '无人机运动模糊' : source.title} · ${new Date().toLocaleDateString('zh-CN')}`,
+    name: `${domain} · ${isMotionBlur ? '无人机运动模糊' : source.title}`,
     adapter_id: isCondition ? conditionAdapterId : source.id,
     source_type: source.source,
     sample_count: isCondition ? inputDataset?.sample_count || 1 : samples,
@@ -2110,7 +2110,7 @@ export function EvaluationPage({ navigate, refresh }: PageProps) {
     {categoryIssues.length > 0 && <Alert type="error" showIcon message="类别不一致，无法启动评测" description={<Space direction="vertical" size={2}>{categoryIssues.map((item) => <Typography.Text key={item}>{item}</Typography.Text>)}</Space>} />}
     <Card className="matrix-preview"><Row align="middle" gutter={[18, 18]}><Col flex="auto"><Typography.Title level={4}>组合矩阵预览</Typography.Title><Typography.Text type="secondary">{datasetIds.length} 数据版本 × {modelIds.length} 模型</Typography.Text></Col><Col><Statistic value={count} suffix="次运行" /></Col><Col><Button type="primary" size="large" icon={<PlayCircleOutlined />} disabled={!count || categoryIssues.length > 0} loading={submitting} onClick={submit}>启动批量评测</Button></Col></Row></Card>
     {jobId && <JobProgress jobId={jobId} onFinish={() => refresh()} />}
-    {jobId && <Card><Button type="primary" onClick={() => navigate('explorer')}>打开效能探索器</Button></Card>}
+    {jobId && <Card><Button type="primary" onClick={() => navigate('explorer')}>打开效能模型库</Button></Card>}
   </Space>
 }
 
