@@ -1338,6 +1338,7 @@ def test_basegen_scene_schema_exposes_domain_specific_ui_fields() -> None:
         for domain in schema["domains"]
         if domain["value"] == "low-altitude-uav"
     )
+    assert uav["label_zh"] == "低空无人机"
     assert {field["name"] for field in uav["fields"]} >= {
         "region",
         "camera_height",

@@ -599,7 +599,7 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
       const values = fixedValues(basegenSelections[field.name])
       const value = values.length
         ? values.map((item) => optionFor(field, item)?.label_zh || item).join('、')
-        : field.weighted ? '随机（按权重）' : '随机'
+        : '随机'
       return `${field.label_zh}：${value}`
     }) || []
 
@@ -785,7 +785,7 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
                 const value = fixedValues(selection)[0] || RANDOM_VALUE
                 return (
                   <Form.Item key={field.name} label={field.label_zh} extra={field.description_zh}>
-                    <Select value={value} onChange={(next) => changeBasegenSelection(field, next === RANDOM_VALUE ? { mode: 'random' } : { mode: 'fixed', value: next })} options={[{ value: RANDOM_VALUE, label: field.weighted ? '随机（按 BaseGen 权重）' : '随机' }, ...field.options.map((option) => ({ value: option.value, label: option.label_zh, disabled: optionDisabled(field, option) }))]} />
+                    <Select value={value} onChange={(next) => changeBasegenSelection(field, next === RANDOM_VALUE ? { mode: 'random' } : { mode: 'fixed', value: next })} options={[{ value: RANDOM_VALUE, label: '随机' }, ...field.options.map((option) => ({ value: option.value, label: option.label_zh, disabled: optionDisabled(field, option) }))]} />
                   </Form.Item>
                 )
               })}
