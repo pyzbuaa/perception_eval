@@ -18,7 +18,6 @@ import {
   theme,
 } from 'antd'
 import {
-  AppstoreOutlined,
   BarChartOutlined,
   BellOutlined,
   BulbOutlined,
@@ -107,7 +106,7 @@ function AppShell() {
 
   const menuItems = [
     { key: 'overview', icon: <HomeOutlined />, label: '概览' },
-    { key: 'builder', icon: <BulbOutlined />, label: '数据构建' },
+    { key: 'builder', icon: <BulbOutlined />, label: '数据集构建' },
     { key: 'datasets', icon: <DatabaseOutlined />, label: '数据集' },
     { key: 'registry', icon: <RobotOutlined />, label: '模型版本' },
     { key: 'evaluation', icon: <ExperimentOutlined />, label: '评测中心' },
@@ -167,7 +166,6 @@ function AppShell() {
                 <Typography.Title level={2}>{routeTitles[route].title}</Typography.Title>
                 <Typography.Text type="secondary">{routeTitles[route].subtitle}</Typography.Text>
               </div>
-              <Space><Tag icon={<AppstoreOutlined />} color="cyan">MVP 0.1</Tag></Space>
             </div>
             <div className="page-body">{content || <Spin />}</div>
           </Content>
