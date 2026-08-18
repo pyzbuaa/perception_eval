@@ -46,6 +46,7 @@ from app.services import (
     delete_model,
     dataset_statistics,
     environment_status,
+    evaluation_run_visualization,
     get_annotation_session,
     get_basegen_scene_schema,
     get_job,
@@ -782,6 +783,21 @@ def get_results(
     model_id: str | None = None,
 ) -> dict[str, Any]:
     return query_results(scene, condition, resolution, model_id)
+
+
+@app.get("/api/evaluation-runs/{run_id}/visualization")
+def get_evaluation_run_visualization(
+    run_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=12, ge=1, le=50),
+) -> dict[str, Any]:
+    try:
+        result = evaluation_run_visualization(run_id, offset, limit)
+    except DatasetArtifactError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="评测运行不存在")
+    return result
 
 
 @app.get("/api/environment/status")

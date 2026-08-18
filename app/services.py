@@ -2050,6 +2050,174 @@ def _condition_metadata(
     }
 
 
+def evaluation_run_visualization(
+    run_id: str,
+    offset: int,
+    limit: int,
+    database: Database = db,
+) -> dict[str, Any] | None:
+    run = database.row(
+        """
+        SELECT x.*,d.name AS dataset_name,d.artifact_path,
+               m.name AS model_name,m.is_demo
+        FROM runs x
+        JOIN datasets d ON d.id=x.dataset_id
+        JOIN models m ON m.id=x.model_id
+        JOIN results r ON r.run_id=x.id
+        WHERE x.id=?
+        """,
+        (run_id,),
+    )
+    if not run:
+        return None
+    config = json_load(run.get("config"), {})
+    prediction_value = config.get("predictions_path")
+    if not prediction_value:
+        raise DatasetArtifactError("该运行没有保存预测结果，无法可视化")
+    artifact_root = database.settings.artifact_dir.resolve()
+    prediction_relative = Path(str(prediction_value))
+    predictions_path = (artifact_root / prediction_relative).resolve()
+    if (
+        prediction_relative.is_absolute()
+        or ".." in prediction_relative.parts
+        or not predictions_path.is_relative_to(artifact_root)
+        or not predictions_path.is_file()
+    ):
+        raise DatasetArtifactError("该运行的预测结果文件不存在")
+    dataset_relative = Path(str(run.get("artifact_path") or ""))
+    dataset_directory = (artifact_root / dataset_relative).resolve()
+    if (
+        not run.get("artifact_path")
+        or not dataset_directory.is_relative_to(artifact_root)
+        or not dataset_directory.is_dir()
+    ):
+        raise DatasetArtifactError("该运行关联的数据集目录不存在")
+
+    files = _dataset_image_files(dataset_directory)
+    names = {
+        _dataset_sample_name(dataset_directory, path): path
+        for path in files
+    }
+    image_paths: dict[int, Path] = {}
+    coco_path = dataset_directory / "annotations" / "instances.json"
+    if coco_path.is_file():
+        try:
+            coco = json.loads(coco_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DatasetArtifactError(f"数据集 COCO 标注无法读取: {exc}") from exc
+        for image in coco.get("images", []):
+            matched = _match_dataset_sample_name(
+                str(image.get("file_name", "")), set(names)
+            )
+            if matched:
+                image_paths[int(image["id"])] = names[matched]
+    if not image_paths:
+        image_paths = {
+            image_id: path
+            for image_id, path in enumerate(files, start=1)
+        }
+
+    try:
+        predictions = json.loads(predictions_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DatasetArtifactError(f"预测结果无法读取: {exc}") from exc
+    if not isinstance(predictions, list):
+        raise DatasetArtifactError("预测结果不是 COCO predictions 数组")
+
+    colors = [
+        "#1677FF", "#13A8A8", "#722ED1", "#EB2F96",
+        "#52C41A", "#FA8C16", "#F5222D", "#2F54EB",
+    ]
+    categories = {
+        int(category["id"]): {
+            "name": str(category["name"]),
+            "color": str(category.get("color") or colors[index % len(colors)]),
+        }
+        for index, category in enumerate(
+            _annotation_categories(run["dataset_id"], database)
+        )
+    }
+    predictions_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for prediction in predictions:
+        try:
+            image_id = int(prediction["image_id"])
+            category_id = int(prediction["category_id"])
+            score = float(prediction["score"])
+            bbox = [float(value) for value in prediction["bbox"]]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if image_id in image_paths and len(bbox) == 4:
+            predictions_by_image[image_id].append(
+                {"category_id": category_id, "score": score, "bbox": bbox}
+            )
+
+    ordered_images = sorted(
+        image_paths.items(),
+        key=lambda item: _dataset_sample_name(dataset_directory, item[1]),
+    )
+    page = ordered_images[offset : offset + limit]
+    items = []
+    for image_id, path in page:
+        try:
+            with Image.open(path) as image:
+                width, height = image.width, image.height
+        except OSError:
+            width, height = 0, 0
+        boxes = []
+        if width > 0 and height > 0:
+            for prediction in predictions_by_image.get(image_id, []):
+                x, y, box_width, box_height = prediction["bbox"]
+                left = max(0.0, min(float(width), x))
+                top = max(0.0, min(float(height), y))
+                right = max(left, min(float(width), x + box_width))
+                bottom = max(top, min(float(height), y + box_height))
+                if right == left or bottom == top:
+                    continue
+                category_id = prediction["category_id"]
+                category = categories.get(
+                    category_id,
+                    {
+                        "name": f"class {category_id}",
+                        "color": colors[category_id % len(colors)],
+                    },
+                )
+                boxes.append(
+                    {
+                        "category_id": category_id,
+                        "label": category["name"],
+                        "color": category["color"],
+                        "score": prediction["score"],
+                        "x": left / width,
+                        "y": top / height,
+                        "width": (right - left) / width,
+                        "height": (bottom - top) / height,
+                    }
+                )
+        items.append(
+            {
+                "image_id": image_id,
+                "name": _dataset_sample_name(dataset_directory, path),
+                "url": f"/artifacts/{quote(path.relative_to(artifact_root).as_posix(), safe='/')}",
+                "width": width,
+                "height": height,
+                "boxes": boxes,
+            }
+        )
+    return {
+        "run_id": run_id,
+        "dataset_id": run["dataset_id"],
+        "dataset_name": run["dataset_name"],
+        "model_id": run["model_id"],
+        "model_name": run["model_name"],
+        "inference_confidence": float(config.get("confidence", 0.0)),
+        "total": len(ordered_images),
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(page) < len(ordered_images),
+        "items": items,
+    }
+
+
 def query_results(
     scene: str | None = None,
     condition: str | None = None,

@@ -253,6 +253,36 @@ export interface ResultResponse {
   }
 }
 
+export interface EvaluationVisualization {
+  run_id: string
+  dataset_id: string
+  dataset_name: string
+  model_id: string
+  model_name: string
+  inference_confidence: number
+  total: number
+  offset: number
+  limit: number
+  has_more: boolean
+  items: Array<{
+    image_id: number
+    name: string
+    url: string
+    width: number
+    height: number
+    boxes: Array<{
+      category_id: number
+      label: string
+      color: string
+      score: number
+      x: number
+      y: number
+      width: number
+      height: number
+    }>
+  }>
+}
+
 export interface EnvironmentStatus {
   isolation: {
     mode: string

@@ -64,7 +64,7 @@ import ReactECharts from 'echarts-for-react'
 import { api, formatBytes, percent, post } from './api'
 import { parseCategoryFile } from './categoryFiles'
 import { DemoTag, Gallery, JobProgress, ParetoChart, PRChart, StatusTag } from './components'
-import type { Adapter, AnnotationCategory, AnnotationSession, BaseGenSceneField, BaseGenSceneOption, BaseGenSceneSchema, CategoryDefinition, CategoryTemplate, Dataset, DatasetAnnotationCategories, DatasetSamplePage, DatasetStatistics, DetectionBox, EnvironmentStatus, Job, ModelVersion, Overview, ResultGroup, ResultResponse, SampleAnnotation } from './types'
+import type { Adapter, AnnotationCategory, AnnotationSession, BaseGenSceneField, BaseGenSceneOption, BaseGenSceneSchema, CategoryDefinition, CategoryTemplate, Dataset, DatasetAnnotationCategories, DatasetSamplePage, DatasetStatistics, DetectionBox, EnvironmentStatus, EvaluationVisualization, Job, ModelVersion, Overview, ResultGroup, ResultResponse, SampleAnnotation } from './types'
 
 type RouteKey = 'overview' | 'builder' | 'datasets' | 'registry' | 'evaluation' | 'explorer' | 'tasks' | 'environment'
 interface PageProps { dark: boolean; navigate: (route: RouteKey) => void; refresh: () => void }
@@ -957,6 +957,110 @@ function DatasetBrowser({ dataset, onClose }: { dataset?: Dataset; onClose: () =
         {loading && <div className="dataset-browser-loading"><Spin /><Typography.Text type="secondary">正在加载图片…</Typography.Text></div>}
         {!error && total > 0 && <div className="dataset-browser-pagination"><Pagination current={pageNumber} pageSize={pageSize} total={total} showSizeChanger={false} showQuickJumper disabled={loading} showTotal={(count) => `共 ${count} 张`} onChange={changePage} /></div>}
       </div>
+    </Drawer>
+  )
+}
+
+function EvaluationVisualizationDrawer({ group, onClose }: { group?: ResultGroup; onClose: () => void }) {
+  const pageSize = 12
+  const [runId, setRunId] = useState<string>()
+  const [data, setData] = useState<EvaluationVisualization>()
+  const [pageNumber, setPageNumber] = useState(1)
+  const [threshold, setThreshold] = useState(0.25)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    setRunId(group?.run_ids[0])
+    setData(undefined)
+    setPageNumber(1)
+    setThreshold(0.25)
+    setError('')
+  }, [group?.comparison_id])
+
+  useEffect(() => {
+    if (!runId) return
+    let active = true
+    setLoading(true)
+    setError('')
+    api<EvaluationVisualization>(`/api/evaluation-runs/${runId}/visualization?offset=${(pageNumber - 1) * pageSize}&limit=${pageSize}`)
+      .then((result) => {
+        if (!active) return
+        setData(result)
+        setThreshold((current) => Math.max(current, result.inference_confidence))
+      })
+      .catch((loadError) => {
+        if (active) setError((loadError as Error).message)
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => { active = false }
+  }, [runId, pageNumber])
+
+  const visibleBoxes = (item: EvaluationVisualization['items'][number]) => item.boxes.filter((box) => box.score >= threshold)
+  const predictionBoxes = (item: EvaluationVisualization['items'][number]) => (
+    <div className="dataset-browser-boxes">
+      {visibleBoxes(item).map((box, index) => (
+        <div
+          className="dataset-browser-box"
+          key={`${box.category_id}-${index}`}
+          style={{
+            left: `${box.x * 100}%`,
+            top: `${box.y * 100}%`,
+            width: `${box.width * 100}%`,
+            height: `${box.height * 100}%`,
+            borderColor: box.color,
+          }}
+        >
+          <span style={{ background: box.color }}>{box.label} {box.score.toFixed(2)}</span>
+        </div>
+      ))}
+    </div>
+  )
+
+  return (
+    <Drawer open={Boolean(group)} width="90vw" title="推理结果可视化" onClose={onClose}>
+      <Space direction="vertical" size={16} style={{ width: '100%' }}>
+        <Row gutter={[16, 12]} align="middle">
+          <Col xs={24} md={10}><Typography.Text type="secondary">评测运行</Typography.Text><Select value={runId} onChange={(value) => { setRunId(value); setPageNumber(1); setThreshold(0.25) }} style={{ width: '100%', marginTop: 6 }} options={group?.run_ids.map((value, index) => ({ value, label: `运行 ${index + 1} · ${value}` }))} /></Col>
+          <Col xs={24} md={6}><Typography.Text type="secondary">可视化置信度阈值</Typography.Text><InputNumber value={threshold} onChange={(value) => setThreshold(value ?? 0)} min={0} max={1} step={0.01} precision={3} style={{ width: '100%', marginTop: 6 }} /></Col>
+          <Col xs={24} md={8}><Typography.Text type="secondary">当前内容</Typography.Text><div style={{ marginTop: 8 }}>{data ? <Space wrap><Tag>{data.model_name}</Tag><Tag>{data.dataset_name}</Tag><Tag>第 {pageNumber} 页</Tag></Space> : '—'}</div></Col>
+        </Row>
+        {data && <Alert type="info" showIcon message={`本次推理置信度阈值：${data.inference_confidence}`} description="可视化阈值只过滤已保存的预测框，不会重新推理、修改预测文件或重新计算评测指标；低于推理阈值的框未被保存，调低可视化阈值无法恢复。" />}
+        {error && <Alert type="error" showIcon message="推理结果加载失败" description={error} />}
+        {!loading && !error && data?.total === 0 && <Empty description="该运行没有可视化图片" />}
+        {data && data.total > 0 && (
+          <Image.PreviewGroup preview={{
+            imageRender: (originalNode, info) => {
+              const item = data.items[info.current]
+              if (!item) return originalNode
+              const { x, y, rotate, scale, flipX, flipY } = info.transform
+              return (
+                <div
+                  className="dataset-browser-preview-image"
+                  style={{
+                    aspectRatio: item.width && item.height ? `${item.width} / ${item.height}` : '16 / 9',
+                    transform: `translate3d(${x}px, ${y}px, 0) scale3d(${flipX ? -scale : scale}, ${flipY ? -scale : scale}, 1) rotate(${rotate}deg)`,
+                  }}
+                >
+                  {cloneElement(originalNode, { style: { ...originalNode.props.style, transform: 'none', transitionDuration: '0s' } })}
+                  {predictionBoxes(item)}
+                </div>
+              )
+            },
+          }}>
+            <div className="dataset-browser-grid">
+              {data.items.map((item) => {
+                const count = visibleBoxes(item).length
+                return <div className="dataset-browser-sample" key={`${item.image_id}-${item.url}`}><div className="dataset-browser-image" style={{ aspectRatio: item.width && item.height ? `${item.width} / ${item.height}` : '16 / 9' }}><Image src={item.url} alt={item.name} loading="lazy" preview={{ mask: item.name }} />{predictionBoxes(item)}</div><div className="dataset-browser-caption"><Typography.Text ellipsis={{ tooltip: item.name }}>{item.name}</Typography.Text><Tag color={count ? 'blue' : 'default'}>{count} / {item.boxes.length} 框</Tag></div></div>
+              })}
+            </div>
+          </Image.PreviewGroup>
+        )}
+        {loading && <div className="dataset-browser-loading"><Spin /><Typography.Text type="secondary">正在加载推理结果…</Typography.Text></div>}
+        {!error && data && data.total > 0 && <div className="dataset-browser-pagination"><Pagination current={pageNumber} pageSize={pageSize} total={data.total} showSizeChanger={false} showQuickJumper disabled={loading} showTotal={(count) => `共 ${count} 张`} onChange={setPageNumber} /></div>}
+      </Space>
     </Drawer>
   )
 }
@@ -2163,6 +2267,7 @@ export function ExplorerPage({ dark }: PageProps) {
   const [minimumMap, setMinimumMap] = useState(0)
   const [maximumLatency, setMaximumLatency] = useState<number>()
   const [selected, setSelected] = useState<ResultGroup>()
+  const [visualizationGroup, setVisualizationGroup] = useState<ResultGroup>()
   const load = async () => { setLoading(true); try { setData(await api<ResultResponse>('/api/results')) } catch (error) { message.error((error as Error).message) } finally { setLoading(false) } }
   useEffect(() => { load() }, [])
   useEffect(() => {
@@ -2314,10 +2419,11 @@ export function ExplorerPage({ dark }: PageProps) {
       { title: '重复', dataIndex: 'seed_count', width: 70 },
     ]} /></Card>
     <Drawer open={Boolean(selected)} onClose={() => setSelected(undefined)} title="可比单元详情" width={720}>
-      {selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Space>{natureTag(selected)}<Tag>{selected.configuration_id}</Tag></Space><Row gutter={12}><Col span={8}><Card><Statistic title="mAP" value={selected.map_mean * 100} precision={2} suffix="%" /></Card></Col><Col span={8}><Card><Statistic title="时延P50" value={selected.latency_mean} precision={2} suffix="ms" /></Card></Col><Col span={8}><Card><Statistic title="FPS" value={selected.fps_mean} precision={1} /></Card></Col></Row><Descriptions bordered column={1} items={[
+      {selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Space wrap>{natureTag(selected)}<Tag>{selected.configuration_id}</Tag><Button icon={<EyeOutlined />} disabled={selected.is_demo} onClick={() => setVisualizationGroup(selected)}>查看推理结果</Button></Space><Row gutter={12}><Col span={8}><Card><Statistic title="mAP" value={selected.map_mean * 100} precision={2} suffix="%" /></Card></Col><Col span={8}><Card><Statistic title="时延P50" value={selected.latency_mean} precision={2} suffix="ms" /></Card></Col><Col span={8}><Card><Statistic title="FPS" value={selected.fps_mean} precision={1} /></Card></Col></Row><Descriptions bordered column={1} items={[
         { key: 'model', label: '模型', children: selected.model_name }, { key: 'backbone', label: 'Backbone', children: selected.backbone }, { key: 'dataset', label: '数据版本', children: selected.dataset_name }, { key: 'scene', label: '场景 / 条件', children: `${selected.scene_domain} / ${selected.condition_type}${selected.condition_strength === null ? '（强度未记录）' : ` / 强度 ${selected.condition_strength}`}` }, { key: 'resolution', label: '数据分辨率', children: selected.resolution }, { key: 'config', label: '推理配置', children: <Typography.Text code copyable>{JSON.stringify(selected.inference_config)}</Typography.Text> }, { key: 'hardware', label: '硬件环境', children: <Typography.Text code copyable>{JSON.stringify(selected.hardware_profile)}</Typography.Text> }, { key: 'fingerprint', label: '环境指纹', children: <Typography.Text code copyable>{selected.environment_fingerprint || '未记录'}</Typography.Text> }, { key: 'seeds', label: '重复运行', children: `${selected.seed_count} 次：${selected.seeds.join(', ')}` }, { key: 'runs', label: '运行ID', children: <Typography.Text code copyable>{selected.run_ids.join(', ')}</Typography.Text> }, { key: 'official', label: '结果性质', children: natureTag(selected) },
       ]} /><PRChart groups={[selected]} dark={dark} /></Space>}
     </Drawer>
+    <EvaluationVisualizationDrawer group={visualizationGroup} onClose={() => setVisualizationGroup(undefined)} />
   </Space>
 }
 

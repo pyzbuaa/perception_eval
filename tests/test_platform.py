@@ -40,6 +40,7 @@ from app.services import (
     delete_job,
     delete_model,
     dataset_statistics,
+    evaluation_run_visualization,
     get_annotation_session,
     get_basegen_scene_schema,
     get_sample_annotation,
@@ -1999,6 +2000,16 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
     assert run["is_official"] == 0
     assert json.loads(run["config"])["annotation_conversion"]["images"] == 1
     assert not (dataset_directory / "annotations" / "instances.json").exists()
+    visualization = evaluation_run_visualization(run["id"], 0, 12, database)
+    assert visualization
+    assert visualization["inference_confidence"] == pytest.approx(0.001)
+    assert visualization["total"] == 1
+    assert visualization["items"][0]["name"] == "sample.png"
+    box = visualization["items"][0]["boxes"][0]
+    assert box["label"] == "car"
+    assert box["score"] == pytest.approx(0.99)
+    assert box["x"] == pytest.approx(0.1)
+    assert box["width"] == pytest.approx(0.3)
 
 
 def test_local_import_can_feed_diffusiondegrade_fog(
