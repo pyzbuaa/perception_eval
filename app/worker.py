@@ -428,6 +428,13 @@ class JobAgent:
                 "PYTHONUNBUFFERED": "1",
             }
         )
+        if payload["adapter_id"] == "adapter_basegen":
+            environment.update(
+                {
+                    "HF_HOME": str(self.settings.basegen_hf_home),
+                    "HF_HUB_CACHE": str(self.settings.basegen_hf_home / "hub"),
+                }
+            )
         if payload["adapter_id"] in {
             "adapter_condition",
             "adapter_day_to_night",
@@ -544,7 +551,13 @@ class JobAgent:
                     payload["name"],
                     "v1",
                     payload.get("source_type", "GENERATIVE"),
-                    scene.get("domain_label", scene.get("domain", "无人机航拍")),
+                    (
+                        "自动驾驶"
+                        if scene.get("domain") == "autonomous-driving"
+                        else scene.get(
+                            "domain_label", scene.get("domain", "无人机航拍")
+                        )
+                    ),
                     scene.get("weather", "晴朗"),
                     json_dump(sensor),
                     resolution,

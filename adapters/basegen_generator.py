@@ -40,6 +40,36 @@ def basegen_root() -> Path:
     return Path(os.environ.get("BASEGEN_ROOT", default)).expanduser().resolve()
 
 
+def resolve_cached_model_path(model_path: str) -> str:
+    local_path = Path(model_path).expanduser()
+    if local_path.is_dir():
+        return str(local_path.resolve())
+
+    repo_parts = model_path.split("/")
+    if (
+        len(repo_parts) != 2
+        or not all(repo_parts)
+        or any(part in {".", ".."} for part in repo_parts)
+    ):
+        return model_path
+    hf_home = Path(
+        os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")
+    ).expanduser()
+    hub_cache = Path(os.environ.get("HF_HUB_CACHE", hf_home / "hub")).expanduser()
+    repository = hub_cache / f"models--{repo_parts[0]}--{repo_parts[1]}"
+    main_ref = repository / "refs" / "main"
+    try:
+        revision = main_ref.read_text(encoding="utf-8").strip()
+    except OSError:
+        return model_path
+    if not revision or Path(revision).name != revision:
+        return model_path
+    snapshot = repository / "snapshots" / revision
+    if (snapshot / "model_index.json").is_file():
+        return str(snapshot.resolve())
+    return model_path
+
+
 def load_basegen(root: Path):
     if not (root / "zimage_gen" / "runner.py").is_file():
         raise FileNotFoundError(f"BaseGen 项目不存在或不完整: {root}")
@@ -356,6 +386,9 @@ def run(request_path: Path, result_path: Path) -> None:
     request = json.loads(request_path.read_text(encoding="utf-8"))
     root = basegen_root()
     plan, config = prepare_plan(request, root)
+    config["model_path"] = resolve_cached_model_path(config["model_path"])
+    if Path(config["model_path"]).is_dir():
+        config["local_files_only"] = True
     _, run_plan, _, _, _ = load_basegen(root)
     started = time.perf_counter()
     emit_stage("加载生成模型（可能需要数分钟）")

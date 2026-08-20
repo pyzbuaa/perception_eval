@@ -102,6 +102,11 @@ class Database:
             connection.execute(
                 "ALTER TABLE datasets ADD COLUMN source_path TEXT"
             )
+        connection.execute(
+            "UPDATE datasets SET scene_domain='自动驾驶',"
+            "name=replace(name,'城市自动驾驶感知','自动驾驶') "
+            "WHERE scene_domain='城市自动驾驶感知'"
+        )
         rows = connection.execute(
             """
             SELECT id,sensor_conditions FROM datasets

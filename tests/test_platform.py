@@ -16,7 +16,7 @@ from PIL import Image
 
 import app.main as main_module
 from adapters import diffusionblur_motion, diffusiondegrade_day_to_night
-from adapters.basegen_generator import emit_stage, prepare_plan
+from adapters.basegen_generator import emit_stage, prepare_plan, resolve_cached_model_path
 from adapters.diffusiondegrade_fog import blend_fog
 from adapters.dronedets_detector import category_mapping
 from app.command_protocol import (
@@ -447,6 +447,24 @@ def test_dataset_migration_marks_existing_id_blau_motion_blur(tmp_path: Path) ->
     assert conditions["motion_blur"] is True
     assert conditions["motion_blur_model"] == "ID-Blau"
     assert conditions["motion_blur_sample_timesteps"] == 20
+
+
+def test_dataset_migration_renames_autonomous_driving_domain(tmp_path: Path) -> None:
+    database, _ = make_database(tmp_path)
+    dataset_id = database.row("SELECT id FROM datasets LIMIT 1")["id"]
+    database.execute(
+        "UPDATE datasets SET scene_domain='城市自动驾驶感知',"
+        "name='城市自动驾驶感知 · 基础图像生成' WHERE id=?",
+        (dataset_id,),
+    )
+
+    database.initialize()
+
+    dataset = database.row(
+        "SELECT name,scene_domain FROM datasets WHERE id=?", (dataset_id,)
+    )
+    assert dataset["scene_domain"] == "自动驾驶"
+    assert dataset["name"] == "自动驾驶 · 基础图像生成"
 
 
 def test_delete_job_rejects_active_task_and_preserves_evaluation_results(
@@ -1765,6 +1783,42 @@ def test_basegen_adapter_prepares_reproducible_batch(tmp_path: Path) -> None:
     assert config["model_path"] == "Tongyi-MAI/Z-Image-Turbo"
 
 
+def test_basegen_resolves_cached_snapshot_without_hub_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub = tmp_path / "hub"
+    repository = hub / "models--Tongyi-MAI--Z-Image-Turbo"
+    snapshot = repository / "snapshots" / "cached-revision"
+    snapshot.mkdir(parents=True)
+    (snapshot / "model_index.json").write_text("{}", encoding="utf-8")
+    (repository / "refs").mkdir()
+    (repository / "refs" / "main").write_text(
+        "cached-revision\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub))
+
+    assert resolve_cached_model_path("Tongyi-MAI/Z-Image-Turbo") == str(
+        snapshot.resolve()
+    )
+
+
+def test_basegen_keeps_repo_id_when_cached_snapshot_is_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "hub" / "models--Tongyi-MAI--Z-Image-Turbo"
+    (repository / "refs").mkdir(parents=True)
+    (repository / "refs" / "main").write_text(
+        "missing-revision\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+
+    assert resolve_cached_model_path("Tongyi-MAI/Z-Image-Turbo") == (
+        "Tongyi-MAI/Z-Image-Turbo"
+    )
+
+
 def test_basegen_scene_schema_exposes_domain_specific_ui_fields() -> None:
     schema = get_basegen_scene_schema()
     assert [domain["value"] for domain in schema["domains"]] == [
@@ -1772,6 +1826,12 @@ def test_basegen_scene_schema_exposes_domain_specific_ui_fields() -> None:
         "low-altitude-uav",
         "offroad-autonomous-driving",
     ]
+    driving = next(
+        domain
+        for domain in schema["domains"]
+        if domain["value"] == "autonomous-driving"
+    )
+    assert driving["label_zh"] == "自动驾驶"
     uav = next(
         domain
         for domain in schema["domains"]

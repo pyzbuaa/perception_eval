@@ -1063,9 +1063,13 @@ def get_basegen_scene_schema() -> dict[str, Any]:
             {
                 "value": catalog["domain"],
                 "label_zh": (
-                    "低空无人机"
-                    if catalog["domain"] == "low-altitude-uav"
-                    else catalog.get("label_zh", catalog["domain"])
+                    {
+                        "autonomous-driving": "自动驾驶",
+                        "low-altitude-uav": "低空无人机",
+                    }.get(
+                        catalog["domain"],
+                        catalog.get("label_zh", catalog["domain"]),
+                    )
                 ),
                 "default_resolution": (
                     "1024×1024"

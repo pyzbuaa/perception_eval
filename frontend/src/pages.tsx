@@ -821,7 +821,7 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
       : isDrivingDayToNight
         ? [{ key: 'model', label: '模型', children: 'WarpI2I · 自动驾驶弱光' }, { key: 'method', label: '方法', children: 'unpaired / a2b' }, { key: 'checkpoint', label: '权重', children: 'BDD100K_day2night.pkl' }, { key: 'prep', label: '模型输入', children: '缩放至 512×512' }, { key: 'output', label: '模型输出', children: '恢复原图分辨率和文件名' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP16' }]
         : isUavDayToNight
-      ? [{ key: 'model', label: '模型', children: 'DiffusionDegrade · CycleGAN-Turbo Sichuan UAV Low-Light' }, { key: 'checkpoint', label: '权重', children: 'uav_daynight_sichuan_3125 / model_3125' }, { key: 'model-size', label: '模型输入', children: '整图缩放至 640×640' }, { key: 'output', label: '模型输出', children: '恢复原图分辨率和文件名' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP16' }]
+        ? [{ key: 'model', label: '模型', children: 'DiffusionDegrade' }, { key: 'checkpoint', label: '权重', children: 'model_3125' }, { key: 'model-size', label: '模型输入', children: '整图缩放至 640×640' }, { key: 'output', label: '模型输出', children: '恢复原图分辨率和文件名' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP16' }]
       : [{ key: 'model', label: '模型', children: 'DiffusionDegrade · 无人机气雾' }, { key: 'checkpoint', label: '权重', children: 'content15 / model_2501' }, { key: 'prep', label: '模型输入', children: '缩放至 512×512' }, { key: 'output', label: '模型输出', children: '恢复原图分辨率' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP16' }]
   const conditionBuildName = isMotionBlur ? '非理想条件生成 · 无人机运动模糊' : isDrivingFog ? '非理想条件生成 · 自动驾驶气雾' : isDrivingDayToNight ? '非理想条件生成 · 自动驾驶弱光' : isUavDayToNight ? '非理想条件生成 · 无人机弱光' : '非理想条件生成 · 无人机气雾'
   const conditionSceneSummary = isMotionBlur ? '无人机航拍 / 保持源天气' : `${conditionSceneDomain} / ${isDayToNight ? '弱光' : '气雾'}`
@@ -929,11 +929,13 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
                             </Form.Item>}
                         <Form.Item label={`${motionConditionMode === 'files' ? '回退运动模糊强度' : '运动模糊强度'} ${motionStrength.toFixed(2)}`} extra={motionConditionMode === 'preset' ? 'ID-Blau 归一化条件强度，不表示像素位移' : undefined}><Slider value={motionStrength} onChange={setMotionStrength} min={0.01} max={0.35} step={0.01} marks={{ 0.01: '轻微', 0.14: '默认', 0.35: '强烈' }} /></Form.Item>
                       </Form>
-                    : isDayToNight
-                      ? <Alert className="top-gap" type="info" showIcon message={isDrivingDayToNight ? '当前模型不提供夜间强度控制' : '当前模型不提供弱光强度控制'} description={isDrivingDayToNight ? '使用 WarpI2I BDD100K 权重执行固定的白天到夜晚域转换。' : '使用 Sichuan 版本的 3,125 step 权重执行固定的无人机弱光域转换。'} />
+                    : isDrivingDayToNight
+                      ? <Alert className="top-gap" type="info" showIcon message="当前模型不提供夜间强度控制" description="使用 WarpI2I BDD100K 权重执行固定的白天到夜晚域转换。" />
+                      : isUavDayToNight
+                        ? null
                       : isDrivingFog
                         ? <Alert className="top-gap" type="info" showIcon message="自动驾驶气雾为固定模型效果" description="当前 WarpI2I paired 权重不提供连续气雾强度控制。" />
-                        : <Form layout="vertical" className="top-gap"><Form.Item label={`气雾强度 ${fogStrength.toFixed(1)}`} extra="0 为原图，1 为完整模型气雾结果"><Slider value={fogStrength} onChange={setFogStrength} min={0} max={1} step={0.1} marks={{ 0: '原图', 0.5: '中等', 1: '完整气雾' }} /></Form.Item></Form>}
+                        : <Form layout="vertical" className="top-gap"><Form.Item label={`气雾强度 ${fogStrength.toFixed(1)}`}><Slider value={fogStrength} onChange={setFogStrength} min={0} max={1} step={0.1} marks={{ 0: '0', 1: '1' }} /></Form.Item></Form>}
               </Card>
             : <Card title={isBaseGen ? '生成参数' : '传感器与成像条件'}><Form layout="vertical"><Form.Item label="图像分辨率"><Select value={resolution} onChange={setResolution} options={resolutionOptions} /></Form.Item>{isBaseGen ? <><Form.Item label="起始随机种子"><InputNumber value={generatorSeed} onChange={(value) => setGeneratorSeed(value || 0)} min={0} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="推理步数"><InputNumber value={generatorSteps} onChange={(value) => setGeneratorSteps(value || 1)} min={1} max={100} precision={0} style={{ width: '100%' }} /></Form.Item><Form.Item label="设备策略"><Select value={devicePolicy} onChange={setDevicePolicy} options={[{ value: 'cuda', label: '全量 CUDA（推荐）' }, { value: 'cpu-offload', label: 'CPU Offload（节省显存）' }]} /></Form.Item></> : <><Form.Item label={`运动模糊强度 ${blur.toFixed(1)}`}><Slider value={blur} onChange={setBlur} min={0} max={1} step={0.1} marks={{ 0: '清洁', 0.5: '中等', 1: '严重' }} /></Form.Item><Form.Item label="固定随机种子"><Checkbox.Group options={[1001, 1002, 1003, 1004].map((value) => ({ label: value, value }))} value={seeds} onChange={(values) => setSeeds(values as number[])} /></Form.Item></>}</Form></Card>}
         </Col>}
@@ -2405,8 +2407,8 @@ export function EvaluationPage({ navigate, refresh }: PageProps) {
       description="使用模型注册时登记的推理入口、Python 环境和权重执行真实推理，并用 pycocotools 计算 COCO 指标。"
     />}
     <Row gutter={[16, 16]}>
-      <Col xs={24} xl={12}><Card title="数据版本"><Select mode="multiple" value={datasetIds} onChange={setDatasetIds} optionFilterProp="label" style={{ width: '100%' }} options={datasetOptions} /><Divider /><Typography.Text type="secondary">选项展示名称、场景/天气、样本数和短ID；悬停可查看完整ID、创建时间与数据集地址。真实检测要求数据集已冻结，并具有 COCO 或 VisDrone 目标框标注。</Typography.Text></Card></Col>
-      <Col xs={24} xl={12}><Card title="模型版本"><Select mode="multiple" value={modelIds} onChange={setModelIds} style={{ width: '100%' }} options={models.data.map((item) => ({ value: item.id, label: `${item.name}${item.is_demo ? '（流程样例）' : '（真实推理）'}${item.categories.length ? '' : '（类别待配置）'}`, disabled: item.status === 'UNAVAILABLE' || !item.categories.length }))} /><Divider />{hasRealDetector ? <Tag color="purple">本地真实模型</Tag> : <Space><DemoTag /><Typography.Text type="secondary">可选择已注册的本地检测模型。</Typography.Text></Space>}</Card></Col>
+      <Col xs={24} xl={12}><Card title="数据版本"><Select mode="multiple" value={datasetIds} onChange={setDatasetIds} optionFilterProp="label" style={{ width: '100%' }} options={datasetOptions} /></Card></Col>
+      <Col xs={24} xl={12}><Card title="模型版本"><Select mode="multiple" value={modelIds} onChange={setModelIds} style={{ width: '100%' }} options={models.data.map((item) => ({ value: item.id, label: `${item.name}${item.is_demo ? '（流程样例）' : ''}${item.categories.length ? '' : '（类别待配置）'}`, disabled: item.status === 'UNAVAILABLE' || !item.categories.length }))} /></Card></Col>
       <Col span={24}><Card title="评测类别" extra={<Typography.Text type="secondary">已选 {evaluationCategories.length} / 共同 {commonEvaluationCategories.length} 类</Typography.Text>}><Space direction="vertical" size={12} style={{ width: '100%' }}><Select mode="multiple" allowClear maxTagCount="responsive" value={evaluationCategories} onChange={setEvaluationCategories} disabled={!commonEvaluationCategories.length} placeholder={count ? '请选择参与指标计算的类别' : '请先选择数据集和模型'} style={{ width: '100%' }} options={commonEvaluationCategories.map((value) => ({ value, label: value }))} /><Space><Button size="small" disabled={!commonEvaluationCategories.length} onClick={() => setEvaluationCategories(commonEvaluationCategories)}>全选</Button><Button size="small" disabled={!evaluationCategories.length} onClick={() => setEvaluationCategories([])}>清空</Button><Typography.Text type="secondary">模型仍执行完整推理，所选类别仅决定 mAP、精确率和召回率的计算范围。</Typography.Text></Space></Space></Card></Col>
       <Col span={24}><Card title="本次推理参数" extra={<Typography.Text type="secondary">仅覆盖模型声明支持的参数；最终值写入运行记录</Typography.Text>}><Form layout="vertical"><Row gutter={16}>
         <Col span={24}><Form.Item label="精度模式"><Segmented block value={precision} onChange={(value) => setPrecision(String(value))} options={[{ value: 'FP32', label: 'FP32' }, { value: 'FP16', label: 'FP16' }, { value: 'INT8', label: 'INT8', disabled: hasRealDetector }]} /></Form.Item></Col>
@@ -2421,7 +2423,7 @@ export function EvaluationPage({ navigate, refresh }: PageProps) {
       </Row></Form></Card></Col>
     </Row>
     {categoryIssues.length > 0 && <Alert type="error" showIcon message="评测类别不可用，无法启动评测" description={<Space direction="vertical" size={2}>{categoryIssues.map((item) => <Typography.Text key={item}>{item}</Typography.Text>)}</Space>} />}
-    <Card className="matrix-preview"><Row align="middle" gutter={[18, 18]}><Col flex="auto"><Typography.Title level={4}>组合矩阵预览</Typography.Title><Typography.Text type="secondary">{datasetIds.length} 数据版本 × {modelIds.length} 模型 · 评测 {evaluationCategories.length} 类</Typography.Text></Col><Col><Statistic value={count} suffix="次运行" /></Col><Col><Button type="primary" size="large" icon={<PlayCircleOutlined />} disabled={!count || categoryIssues.length > 0} loading={submitting} onClick={submit}>启动批量评测</Button></Col></Row></Card>
+    <Card className="matrix-preview"><Row align="middle" gutter={[18, 18]}><Col flex="auto"><Typography.Title level={4}>评测组合</Typography.Title><Typography.Text type="secondary">{datasetIds.length} 数据版本 × {modelIds.length} 模型 · 评测 {evaluationCategories.length} 类</Typography.Text></Col><Col><Button type="primary" size="large" icon={<PlayCircleOutlined />} disabled={!count || categoryIssues.length > 0} loading={submitting} onClick={submit}>启动批量评测</Button></Col></Row></Card>
     {jobId && <JobProgress jobId={jobId} onFinish={() => refresh()} />}
     {jobId && <Card><Button type="primary" onClick={() => navigate('explorer')}>打开效能模型库</Button></Card>}
   </Space>
@@ -2447,17 +2449,136 @@ function runParameterValue(config: Record<string, unknown>, key: string) {
   return value === undefined || value === null || value === '' ? '默认' : String(value)
 }
 
+const resultParameterLabels: Record<string, string> = {
+  input_resolution: '推理分辨率',
+  confidence: '置信度阈值',
+  nms_iou: 'NMS IoU',
+  precision: '推理精度',
+  batch_size: '批大小',
+  max_detections: '最大检测数',
+  warmup: '预热次数',
+}
+
+function resultInferenceParameters(run: ResultRun) {
+  return {
+    input_resolution: runInferenceResolution(run.config),
+    confidence: runParameterValue(run.config, 'confidence'),
+    nms_iou: runParameterValue(run.config, 'nms_iou'),
+    precision: runParameterValue(run.config, 'precision'),
+    batch_size: runParameterValue(run.config, 'batch_size'),
+    max_detections: runParameterValue(run.config, 'max_detections'),
+    warmup: runParameterValue(run.config, 'warmup'),
+  }
+}
+
+function parameterComparisonIssue(runs: ResultRun[]) {
+  if (runs.length < 2) return '请至少选择两次评测结果'
+  const first = runs[0]
+  const categories = [...first.evaluation_categories].sort().join('\u0000')
+  const hardware = first.environment_fingerprint || JSON.stringify(first.hardware_profile)
+  const protocol = String(first.config.metric_protocol || '')
+  const adapter = String(first.config.adapter_id || '')
+  for (const run of runs.slice(1)) {
+    if (run.model_id !== first.model_id) return '只能比较同一个模型版本的评测结果'
+    if (run.dataset_id !== first.dataset_id) return '只能比较同一个数据集版本的评测结果'
+    if ([...run.evaluation_categories].sort().join('\u0000') !== categories) return '所选结果的评测类别范围不一致'
+    if ((run.environment_fingerprint || JSON.stringify(run.hardware_profile)) !== hardware) return '所选结果的硬件或运行环境不一致'
+    if (String(run.config.metric_protocol || '') !== protocol) return '所选结果的指标计算协议不一致'
+    if (String(run.config.adapter_id || '') !== adapter) return '所选结果使用的推理适配器不一致'
+  }
+  return ''
+}
+
+type ParameterComparisonRow = {
+  key: string
+  label: string
+  parameters: Record<string, string>
+  runs: ResultRun[]
+  map: number
+  map50: number
+  map75: number
+  latencyP50: number
+  latencyP95: number
+  fps: number
+  peakMemory: number
+  curves: { recall: number[]; precision: number[] }
+}
+
+function average(values: number[]) {
+  return values.reduce((total, value) => total + value, 0) / Math.max(1, values.length)
+}
+
+function aggregateParameterRuns(runs: ResultRun[]): ParameterComparisonRow[] {
+  const grouped = new Map<string, ResultRun[]>()
+  runs.forEach((run) => {
+    const key = JSON.stringify(resultInferenceParameters(run))
+    grouped.set(key, [...(grouped.get(key) || []), run])
+  })
+  return [...grouped.entries()].map(([key, groupedRuns], index) => {
+    const first = groupedRuns[0]
+    const precisionLength = Math.max(...groupedRuns.map((run) => run.curves.precision.length), 0)
+    const recallLength = Math.max(...groupedRuns.map((run) => run.curves.recall.length), 0)
+    return {
+      key,
+      label: `配置 ${index + 1}`,
+      parameters: resultInferenceParameters(first),
+      runs: groupedRuns,
+      map: average(groupedRuns.map((run) => run.map)),
+      map50: average(groupedRuns.map((run) => run.map50)),
+      map75: average(groupedRuns.map((run) => run.map75)),
+      latencyP50: average(groupedRuns.map((run) => run.latency_p50)),
+      latencyP95: average(groupedRuns.map((run) => run.latency_p95)),
+      fps: average(groupedRuns.map((run) => run.fps)),
+      peakMemory: average(groupedRuns.map((run) => run.peak_memory)),
+      curves: {
+        recall: Array.from({ length: recallLength }, (_, point) => average(groupedRuns.map((run) => run.curves.recall[point]).filter((value) => Number.isFinite(value)))),
+        precision: Array.from({ length: precisionLength }, (_, point) => average(groupedRuns.map((run) => run.curves.precision[point]).filter((value) => Number.isFinite(value)))),
+      },
+    }
+  })
+}
+
 export function ExplorerPage({ dark }: PageProps) {
   const [data, setData] = useState<ResultResponse>({ count: 0, groups: [], runs: [], dimensions: resultDimensions() })
   const [loading, setLoading] = useState(true)
+  const [selectedRunIds, setSelectedRunIds] = useState<string[]>([])
+  const [comparisonRuns, setComparisonRuns] = useState<ResultRun[]>([])
+  const [baselineKey, setBaselineKey] = useState('')
   const [selectedRun, setSelectedRun] = useState<ResultRun>()
   const [visualizationGroup, setVisualizationGroup] = useState<ResultGroup>()
   const [runPage, setRunPage] = useState(1)
   const [runPageSize, setRunPageSize] = useState(20)
   const load = async () => { setLoading(true); try { setData(await api<ResultResponse>('/api/results')) } catch (error) { message.error((error as Error).message) } finally { setLoading(false) } }
   useEffect(() => { load() }, [])
+  useEffect(() => {
+    const available = new Set(data.runs.map((run) => run.run_id))
+    setSelectedRunIds((current) => current.filter((runId) => available.has(runId)))
+  }, [data.runs])
   const natureTag = (result: { is_demo: boolean; is_official: boolean }) => result.is_demo ? <DemoTag /> : result.is_official ? <Tag color="green">真实模型 · 正式结果</Tag> : <Tag color="purple">真实模型 · 实验性结果</Tag>
   const runs = [...data.runs].sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
+  const comparisonRows = useMemo(() => aggregateParameterRuns(comparisonRuns), [comparisonRuns])
+  const changedParameterKeys = Object.keys(resultParameterLabels).filter((key) => new Set(comparisonRows.map((row) => row.parameters[key])).size > 1)
+  const commonParameterKeys = Object.keys(resultParameterLabels).filter((key) => comparisonRows.length && !changedParameterKeys.includes(key))
+  const baseline = comparisonRows.find((row) => row.key === baselineKey) || comparisonRows[0]
+  const openParameterComparison = () => {
+    const selectedRuns = runs.filter((run) => selectedRunIds.includes(run.run_id))
+    const issue = parameterComparisonIssue(selectedRuns)
+    if (issue) {
+      message.warning(issue)
+      return
+    }
+    const grouped = aggregateParameterRuns(selectedRuns)
+    if (grouped.length < 2) {
+      message.warning('所选结果的推理参数完全相同，请选择至少两种不同配置')
+      return
+    }
+    if (grouped.length > 4) {
+      message.warning('单次最多对比四种推理配置，请减少选择')
+      return
+    }
+    setComparisonRuns(selectedRuns)
+    setBaselineKey(grouped[0].key)
+  }
   const visualize = (run: ResultRun) => {
     const group = data.groups.find((item) => item.run_ids.includes(run.run_id))
     if (group) setVisualizationGroup({ ...group, comparison_id: `${group.comparison_id}:${run.run_id}`, run_ids: [run.run_id] })
@@ -2467,17 +2588,52 @@ export function ExplorerPage({ dark }: PageProps) {
       await api(`/api/evaluation-runs/${run.run_id}`, { method: 'DELETE' })
       if (selectedRun?.run_id === run.run_id) setSelectedRun(undefined)
       if (visualizationGroup?.run_ids.includes(run.run_id)) setVisualizationGroup(undefined)
+      setSelectedRunIds((current) => current.filter((runId) => runId !== run.run_id))
+      if (comparisonRuns.some((item) => item.run_id === run.run_id)) setComparisonRuns([])
       message.success('评测结果已移入回收站')
       await load()
     } catch (error) { message.error((error as Error).message) }
   }
+  const singleParameterKey = changedParameterKeys.length === 1 ? changedParameterKeys[0] : undefined
+  const orderedComparisonRows = [...comparisonRows].sort((left, right) => {
+    if (!singleParameterKey) return 0
+    return left.parameters[singleParameterKey].localeCompare(right.parameters[singleParameterKey], 'zh-CN', { numeric: true })
+  })
+  const comparisonTextColor = dark ? '#c6d1df' : '#4b5565'
+  const comparisonSplitColor = dark ? '#263449' : '#eef1f5'
+  const comparisonChartBase = {
+    tooltip: { trigger: 'axis' },
+    legend: { top: 0, textStyle: { color: comparisonTextColor } },
+    grid: { left: 64, right: 24, top: 48, bottom: 48 },
+    xAxis: { type: 'category', name: singleParameterKey ? resultParameterLabels[singleParameterKey] : '', data: orderedComparisonRows.map((row) => singleParameterKey ? row.parameters[singleParameterKey] : row.label), axisLabel: { color: comparisonTextColor } },
+  }
+  const accuracyComparisonOption = {
+    ...comparisonChartBase,
+    yAxis: { type: 'value', name: '精度', min: 0, max: 1, axisLabel: { formatter: (value: number) => `${Math.round(value * 100)}%`, color: comparisonTextColor }, splitLine: { lineStyle: { color: comparisonSplitColor } } },
+    series: [
+      { name: 'mAP', type: 'line', data: orderedComparisonRows.map((row) => row.map), smooth: true },
+      { name: 'AP50', type: 'line', data: orderedComparisonRows.map((row) => row.map50), smooth: true },
+      { name: 'AP75', type: 'line', data: orderedComparisonRows.map((row) => row.map75), smooth: true },
+    ],
+  }
+  const latencyComparisonOption = {
+    ...comparisonChartBase,
+    yAxis: { type: 'value', name: '时延 / ms', min: 0, axisLabel: { color: comparisonTextColor }, splitLine: { lineStyle: { color: comparisonSplitColor } } },
+    series: [
+      { name: 'P50', type: 'line', data: orderedComparisonRows.map((row) => row.latencyP50), smooth: true },
+      { name: 'P95', type: 'line', data: orderedComparisonRows.map((row) => row.latencyP95), smooth: true },
+    ],
+  }
+  const relativeDelta = (value: number, base: number) => base ? `${value >= base ? '+' : ''}${((value / base - 1) * 100).toFixed(1)}%` : '—'
+  const mapDelta = (value: number, base: number) => `${value >= base ? '+' : ''}${((value - base) * 100).toFixed(2)}pp`
   return <Space direction="vertical" size={18} style={{ width: '100%' }}>
-      <Card title="模型对比" extra={<Button icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新结果</Button>}>
+      <Card title="模型对比" extra={<Space><Button type="primary" disabled={selectedRunIds.length < 2} onClick={openParameterComparison}>参数对比{selectedRunIds.length ? `（${selectedRunIds.length}）` : ''}</Button><Button icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新结果</Button></Space>}>
         <Table<ResultRun>
           size="small"
           loading={loading}
           rowKey="run_id"
           dataSource={runs}
+          rowSelection={{ fixed: true, selectedRowKeys: selectedRunIds, preserveSelectedRowKeys: true, onChange: (keys) => setSelectedRunIds(keys.map(String)) }}
           pagination={{ current: runPage, pageSize: runPageSize, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100], showTotal: (total) => `共 ${total} 次评测`, onChange: (page, pageSize) => { setRunPage(page); setRunPageSize(pageSize) } }}
           scroll={{ x: 1920 }}
           columns={[
@@ -2535,6 +2691,38 @@ export function ExplorerPage({ dark }: PageProps) {
             { key: 'fingerprint', label: '环境指纹', children: <Typography.Text code copyable>{selectedRun.environment_fingerprint || '未记录'}</Typography.Text> },
           ]} />
           <Card title="PR 曲线"><PRChart groups={[selectedRun]} dark={dark} height={320} /></Card>
+        </Space>}
+      </Drawer>
+      <Drawer open={Boolean(comparisonRuns.length)} onClose={() => setComparisonRuns([])} title="推理参数对比" width="94vw">
+        {comparisonRows.length > 1 && baseline && <Space direction="vertical" size={18} style={{ width: '100%' }}>
+          <Alert type="info" showIcon message={`${comparisonRuns[0].model_name} · ${comparisonRuns[0].dataset_name}`} description={`评测类别：${evaluationCategoryLabel(comparisonRuns[0].evaluation_categories)}；相同推理配置的重复运行已自动计算均值。`} />
+          <Space wrap>
+            <Typography.Text strong>基准配置</Typography.Text>
+            <Select value={baseline.key} onChange={setBaselineKey} style={{ minWidth: 260 }} options={comparisonRows.map((row) => ({ value: row.key, label: `${row.label} · ${changedParameterKeys.map((key) => `${resultParameterLabels[key]}=${row.parameters[key]}`).join('，')}` }))} />
+          </Space>
+          <Card size="small" title="共同推理参数"><Space wrap>{commonParameterKeys.map((key) => <Tag key={key}>{resultParameterLabels[key]}：{comparisonRows[0].parameters[key]}</Tag>)}</Space></Card>
+          <Table<ParameterComparisonRow>
+            rowKey="key"
+            pagination={false}
+            dataSource={comparisonRows}
+            scroll={{ x: 1380 }}
+            columns={[
+              { title: '基准', width: 70, fixed: 'left', render: (_, row) => <Radio checked={row.key === baseline.key} onChange={() => setBaselineKey(row.key)} /> },
+              { title: '配置', dataIndex: 'label', width: 100, fixed: 'left', render: (value, row) => <Space direction="vertical" size={0}><Typography.Text strong>{value}</Typography.Text><Typography.Text type="secondary">{row.runs.length} 次运行</Typography.Text></Space> },
+              ...changedParameterKeys.map((key) => ({ title: resultParameterLabels[key], width: 130, render: (_: unknown, row: ParameterComparisonRow) => row.parameters[key] })),
+              { title: 'mAP', width: 110, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text strong>{percent(row.map)}</Typography.Text>{row.key !== baseline.key && <Typography.Text type="secondary">{mapDelta(row.map, baseline.map)}</Typography.Text>}</Space> },
+              { title: 'AP50', width: 100, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{percent(row.map50)}</Typography.Text>{row.key !== baseline.key && <Typography.Text type="secondary">{mapDelta(row.map50, baseline.map50)}</Typography.Text>}</Space> },
+              { title: 'AP75', width: 100, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{percent(row.map75)}</Typography.Text>{row.key !== baseline.key && <Typography.Text type="secondary">{mapDelta(row.map75, baseline.map75)}</Typography.Text>}</Space> },
+              { title: '时延P50', width: 115, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{row.latencyP50.toFixed(2)} ms</Typography.Text>{row.key !== baseline.key && <Typography.Text type="secondary">{relativeDelta(row.latencyP50, baseline.latencyP50)}</Typography.Text>}</Space> },
+              { title: '时延P95', width: 115, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{row.latencyP95.toFixed(2)} ms</Typography.Text>{row.key !== baseline.key && <Typography.Text type="secondary">{relativeDelta(row.latencyP95, baseline.latencyP95)}</Typography.Text>}</Space> },
+              { title: 'FPS', width: 95, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{row.fps.toFixed(2)}</Typography.Text>{row.key !== baseline.key && <Typography.Text type="secondary">{relativeDelta(row.fps, baseline.fps)}</Typography.Text>}</Space> },
+              { title: '峰值显存', width: 110, render: (_, row) => <Space direction="vertical" size={0}><Typography.Text>{row.peakMemory.toFixed(0)} MB</Typography.Text>{row.key !== baseline.key && <Typography.Text type="secondary">{relativeDelta(row.peakMemory, baseline.peakMemory)}</Typography.Text>}</Space> },
+            ]}
+          />
+          {singleParameterKey
+            ? <Row gutter={[16, 16]}><Col xs={24} xl={12}><Card title={`${resultParameterLabels[singleParameterKey]}—精度`}><ReactECharts option={accuracyComparisonOption} style={{ height: 340 }} /></Card></Col><Col xs={24} xl={12}><Card title={`${resultParameterLabels[singleParameterKey]}—时延`}><ReactECharts option={latencyComparisonOption} style={{ height: 340 }} /></Card></Col></Row>
+            : <Alert type="warning" showIcon message="同时变化了多个推理参数" description="平台仅展示结果差异，不将性能变化归因于某一个参数。若要查看单参数趋势，请选择其他参数完全一致的评测结果。" />}
+          <Card title="PR 曲线对比"><PRChart groups={comparisonRows.map((row) => ({ model_name: `${row.label} ${changedParameterKeys.map((key) => row.parameters[key]).join(' / ')}`, curves: row.curves }))} dark={dark} height={360} /></Card>
         </Space>}
       </Drawer>
       <EvaluationVisualizationDrawer group={visualizationGroup} onClose={() => setVisualizationGroup(undefined)} />

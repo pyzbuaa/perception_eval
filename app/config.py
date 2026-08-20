@@ -18,6 +18,9 @@ class Settings:
     basegen_conda_prefix: Path = Path(
         os.environ.get("BASEGEN_CONDA_PREFIX", "/home/yons/miniforge3/envs/gen")
     )
+    basegen_hf_home: Path = Path(
+        os.environ.get("BASEGEN_HF_HOME", "/mnt/data/cache/huggingface")
+    )
     dronedets_root: Path = Path(
         os.environ.get("DRONEDETS_ROOT", ROOT_DIR.parent / "DroneDets")
     )
