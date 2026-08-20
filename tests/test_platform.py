@@ -1152,6 +1152,7 @@ def test_annotated_dataset_categories_are_read_from_annotation_files(
         {"id": 8, "name": "truck"},
     ]
     assert payload["category_template"] == "annotation"
+    assert payload["nonideal_condition"] == "无"
 
 
 def test_local_dataset_import_references_images_without_copying_source(
@@ -1170,6 +1171,7 @@ def test_local_dataset_import_references_images_without_copying_source(
             "directory": str(source_directory),
             "annotation_path": None,
             "scene_domain": "无人机航拍",
+            "nonideal_condition": "无人机气雾",
             "category_template": "custom",
             "categories": [{"id": 1, "name": "car"}],
         },
@@ -1180,6 +1182,9 @@ def test_local_dataset_import_references_images_without_copying_source(
     assert completed["status"] == "SUCCEEDED"
     dataset = database.row("SELECT * FROM datasets WHERE name='引用模式数据集'")
     assert dataset["source_path"] == str(source_directory)
+    assert json.loads(dataset["sensor_conditions"]) == {
+        "recorded_condition": "无人机气雾"
+    }
     linked_image = (
         app_settings.artifact_dir / dataset["artifact_path"] / "sample.png"
     )
@@ -2163,6 +2168,13 @@ def test_detection_annotations_persist_and_export_coco(tmp_path: Path) -> None:
         {"width": 64, "height": 40, "label": "64×40", "count": 2}
     ]
     assert [item["count"] for item in statistics["scales"]] == [1, 0, 0, 0]
+    assert [item["count"] for item in statistics["relative_scales"]] == [
+        0,
+        0,
+        0,
+        1,
+        0,
+    ]
     assert database.row(
         "SELECT annotation_status FROM datasets WHERE id='dataset_annotation_test'"
     )["annotation_status"] == "ANNOTATING"
@@ -2668,6 +2680,7 @@ def test_local_import_can_feed_nonideal_condition_adapters(
     assert transformed["weather"] == "未记录"
     sensor = json.loads(transformed["sensor_conditions"])
     assert sensor["motion_blur"] is True
+    assert sensor["condition_label"] == "无人机运动模糊"
     assert sensor["motion_blur_model"] == "ID-Blau"
     assert sensor["motion"] == "yaw-left"
     assert sensor["motion_blur_strength"] == pytest.approx(0.18)

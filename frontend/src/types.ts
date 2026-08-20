@@ -95,6 +95,7 @@ export interface DatasetStatistics {
   category_counts: Array<{ id: number | null; name: string; count: number }>
   resolutions: Array<{ width: number; height: number; label: string; count: number }>
   scales: Array<{ key: 'small' | 'medium' | 'large' | 'unknown'; label: string; count: number }>
+  relative_scales: Array<{ key: 'under_0_1' | '0_1_to_1' | '1_to_10' | 'over_10' | 'unknown'; label: string; count: number }>
 }
 
 export interface AnnotationCategory extends CategoryDefinition {

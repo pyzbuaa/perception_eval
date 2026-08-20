@@ -1514,6 +1514,13 @@ def dataset_statistics(
     visualizations = _sample_visualizations(dataset_id, directory, files, database)
     resolution_counts: dict[tuple[int, int], int] = defaultdict(int)
     scale_counts = {"small": 0, "medium": 0, "large": 0, "unknown": 0}
+    relative_scale_counts = {
+        "under_0_1": 0,
+        "0_1_to_1": 0,
+        "1_to_10": 0,
+        "over_10": 0,
+        "unknown": 0,
+    }
     annotated_images = 0
     object_count = 0
     for item in visualizations.values():
@@ -1535,14 +1542,26 @@ def dataset_statistics(
             counts[normalized_name]["count"] += 1
             if width <= 0 or height <= 0:
                 scale_counts["unknown"] += 1
+                relative_scale_counts["unknown"] += 1
                 continue
-            area = max(0.0, float(box["width"]) * width) * max(0.0, float(box["height"]) * height)
+            relative_area = max(0.0, float(box["width"])) * max(
+                0.0, float(box["height"])
+            )
+            area = relative_area * width * height
             if area < 32 ** 2:
                 scale_counts["small"] += 1
             elif area < 96 ** 2:
                 scale_counts["medium"] += 1
             else:
                 scale_counts["large"] += 1
+            if relative_area < 0.001:
+                relative_scale_counts["under_0_1"] += 1
+            elif relative_area < 0.01:
+                relative_scale_counts["0_1_to_1"] += 1
+            elif relative_area < 0.1:
+                relative_scale_counts["1_to_10"] += 1
+            else:
+                relative_scale_counts["over_10"] += 1
     category_counts = sorted(
         counts.values(),
         key=lambda item: (
@@ -1569,6 +1588,13 @@ def dataset_statistics(
             {"key": "medium", "label": "中目标 32²–96²", "count": scale_counts["medium"]},
             {"key": "large", "label": "大目标 ≥ 96²", "count": scale_counts["large"]},
             {"key": "unknown", "label": "尺寸未知", "count": scale_counts["unknown"]},
+        ],
+        "relative_scales": [
+            {"key": "under_0_1", "label": "< 0.1%", "count": relative_scale_counts["under_0_1"]},
+            {"key": "0_1_to_1", "label": "0.1%–1%", "count": relative_scale_counts["0_1_to_1"]},
+            {"key": "1_to_10", "label": "1%–10%", "count": relative_scale_counts["1_to_10"]},
+            {"key": "over_10", "label": "≥ 10%", "count": relative_scale_counts["over_10"]},
+            {"key": "unknown", "label": "尺寸未知", "count": relative_scale_counts["unknown"]},
         ],
     }
 
@@ -2422,6 +2448,17 @@ def _condition_metadata(
         return {
             "condition_type": str(degradation),
             "condition_strength": None,
+            "source_dataset_id": source_dataset_id,
+        }
+    recorded_condition = str(
+        sensor_conditions.get("recorded_condition") or ""
+    )
+    if recorded_condition:
+        return {
+            "condition_type": (
+                "基准" if recorded_condition == "无" else recorded_condition
+            ),
+            "condition_strength": 0.0 if recorded_condition == "无" else None,
             "source_dataset_id": source_dataset_id,
         }
     if weather not in {"", "晴朗", "未记录"}:

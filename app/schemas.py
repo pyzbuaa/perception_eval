@@ -26,6 +26,14 @@ class DatasetImportRequest(BaseModel):
     annotation_path: str | None = None
     annotation_format: Literal["COCO", "YOLO", "VISDRONE"] = "COCO"
     scene_domain: str = Field(default="未分类", min_length=1, max_length=80)
+    nonideal_condition: Literal[
+        "无",
+        "无人机气雾",
+        "无人机运动模糊",
+        "无人机弱光",
+        "自动驾驶气雾",
+        "自动驾驶弱光",
+    ] = "无"
     category_template: str = Field(min_length=1, max_length=40)
     categories: list["CategoryInput"] = Field(default_factory=list, max_length=1000)
 

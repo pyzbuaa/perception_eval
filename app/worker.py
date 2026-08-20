@@ -352,6 +352,7 @@ class JobAgent:
                         "resolution": resolution,
                         "source_dataset_id": input_dataset_id,
                         "degradation": "ID-Blau UAV Motion Blur",
+                        "condition_label": "无人机运动模糊",
                         "motion_blur": True,
                         "motion_blur_model": "ID-Blau",
                         "motion": "condition-files" if condition_directory else motion,
@@ -848,7 +849,13 @@ class JobAgent:
                     "REAL",
                     payload.get("scene_domain", "未分类"),
                     "未记录",
-                    "{}",
+                    json_dump(
+                        {
+                            "recorded_condition": payload.get(
+                                "nonideal_condition", "无"
+                            )
+                        }
+                    ),
                     resolution,
                     len(candidates),
                     annotation_status,
