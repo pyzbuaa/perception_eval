@@ -10,7 +10,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import quote
 
 from PIL import Image
@@ -107,10 +107,29 @@ def list_datasets(database: Database = db) -> list[dict[str, Any]]:
             row["platform_path"] = str(platform_path)
             row["dataset_path"] = source_path or str(platform_path)
             if directory.exists():
+                image_files = _dataset_image_files(directory)
                 row["preview_images"] = [
                     f"/artifacts/{path.relative_to(database.settings.artifact_dir).as_posix()}"
-                    for path in _dataset_image_files(directory)
+                    for path in image_files
                 ][:6]
+                if (
+                    not str(row.get("resolution") or "").strip()
+                    or row["resolution"] == "原始分辨率"
+                ):
+                    resolution = summarize_image_resolutions(image_files)
+                    if resolution:
+                        database.execute(
+                            "UPDATE datasets SET resolution=? WHERE id=?",
+                            (resolution, row["id"]),
+                        )
+                        row["resolution"] = resolution
+                    else:
+                        row["resolution"] = "无法读取"
+        if (
+            not str(row.get("resolution") or "").strip()
+            or row["resolution"] == "原始分辨率"
+        ):
+            row["resolution"] = "无法读取"
         yield row
 
 
@@ -119,6 +138,10 @@ class DatasetDeletionError(ValueError):
 
 
 class JobDeletionError(ValueError):
+    pass
+
+
+class EvaluationResultDeletionError(ValueError):
     pass
 
 
@@ -210,6 +233,15 @@ def category_compatibility(
         for name, model_category in model_by_name.items()
         if name in dataset_by_name
     }
+    common_categories = [
+        {
+            "name": dataset_by_name[name]["name"],
+            "dataset_id": dataset_by_name[name]["id"],
+            "model_id": model_by_name[name]["id"],
+        }
+        for name in dataset_by_name
+        if name in model_by_name
+    ]
     return {
         "compatible": not missing and not extra,
         "dataset_id": dataset_id,
@@ -220,6 +252,7 @@ def category_compatibility(
         "missing_in_model": [dataset_by_name[name]["name"] for name in missing],
         "extra_in_model": [model_by_name[name]["name"] for name in extra],
         "model_to_dataset": mapping,
+        "common_categories": common_categories,
     }
 
 
@@ -227,12 +260,56 @@ def validate_evaluation_categories(
     dataset_ids: list[str],
     model_ids: list[str],
     database: Database = db,
+    evaluation_categories: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     results = [
         category_compatibility(dataset_id, model_id, database)
         for dataset_id in dataset_ids
         for model_id in model_ids
     ]
+    selected_by_name: dict[str, str] | None = None
+    if evaluation_categories is not None:
+        selected_by_name = {}
+        for value in evaluation_categories:
+            display_name = str(value).strip()
+            normalized_name = normalize_category_name(display_name)
+            if not normalized_name:
+                raise CategoryCompatibilityError("评测类别名称不能为空")
+            if normalized_name in selected_by_name:
+                raise CategoryCompatibilityError("评测类别名称不能重复")
+            selected_by_name[normalized_name] = display_name
+        if not selected_by_name:
+            raise CategoryCompatibilityError("至少选择一个评测类别")
+        unavailable = []
+        for item in results:
+            common = {
+                normalize_category_name(category["name"]): category
+                for category in item.get("common_categories", [])
+            }
+            missing = [
+                selected_by_name[name]
+                for name in selected_by_name
+                if name not in common
+            ]
+            if missing:
+                unavailable.append(
+                    f"{item['dataset_name']} × {item['model_name']}: "
+                    f"缺少 {', '.join(missing)}"
+                )
+            else:
+                item["evaluation_categories"] = [
+                    common[name]["name"] for name in selected_by_name
+                ]
+                item["evaluation_category_ids"] = [
+                    int(common[name]["dataset_id"])
+                    for name in selected_by_name
+                ]
+        if unavailable:
+            raise CategoryCompatibilityError(
+                "所选评测类别不是数据集与模型的共同类别。" + " | ".join(unavailable)
+            )
+        return results
+
     incompatible = [item for item in results if not item["compatible"]]
     if incompatible:
         details = []
@@ -253,6 +330,14 @@ def validate_evaluation_categories(
         raise CategoryCompatibilityError(
             "类别不一致，无法启动评测。" + " | ".join(details)
         )
+    for item in results:
+        item["evaluation_categories"] = [
+            category["name"] for category in item.get("common_categories", [])
+        ]
+        item["evaluation_category_ids"] = [
+            int(category["dataset_id"])
+            for category in item.get("common_categories", [])
+        ]
     return results
 
 
@@ -280,6 +365,33 @@ def _dataset_image_files(directory: Path) -> list[Path]:
         and path.suffix.lower() in LOCAL_IMAGE_SUFFIXES
         and "annotations" not in path.relative_to(directory).parts
     ]
+
+
+def summarize_resolutions(dimensions: Iterable[tuple[int, int]]) -> str | None:
+    valid = {
+        (int(width), int(height))
+        for width, height in dimensions
+        if int(width) > 0 and int(height) > 0
+    }
+    if not valid:
+        return None
+    if len(valid) == 1:
+        width, height = next(iter(valid))
+        return f"{width}×{height}"
+    widths = [width for width, _ in valid]
+    heights = [height for _, height in valid]
+    return f"{min(widths)}×{min(heights)} ～ {max(widths)}×{max(heights)}"
+
+
+def summarize_image_resolutions(files: Iterable[Path]) -> str | None:
+    dimensions = []
+    for path in files:
+        try:
+            with Image.open(path) as image:
+                dimensions.append(image.size)
+        except (OSError, ValueError):
+            continue
+    return summarize_resolutions(dimensions)
 
 
 def _referenced_dataset_source(directory: Path) -> Path | None:
@@ -1695,8 +1807,6 @@ def delete_dataset(dataset_id: str, database: Database = db) -> dict[str, Any] |
             if not row:
                 return None
             dataset = dict(row)
-            if dataset["frozen"]:
-                raise DatasetDeletionError("冻结数据集受保护，不能删除")
             run_count = connection.execute(
                 "SELECT COUNT(*) FROM runs WHERE dataset_id=?", (dataset_id,)
             ).fetchone()[0]
@@ -1705,15 +1815,25 @@ def delete_dataset(dataset_id: str, database: Database = db) -> dict[str, Any] |
                     f"数据集已被 {run_count} 个评测运行引用，不能删除"
                 )
             referenced_plans = [
-                plan["id"]
+                dict(plan)
                 for plan in connection.execute(
-                    "SELECT id,dataset_ids FROM evaluation_plans"
+                    "SELECT * FROM evaluation_plans"
                 ).fetchall()
                 if dataset_id in json_load(plan["dataset_ids"], [])
             ]
-            if referenced_plans:
+            referenced_plan_ids = {plan["id"] for plan in referenced_plans}
+            active_plan_jobs = [
+                job["id"]
+                for job in connection.execute(
+                    "SELECT id,status,payload FROM jobs"
+                ).fetchall()
+                if job["status"] not in {"SUCCEEDED", "FAILED", "CANCELLED"}
+                and json_load(job["payload"], {}).get("plan_id")
+                in referenced_plan_ids
+            ]
+            if active_plan_jobs:
                 raise DatasetDeletionError(
-                    f"数据集已被评测方案 {referenced_plans[0]} 引用，不能删除"
+                    f"评测任务 {active_plan_jobs[0]} 尚未结束，不能删除数据集"
                 )
 
             artifact_path = dataset.get("artifact_path")
@@ -1734,6 +1854,7 @@ def delete_dataset(dataset_id: str, database: Database = db) -> dict[str, Any] |
             trash_created = True
             manifest_payload = {
                 **dataset,
+                "evaluation_plans": referenced_plans,
                 "annotation_schema": connection.execute(
                     """
                     SELECT categories,updated_at FROM dataset_annotation_schemas
@@ -1763,6 +1884,24 @@ def delete_dataset(dataset_id: str, database: Database = db) -> dict[str, Any] |
             if source and source.exists():
                 shutil.move(str(source), str(trash_artifact))
                 moved = True
+            for plan in referenced_plans:
+                remaining_dataset_ids = [
+                    value
+                    for value in json_load(plan["dataset_ids"], [])
+                    if value != dataset_id
+                ]
+                plan_run_count = connection.execute(
+                    "SELECT COUNT(*) FROM runs WHERE plan_id=?", (plan["id"],)
+                ).fetchone()[0]
+                if remaining_dataset_ids or plan_run_count:
+                    connection.execute(
+                        "UPDATE evaluation_plans SET dataset_ids=? WHERE id=?",
+                        (json_dump(remaining_dataset_ids), plan["id"]),
+                    )
+                else:
+                    connection.execute(
+                        "DELETE FROM evaluation_plans WHERE id=?", (plan["id"],)
+                    )
             connection.execute("DELETE FROM datasets WHERE id=?", (dataset_id,))
     except BaseException:
         if moved and source and trash_artifact.exists() and not source.exists():
@@ -1781,6 +1920,7 @@ def delete_dataset(dataset_id: str, database: Database = db) -> dict[str, Any] |
         "id": dataset_id,
         "name": dataset["name"],
         "deleted": True,
+        "evaluation_plans_updated": len(referenced_plans),
         "artifact_moved": moved,
         "trash_path": str(trash_directory),
     }
@@ -1920,6 +2060,93 @@ def delete_job(job_id: str, database: Database = db) -> dict[str, Any] | None:
     }
 
 
+def delete_evaluation_result(
+    run_id: str,
+    database: Database = db,
+) -> dict[str, Any] | None:
+    artifact_root = (database.settings.artifact_dir / "evaluations").resolve()
+    task_root = database.settings.task_dir.resolve()
+    trash_directory = (
+        database.settings.data_dir / "trash" / "evaluation_runs" / run_id
+    ).resolve()
+    manifest = trash_directory / "evaluation.json"
+    moved_paths: list[tuple[Path, Path]] = []
+    trash_created = False
+    run: dict[str, Any] | None = None
+    try:
+        with database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            run_row = connection.execute(
+                "SELECT * FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            result_row = connection.execute(
+                "SELECT * FROM results WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if not run_row or not result_row:
+                return None
+            run = decode_row(dict(run_row))
+            result = decode_row(dict(result_row))
+            if run.get("job_id"):
+                job = connection.execute(
+                    "SELECT status FROM jobs WHERE id=?", (run["job_id"],)
+                ).fetchone()
+                if job and job["status"] not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                    raise EvaluationResultDeletionError(
+                        "所属评测任务尚未结束，不能删除结果"
+                    )
+
+            artifact = (artifact_root / run_id).resolve()
+            if artifact == artifact_root or not artifact.is_relative_to(artifact_root):
+                raise EvaluationResultDeletionError("评测 Artifact 路径超出受控目录")
+            paths = [(artifact, trash_directory / "artifact")]
+            if run.get("job_id"):
+                workspace = (
+                    task_root / str(run["job_id"]) / "runs" / run_id
+                ).resolve()
+                if workspace == task_root or not workspace.is_relative_to(task_root):
+                    raise EvaluationResultDeletionError("评测工作目录超出受控目录")
+                paths.append((workspace, trash_directory / "workspace"))
+
+            if trash_directory.exists():
+                raise EvaluationResultDeletionError(
+                    f"回收站目标已存在: {trash_directory}"
+                )
+            trash_directory.mkdir(parents=True)
+            trash_created = True
+            manifest.write_text(
+                json.dumps(
+                    {"run": run, "result": result},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            for source, target in paths:
+                if source.exists():
+                    shutil.move(str(source), str(target))
+                    moved_paths.append((source, target))
+
+            connection.execute("DELETE FROM results WHERE run_id=?", (run_id,))
+            connection.execute("DELETE FROM runs WHERE id=?", (run_id,))
+    except BaseException:
+        for source, target in reversed(moved_paths):
+            if target.exists() and not source.exists():
+                source.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(target), str(source))
+        if trash_created and trash_directory.exists():
+            shutil.rmtree(trash_directory)
+        raise
+    assert run is not None
+    return {
+        "id": run_id,
+        "deleted": True,
+        "artifact_moved": any(target.name == "artifact" for _, target in moved_paths),
+        "workspace_moved": any(target.name == "workspace" for _, target in moved_paths),
+        "trash_path": str(trash_directory),
+    }
+
+
 def queue_job(job_type: str, payload: dict[str, Any], database: Database = db) -> dict[str, Any]:
     job_id = new_id("job")
     now = utc_now()
@@ -2009,9 +2236,30 @@ def _condition_metadata(
     sensor_conditions: dict[str, Any],
 ) -> dict[str, Any]:
     source_dataset_id = sensor_conditions.get("source_dataset_id")
+    if sensor_conditions.get("day_to_night") is True:
+        return {
+            "condition_type": str(
+                sensor_conditions.get("condition_label")
+                or (
+                    "自动驾驶弱光"
+                    if sensor_conditions.get("day_to_night_method") == "unpaired"
+                    else "无人机弱光"
+                )
+            ),
+            "condition_strength": None,
+            "source_dataset_id": source_dataset_id,
+        }
     if "fog_strength" in sensor_conditions:
         return {
-            "condition_type": "雾",
+            "condition_type": str(
+                sensor_conditions.get("condition_label")
+                or (
+                    "无人机气雾"
+                    if sensor_conditions.get("degradation")
+                    == "DiffusionDegrade UAV Fog"
+                    else "雾"
+                )
+            ),
             "condition_strength": float(sensor_conditions["fog_strength"]),
             "source_dataset_id": source_dataset_id,
         }
@@ -2019,6 +2267,21 @@ def _condition_metadata(
         return {
             "condition_type": "雾",
             "condition_strength": float(sensor_conditions["fog_density"]),
+            "source_dataset_id": source_dataset_id,
+        }
+    if sensor_conditions.get("fog_method") or sensor_conditions.get("fog_model"):
+        return {
+            "condition_type": str(
+                sensor_conditions.get("condition_label")
+                or (
+                    "自动驾驶气雾"
+                    if sensor_conditions.get("fog_method") == "paired"
+                    or sensor_conditions.get("degradation")
+                    == "WarpI2I Driving Fog"
+                    else "雾"
+                )
+            ),
+            "condition_strength": None,
             "source_dataset_id": source_dataset_id,
         }
     if "motion_blur_strength" in sensor_conditions:
@@ -2259,14 +2522,34 @@ def query_results(
         tuple(parameters),
     )
     decoded = [decode_row(row) for row in rows]
+    dataset_categories = {
+        dataset_id: [
+            str(category["name"])
+            for category in _annotation_categories(dataset_id, database)
+        ]
+        for dataset_id in {row["dataset_id"] for row in decoded}
+    }
+    for row in decoded:
+        configured_categories = (row.get("config") or {}).get(
+            "evaluation_categories"
+        )
+        row["evaluation_categories"] = (
+            [str(name) for name in configured_categories]
+            if configured_categories
+            else dataset_categories.get(row["dataset_id"], [])
+        )
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in decoded:
         comparison_config = _comparison_config(
             row.get("config") or {},
             row.get("model_precision"),
         )
+        comparison_scope = {
+            "inference_config": comparison_config,
+            "evaluation_categories": row["evaluation_categories"],
+        }
         configuration_signature = json.dumps(
-            comparison_config,
+            comparison_scope,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -2298,9 +2581,13 @@ def query_results(
             first.get("config") or {},
             first.get("model_precision"),
         )
+        evaluation_categories = list(first["evaluation_categories"])
         configuration_id = hashlib.sha256(
             json.dumps(
-                inference_config,
+                {
+                    "inference_config": inference_config,
+                    "evaluation_categories": evaluation_categories,
+                },
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -2346,6 +2633,7 @@ def query_results(
                 "is_demo": first["is_demo"],
                 "is_official": all(item["is_official"] for item in values),
                 "inference_config": inference_config,
+                "evaluation_categories": evaluation_categories,
                 "hardware_profile": first.get("hardware_profile") or {},
                 "environment_fingerprint": first.get("environment_fingerprint"),
                 **condition,
@@ -2544,10 +2832,24 @@ def adapter_health(adapter_id: str, database: Database = db) -> dict[str, Any] |
                 checks.append(
                     {"name": "生成依赖", "ok": False, "detail": str(exc)}
                 )
-        if adapter["id"] == "adapter_condition":
+        if adapter["id"] in {"adapter_condition", "adapter_day_to_night"}:
             adapter_settings = database.settings
             diffusion_root = adapter_settings.diffusion_degrade_root
-            checkpoint = adapter_settings.diffusion_degrade_checkpoint
+            is_day_to_night = adapter["id"] == "adapter_day_to_night"
+            checkpoint = (
+                adapter_settings.diffusion_degrade_day_to_night_checkpoint
+                if is_day_to_night
+                else adapter_settings.diffusion_degrade_checkpoint
+            )
+            checkpoint_label = (
+                "无人机弱光权重" if is_day_to_night else "无人机气雾权重"
+            )
+            dependency_label = "弱光依赖" if is_day_to_night else "气雾依赖"
+            checkpoint_environment = (
+                "DIFFUSION_DEGRADE_UAV_DAY_TO_NIGHT_CHECKPOINT"
+                if is_day_to_night
+                else "DIFFUSION_DEGRADE_UAV_FOG_CHECKPOINT"
+            )
             model_cache = (
                 adapter_settings.diffusion_degrade_hf_home
                 / "hub"
@@ -2563,7 +2865,7 @@ def adapter_health(adapter_id: str, database: Database = db) -> dict[str, Any] |
                         "detail": str(diffusion_root),
                     },
                     {
-                        "name": "无人机加雾权重",
+                        "name": checkpoint_label,
                         "ok": checkpoint.is_file(),
                         "detail": str(checkpoint),
                     },
@@ -2588,8 +2890,83 @@ def adapter_health(adapter_id: str, database: Database = db) -> dict[str, Any] |
                     env={
                         **os.environ,
                         "DIFFUSION_DEGRADE_ROOT": str(diffusion_root),
-                        "DIFFUSION_DEGRADE_UAV_FOG_CHECKPOINT": str(
-                            checkpoint
+                        checkpoint_environment: str(checkpoint),
+                        "HF_HOME": str(
+                            adapter_settings.diffusion_degrade_hf_home
+                        ),
+                        "HF_HUB_OFFLINE": "1",
+                        "TRANSFORMERS_OFFLINE": "1",
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                )
+                checks.append(
+                    {
+                        "name": dependency_label,
+                        "ok": result.returncode == 0,
+                        "detail": (result.stdout or result.stderr).strip()[-500:],
+                    }
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                checks.append(
+                    {"name": dependency_label, "ok": False, "detail": str(exc)}
+                )
+        if adapter["id"] in {
+            "adapter_warpi2i_fog",
+            "adapter_warpi2i_day_to_night",
+        }:
+            adapter_settings = database.settings
+            warpi2i_root = adapter_settings.warpi2i_root
+            is_fog = adapter["id"] == "adapter_warpi2i_fog"
+            checkpoint = (
+                adapter_settings.warpi2i_driving_fog_checkpoint
+                if is_fog
+                else adapter_settings.warpi2i_driving_day_to_night_checkpoint
+            )
+            effect = "fog" if is_fog else "day_to_night"
+            checks.extend(
+                [
+                    {
+                        "name": "WarpI2I项目",
+                        "ok": (warpi2i_root / "src" / "model.py").is_file(),
+                        "detail": str(warpi2i_root),
+                    },
+                    {
+                        "name": "自动驾驶气雾权重" if is_fog else "自动驾驶弱光权重",
+                        "ok": checkpoint.is_file(),
+                        "detail": str(checkpoint),
+                    },
+                    {
+                        "name": "SD-Turbo本地缓存",
+                        "ok": (
+                            adapter_settings.diffusion_degrade_hf_home
+                            / "hub"
+                            / "models--stabilityai--sd-turbo"
+                        ).is_dir(),
+                        "detail": str(adapter_settings.diffusion_degrade_hf_home),
+                    },
+                ]
+            )
+            try:
+                result = subprocess.run(
+                    [
+                        str(prefix / "bin" / "python"),
+                        "-B",
+                        str(entrypoint),
+                        "health",
+                        "--effect",
+                        effect,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    env={
+                        **os.environ,
+                        "WARPI2I_ROOT": str(warpi2i_root),
+                        "WARPI2I_DRIVING_FOG_CHECKPOINT": str(
+                            adapter_settings.warpi2i_driving_fog_checkpoint
+                        ),
+                        "WARPI2I_DRIVING_DAY_TO_NIGHT_CHECKPOINT": str(
+                            adapter_settings.warpi2i_driving_day_to_night_checkpoint
                         ),
                         "HF_HOME": str(
                             adapter_settings.diffusion_degrade_hf_home
@@ -2601,14 +2978,14 @@ def adapter_health(adapter_id: str, database: Database = db) -> dict[str, Any] |
                 )
                 checks.append(
                     {
-                        "name": "加雾依赖",
+                        "name": "自动驾驶气雾依赖" if is_fog else "自动驾驶弱光依赖",
                         "ok": result.returncode == 0,
                         "detail": (result.stdout or result.stderr).strip()[-500:],
                     }
                 )
             except (OSError, subprocess.SubprocessError) as exc:
                 checks.append(
-                    {"name": "加雾依赖", "ok": False, "detail": str(exc)}
+                    {"name": "WarpI2I依赖", "ok": False, "detail": str(exc)}
                 )
         if adapter["id"] == "adapter_motion_blur":
             adapter_settings = database.settings

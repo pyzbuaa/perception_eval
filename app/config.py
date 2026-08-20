@@ -50,6 +50,17 @@ class Settings:
             / "model_2501.pkl",
         )
     )
+    diffusion_degrade_day_to_night_checkpoint: Path = Path(
+        os.environ.get(
+            "DIFFUSION_DEGRADE_UAV_DAY_TO_NIGHT_CHECKPOINT",
+            ROOT_DIR.parent
+            / "DiffusionDegrade"
+            / "outputs"
+            / "uav_daynight_sichuan_3125"
+            / "checkpoints"
+            / "model_3125.pkl",
+        )
+    )
     diffusion_degrade_hf_home: Path = Path(
         os.environ.get(
             "DIFFUSION_DEGRADE_HF_HOME",
@@ -72,6 +83,36 @@ class Settings:
         os.environ.get(
             "DIFFUSION_BLUR_CHECKPOINT",
             ROOT_DIR.parent / "DiffusionBlur" / "weights" / "ID_Blau.pth",
+        )
+    )
+    warpi2i_root: Path = Path(
+        os.environ.get("WARPI2I_ROOT", ROOT_DIR.parent / "WarpI2I")
+    )
+    warpi2i_runtime_prefix: Path = Path(
+        os.environ.get(
+            "WARPI2I_RUNTIME_PREFIX",
+            ROOT_DIR.parent / "DiffusionDegrade" / ".venv",
+        )
+    )
+    warpi2i_driving_fog_checkpoint: Path = Path(
+        os.environ.get(
+            "WARPI2I_DRIVING_FOG_CHECKPOINT",
+            ROOT_DIR.parent
+            / "WarpI2I"
+            / "weights"
+            / "pix2pix_turbo"
+            / "2_24_drive_v2_warped_128"
+            / "foggy_1.pkl",
+        )
+    )
+    warpi2i_driving_day_to_night_checkpoint: Path = Path(
+        os.environ.get(
+            "WARPI2I_DRIVING_DAY_TO_NIGHT_CHECKPOINT",
+            ROOT_DIR.parent
+            / "WarpI2I"
+            / "weights"
+            / "cyclegan_turbo"
+            / "BDD100K_day2night.pkl",
         )
     )
     model_library_root: Path = Path(

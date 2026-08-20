@@ -36,7 +36,7 @@ export function StatusTag({ status }: { status: string }) {
 }
 
 export function DemoTag() {
-  return <Tag color="gold">流程样例 · 非正式结果</Tag>
+  return null
 }
 
 export function JobProgress({ jobId, onFinish }: { jobId?: string; onFinish?: (job: Job) => void }) {
@@ -139,7 +139,7 @@ export function ParetoChart({ groups, dark = false, height = 310, onSelect }: { 
   return <ReactECharts option={option} onEvents={onSelect ? { click: (params: { data?: { comparisonId?: string } }) => { const group = groups.find((item) => item.comparison_id === params.data?.comparisonId); if (group) onSelect(group) } } : undefined} style={{ height }} />
 }
 
-export function PRChart({ groups, dark = false, height = 290 }: { groups: ResultGroup[]; dark?: boolean; height?: number }) {
+export function PRChart({ groups, dark = false, height = 290 }: { groups: Array<Pick<ResultGroup, 'model_name' | 'curves'>>; dark?: boolean; height?: number }) {
   const option = useMemo(() => ({
     tooltip: { trigger: 'axis' },
     legend: { top: 0, textStyle: { color: dark ? '#c6d1df' : '#4b5565' } },

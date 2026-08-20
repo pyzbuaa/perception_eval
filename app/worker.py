@@ -33,6 +33,7 @@ from app.services import (
     _dataset_sample_name,
     category_compatibility,
     resolve_local_dataset_import,
+    summarize_image_resolutions,
     validate_evaluation_categories,
 )
 
@@ -143,7 +144,17 @@ class JobAgent:
             "source_type": payload.get("source_type", "GENERATIVE"),
             "output_directory": str(artifact_dir),
         }
-        condition_adapter_ids = {"adapter_condition", "adapter_motion_blur"}
+        condition_adapter_ids = {
+            "adapter_condition",
+            "adapter_day_to_night",
+            "adapter_motion_blur",
+            "adapter_warpi2i_fog",
+            "adapter_warpi2i_day_to_night",
+        }
+        driving_condition_adapter_ids = {
+            "adapter_warpi2i_fog",
+            "adapter_warpi2i_day_to_night",
+        }
         is_condition = payload["adapter_id"] in condition_adapter_ids
         input_dataset: dict[str, Any] | None = None
         source_annotation_directory: Path | None = None
@@ -154,11 +165,20 @@ class JobAgent:
             input_dataset = self.db.row("SELECT * FROM datasets WHERE id=?", (input_dataset_id,))
             if not input_dataset or not input_dataset.get("artifact_path"):
                 raise ValueError("输入数据集不存在或没有 Artifact")
-            if input_dataset.get("scene_domain") not in {
+            scene_domain = input_dataset.get("scene_domain")
+            if payload["adapter_id"] in driving_condition_adapter_ids:
+                if scene_domain not in {
+                    "城市驾驶",
+                    "自动驾驶",
+                    "autonomous-driving",
+                }:
+                    raise ValueError("WarpI2I 非理想条件生成仅支持自动驾驶场景数据集")
+            elif scene_domain not in {
                 "无人机航拍",
+                "低空无人机",
                 "low-altitude-uav",
             }:
-                raise ValueError("非理想条件生成当前仅支持无人机航拍域数据集")
+                raise ValueError("该非理想条件生成模型仅支持无人机航拍域数据集")
             category_row = self.db.row(
                 "SELECT categories FROM dataset_annotation_schemas WHERE dataset_id=?",
                 (input_dataset_id,),
@@ -187,22 +207,26 @@ class JobAgent:
             request["has_source_annotations"] = (
                 source_annotation_directory / "instances.json"
             ).is_file()
-            resolution = input_dataset.get("resolution") or "原始分辨率"
+            resolution = summarize_image_resolutions(
+                Path(value) for value in input_images
+            ) or input_dataset.get("resolution") or "无法读取"
             if payload["adapter_id"] == "adapter_condition":
                 try:
                     fog_strength = float(
                         payload.get("model_parameters", {}).get("fog_strength", 1.0)
                     )
                 except (TypeError, ValueError) as exc:
-                    raise ValueError("加雾强度必须是 0 到 1 之间的数值") from exc
+                    raise ValueError("气雾强度必须是 0 到 1 之间的数值") from exc
                 if not 0 <= fog_strength <= 1:
-                    raise ValueError("加雾强度必须位于 0 到 1 之间")
+                    raise ValueError("气雾强度必须位于 0 到 1 之间")
                 request["conditions"] = {
                     "scene": {"domain": "无人机航拍", "weather": "雾"},
                     "sensor": {
                         "resolution": resolution,
                         "source_dataset_id": input_dataset_id,
                         "degradation": "DiffusionDegrade UAV Fog",
+                        "condition_label": "无人机气雾",
+                        "fog_model": "DiffusionDegrade · 无人机气雾",
                         "fog_strength": fog_strength,
                     },
                 }
@@ -214,8 +238,96 @@ class JobAgent:
                     "fog_strength": fog_strength,
                     "checkpoint": "uav_fog_content15_model_2501",
                 }
-            else:
+            elif payload["adapter_id"] == "adapter_day_to_night":
+                request["conditions"] = {
+                    "scene": {"domain": "无人机航拍", "weather": "弱光"},
+                    "sensor": {
+                        "resolution": resolution,
+                        "source_dataset_id": input_dataset_id,
+                        "degradation": "DiffusionDegrade UAV Low-Light",
+                        "day_to_night": True,
+                        "day_to_night_model": "CycleGAN-Turbo Sichuan",
+                        "condition_label": "无人机弱光",
+                        "day_to_night_checkpoint": (
+                            "uav_daynight_sichuan_3125_model_3125"
+                        ),
+                        "source_time_of_day": "白天",
+                        "target_time_of_day": "夜间",
+                        "day_to_night_image_prep": "resize_640x640",
+                        "day_to_night_model_size": 640,
+                    },
+                }
+                request["model_parameters"] = {
+                    "effect": "day_to_night",
+                    "domain": "uav_aerial",
+                    "direction": "a2b",
+                    "image_prep": "resize_640x640",
+                    "model_size": 640,
+                    "precision": "FP16",
+                    "checkpoint": "uav_daynight_sichuan_3125_model_3125",
+                }
+            elif payload["adapter_id"] == "adapter_warpi2i_fog":
+                request["conditions"] = {
+                    "scene": {"domain": "城市驾驶", "weather": "雾"},
+                    "sensor": {
+                        "resolution": resolution,
+                        "source_dataset_id": input_dataset_id,
+                        "degradation": "WarpI2I Driving Fog",
+                        "condition_label": "自动驾驶气雾",
+                        "fog_model": "WarpI2I · 自动驾驶气雾",
+                        "fog_method": "paired",
+                        "fog_checkpoint": "foggy_1.pkl",
+                    },
+                }
+                request["model_parameters"] = {
+                    "effect": "fog",
+                    "domain": "autonomous_driving",
+                    "method": "paired",
+                    "image_prep": "multiple_of_8",
+                    "precision": "FP16",
+                    "checkpoint": "foggy_1.pkl",
+                }
+            elif payload["adapter_id"] == "adapter_warpi2i_day_to_night":
+                request["conditions"] = {
+                    "scene": {"domain": "城市驾驶", "weather": "弱光"},
+                    "sensor": {
+                        "resolution": resolution,
+                        "source_dataset_id": input_dataset_id,
+                        "degradation": "WarpI2I Driving Day-to-Night",
+                        "day_to_night": True,
+                        "condition_label": "自动驾驶弱光",
+                        "day_to_night_model": "WarpI2I · 自动驾驶弱光",
+                        "day_to_night_method": "unpaired",
+                        "day_to_night_checkpoint": "BDD100K_day2night.pkl",
+                        "source_time_of_day": "白天",
+                        "target_time_of_day": "夜间",
+                    },
+                }
+                request["model_parameters"] = {
+                    "effect": "day_to_night",
+                    "domain": "autonomous_driving",
+                    "method": "unpaired",
+                    "direction": "a2b",
+                    "image_prep": "resize_512x512",
+                    "precision": "FP16",
+                    "checkpoint": "BDD100K_day2night.pkl",
+                }
+            elif payload["adapter_id"] == "adapter_motion_blur":
                 motion_parameters = payload.get("model_parameters", {})
+                condition_value = str(
+                    motion_parameters.get("condition_directory") or ""
+                ).strip()
+                condition_directory: Path | None = None
+                if condition_value:
+                    condition_directory = Path(condition_value).expanduser().resolve()
+                    dataset_root = self.settings.dataset_library_root.expanduser().resolve()
+                    if (
+                        not condition_directory.is_relative_to(dataset_root)
+                        or not condition_directory.is_dir()
+                    ):
+                        raise ValueError(
+                            f"运动条件目录必须位于 {dataset_root} 内且真实存在"
+                        )
                 motion = str(motion_parameters.get("motion", "forward"))
                 allowed_motions = {
                     "forward", "backward", "fly-left", "fly-right",
@@ -242,9 +354,18 @@ class JobAgent:
                         "degradation": "ID-Blau UAV Motion Blur",
                         "motion_blur": True,
                         "motion_blur_model": "ID-Blau",
-                        "motion": motion,
+                        "motion": "condition-files" if condition_directory else motion,
                         "motion_blur_strength": motion_strength,
                         "motion_blur_sample_timesteps": 20,
+                        **(
+                            {
+                                "motion_condition_directory": str(condition_directory),
+                                "motion_condition_matching": "filename",
+                                "motion_condition_fallback": "random-preset",
+                            }
+                            if condition_directory
+                            else {}
+                        ),
                     },
                 }
                 request["model_parameters"] = {
@@ -255,9 +376,18 @@ class JobAgent:
                     "sample_timesteps": 20,
                     "precision": "FP32",
                     "checkpoint": "ID_Blau.pth",
+                    **(
+                        {
+                            "condition_directory": str(condition_directory),
+                            "condition_matching": "filename",
+                            "fallback_motion": "random-preset",
+                        }
+                        if condition_directory
+                        else {}
+                    ),
                 }
         request_path.write_text(json_dump(request), encoding="utf-8")
-        self._progress(job["id"], 12, "校验适配器协议")
+        self._progress(job["id"], 1, "校验适配器协议")
         adapter = self.db.row("SELECT * FROM adapters WHERE id=?", (payload["adapter_id"],))
         if not adapter:
             raise ValueError("适配器不存在")
@@ -280,14 +410,29 @@ class JobAgent:
                 "DIFFUSION_DEGRADE_UAV_FOG_CHECKPOINT": str(
                     self.settings.diffusion_degrade_checkpoint
                 ),
+                "DIFFUSION_DEGRADE_UAV_DAY_TO_NIGHT_CHECKPOINT": str(
+                    self.settings.diffusion_degrade_day_to_night_checkpoint
+                ),
                 "DIFFUSION_BLUR_ROOT": str(self.settings.diffusion_blur_root),
                 "DIFFUSION_BLUR_CHECKPOINT": str(
                     self.settings.diffusion_blur_checkpoint
                 ),
+                "WARPI2I_ROOT": str(self.settings.warpi2i_root),
+                "WARPI2I_DRIVING_FOG_CHECKPOINT": str(
+                    self.settings.warpi2i_driving_fog_checkpoint
+                ),
+                "WARPI2I_DRIVING_DAY_TO_NIGHT_CHECKPOINT": str(
+                    self.settings.warpi2i_driving_day_to_night_checkpoint
+                ),
                 "PYTHONUNBUFFERED": "1",
             }
         )
-        if payload["adapter_id"] == "adapter_condition":
+        if payload["adapter_id"] in {
+            "adapter_condition",
+            "adapter_day_to_night",
+            "adapter_warpi2i_fog",
+            "adapter_warpi2i_day_to_night",
+        }:
             environment.update(
                 {
                     "HF_HOME": str(self.settings.diffusion_degrade_hf_home),
@@ -298,7 +443,7 @@ class JobAgent:
         command = self._adapter_command(
             adapter, entrypoint, request_path, result_path
         )
-        self._progress(job["id"], 25, "启动生成适配器")
+        self._progress(job["id"], 1, "启动生成适配器")
         returncode, log_tail = self._run_adapter_process(
             job["id"], command, job_dir, environment
         )
@@ -306,7 +451,7 @@ class JobAgent:
             raise RuntimeError(
                 f"适配器退出码 {returncode}: {log_tail[-500:]}"
             )
-        self._progress(job["id"], 75, "验证输出文件与元数据")
+        self._progress(job["id"], 99, "验证输出文件与元数据")
         if not result_path.is_file():
             raise FileNotFoundError("适配器没有生成 result.json")
         result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -361,9 +506,23 @@ class JobAgent:
         )
         sensor = dataset_conditions.get("sensor", {})
         scene = dataset_conditions.get("scene", {})
-        resolution = sensor.get("resolution", "1920×1080")
-        if isinstance(resolution, list):
-            resolution = "×".join(str(value) for value in resolution)
+        if payload["adapter_id"] == "adapter_motion_blur":
+            runtime = result.get("runtime", {})
+            if "matched_conditions" in runtime:
+                sensor["motion_condition_matched"] = int(
+                    runtime["matched_conditions"]
+                )
+            if "fallback_conditions" in runtime:
+                sensor["motion_condition_fallback_count"] = int(
+                    runtime["fallback_conditions"]
+                )
+        resolution = summarize_image_resolutions(
+            artifact_dir / sample["image_path"] for sample in samples
+        )
+        if not resolution:
+            resolution = sensor.get("resolution", "无法读取")
+            if isinstance(resolution, list):
+                resolution = "×".join(str(value) for value in resolution)
         annotation_status = "CANDIDATE" if result.get("has_candidate_annotations") else "UNLABELED"
         if is_condition:
             annotation_status = (
@@ -403,7 +562,7 @@ class JobAgent:
                 """,
                 (dataset_id, json_dump(dataset_categories), now),
             )
-        self._progress(job["id"], 95, "创建数据集草稿")
+        self._progress(job["id"], 99, "创建数据集草稿")
         return {"dataset_id": dataset_id, "samples": len(samples), "annotation_status": annotation_status}
 
     def _adapter_command(
@@ -498,11 +657,20 @@ class JobAgent:
             event = json.loads(line)
         except json.JSONDecodeError:
             return
+        if event.get("type") == "stage":
+            stage = str(event.get("stage", "")).strip()
+            if stage:
+                self._progress(
+                    job_id,
+                    float(event.get("progress", 1)),
+                    stage,
+                )
+            return
         if event.get("type") != "progress":
             return
         current = int(event.get("current", 0))
         total = max(1, int(event.get("total", 1)))
-        progress = 25 + 48 * current / total
+        progress = max(1, min(99, 100 * current / total))
         stage = str(event.get("stage", "生成图像"))
         self._progress(job_id, progress, f"{stage} {current}/{total}")
 
@@ -548,6 +716,7 @@ class JobAgent:
         )
         if not candidates:
             raise ValueError("目录中没有支持的图像")
+        resolution = summarize_image_resolutions(candidates) or "无法读取"
         target = self.settings.artifact_dir / "imports" / job["id"]
         target.mkdir(parents=True, exist_ok=True)
         for index, path in enumerate(candidates):
@@ -680,7 +849,7 @@ class JobAgent:
                     payload.get("scene_domain", "未分类"),
                     "未记录",
                     "{}",
-                    "原始分辨率",
+                    resolution,
                     len(candidates),
                     annotation_status,
                     0,
@@ -1098,7 +1267,17 @@ class JobAgent:
             raise ValueError("评测方案不存在")
         dataset_ids = json_load(plan["dataset_ids"], [])
         model_ids = json_load(plan["model_ids"], [])
-        validate_evaluation_categories(dataset_ids, model_ids, self.db)
+        protocol = json_load(plan.get("protocol"), {})
+        compatibility_results = validate_evaluation_categories(
+            dataset_ids,
+            model_ids,
+            self.db,
+            evaluation_categories=protocol.get("evaluation_categories"),
+        )
+        category_scopes = {
+            (item["dataset_id"], item["model_id"]): item
+            for item in compatibility_results
+        }
         seeds = json_load(plan["seeds"], [])
         blur_levels = json_load(plan["blur_levels"], [0])
         combinations = [(dataset, model, seed, blur) for dataset in dataset_ids for model in model_ids for blur in blur_levels for seed in seeds]
@@ -1140,6 +1319,9 @@ class JobAgent:
                 "warmup": payload.get("warmup", 20),
                 "blur_level": blur,
                 "metric_protocol": "reference-demo-v1",
+                "evaluation_categories": category_scopes[
+                    (dataset_id, model_id)
+                ]["evaluation_categories"],
             }
             now = utc_now()
             self.db.execute(
@@ -1251,9 +1433,15 @@ class JobAgent:
         ground_truth = json.loads(annotation_path.read_text(encoding="utf-8"))
         if not ground_truth.get("images") or not ground_truth.get("categories"):
             raise ValueError("COCO 标注必须包含图片和类别")
-        compatibility = category_compatibility(dataset["id"], model["id"], self.db)
-        if not compatibility["compatible"]:
-            raise ValueError(compatibility["reason"])
+        protocol = json_load(plan.get("protocol"), {})
+        selected_categories = protocol.get("evaluation_categories")
+        compatibility = validate_evaluation_categories(
+            [dataset["id"]],
+            [model["id"]],
+            self.db,
+            evaluation_categories=selected_categories,
+        )[0]
+        subset_evaluation = selected_categories is not None
         model_to_dataset = {
             int(model_id): int(dataset_id)
             for model_id, dataset_id in compatibility["model_to_dataset"].items()
@@ -1280,13 +1468,16 @@ class JobAgent:
         model_categories = normalize_categories(json_load(model["categories"], []))
         inference_ground_truth = json.loads(json.dumps(ground_truth))
         inference_ground_truth["categories"] = model_categories
+        inference_annotations = []
         for annotation in inference_ground_truth.get("annotations", []):
             dataset_category_id = int(annotation["category_id"])
             if dataset_category_id not in dataset_to_model:
-                raise ValueError(
-                    f"数据集标注引用了未登记类别 {dataset_category_id}"
-                )
+                if subset_evaluation:
+                    continue
+                raise ValueError(f"数据集标注引用了未登记类别 {dataset_category_id}")
             annotation["category_id"] = dataset_to_model[dataset_category_id]
+            inference_annotations.append(annotation)
+        inference_ground_truth["annotations"] = inference_annotations
         inference_annotation_path = (
             job_directory / "annotations" / "model-category-space.json"
         )
@@ -1312,8 +1503,6 @@ class JobAgent:
             specification = properties.get(name, {})
             return specification.get("const", specification.get("default", fallback))
 
-        protocol = json_load(plan.get("protocol"), {})
-
         def task_parameter(name: str, fallback: Any) -> Any:
             default = parameter(name, fallback)
             return protocol.get(name, default) if name in properties else default
@@ -1332,6 +1521,7 @@ class JobAgent:
             "metric_protocol": "pycocotools-2.0.11",
             "adapter_id": adapter["id"],
             "annotation_conversion": annotation_conversion,
+            "evaluation_categories": compatibility["evaluation_categories"],
         }
         request_path = job_directory / "request.json"
         result_path = job_directory / "result.json"
@@ -1522,19 +1712,23 @@ class JobAgent:
         predictions = json.loads(predictions_path.read_text(encoding="utf-8"))
         if not isinstance(predictions, list):
             raise ValueError("检测结果必须是 COCO predictions 数组")
+        mapped_predictions = []
         for prediction in predictions:
             model_category_id = int(prediction["category_id"])
             if model_category_id not in model_to_dataset:
-                raise ValueError(
-                    f"模型输出了未登记类别 {model_category_id}"
-                )
+                if subset_evaluation:
+                    continue
+                raise ValueError(f"模型输出了未登记类别 {model_category_id}")
             prediction["category_id"] = model_to_dataset[model_category_id]
+            mapped_predictions.append(prediction)
+        predictions = mapped_predictions
         predictions_path.write_text(json_dump(predictions), encoding="utf-8")
         self._progress(job["id"], 78, "计算 COCO 检测指标")
         metrics, curves = evaluate_coco_predictions(
             annotation_path,
             predictions_path,
             result.get("runtime", {}),
+            compatibility["evaluation_category_ids"],
         )
         config.update(
             {

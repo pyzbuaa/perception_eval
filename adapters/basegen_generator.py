@@ -309,6 +309,16 @@ def prepare_plan(
     return plan, config
 
 
+def emit_stage(stage: str, progress: float = 1) -> None:
+    print(
+        json.dumps(
+            {"type": "stage", "stage": stage, "progress": progress},
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
 class ProgressStream:
     def __init__(self, target: TextIO, total: int):
         self.target = target
@@ -348,6 +358,7 @@ def run(request_path: Path, result_path: Path) -> None:
     plan, config = prepare_plan(request, root)
     _, run_plan, _, _, _ = load_basegen(root)
     started = time.perf_counter()
+    emit_stage("加载生成模型（可能需要数分钟）")
     original_stdout = sys.stdout
     sys.stdout = ProgressStream(original_stdout, len(plan))
     try:

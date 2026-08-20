@@ -4,16 +4,19 @@ import asyncio
 import hashlib
 import io
 import json
+import random
 import sqlite3
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fastapi import UploadFile
 from PIL import Image
 
 import app.main as main_module
-from adapters.basegen_generator import prepare_plan
+from adapters import diffusionblur_motion, diffusiondegrade_day_to_night
+from adapters.basegen_generator import emit_stage, prepare_plan
 from adapters.diffusiondegrade_fog import blend_fog
 from adapters.dronedets_detector import category_mapping
 from app.command_protocol import (
@@ -30,6 +33,7 @@ from app.services import (
     DatasetAnnotationError,
     DatasetDeletionError,
     DatasetImportError,
+    EvaluationResultDeletionError,
     CategoryCompatibilityError,
     JobDeletionError,
     LocalModelRegistrationError,
@@ -37,6 +41,7 @@ from app.services import (
     complete_dataset_annotations,
     category_compatibility,
     delete_dataset,
+    delete_evaluation_result,
     delete_job,
     delete_model,
     dataset_statistics,
@@ -55,11 +60,129 @@ from app.services import (
     register_local_detector_model,
     resolve_local_dataset_import,
     save_sample_annotation,
+    summarize_resolutions,
     update_annotation_schema,
     validate_evaluation_categories,
 )
 from app.schemas import DatasetImportRequest
 from app.worker import JobAgent
+
+
+def test_motion_blur_condition_files_match_by_name_and_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_directory = tmp_path / "inputs"
+    (input_directory / "nested").mkdir(parents=True)
+    Image.new("RGB", (8, 8), (40, 80, 120)).save(
+        input_directory / "matched.png"
+    )
+    Image.new("RGB", (8, 8), (80, 120, 160)).save(
+        input_directory / "nested" / "missing.png"
+    )
+    condition_directory = tmp_path / "conditions"
+    condition_directory.mkdir()
+    file_condition = np.stack(
+        (
+            np.zeros((8, 8), dtype=np.float32),
+            np.ones((8, 8), dtype=np.float32),
+            np.full((8, 8), 0.25, dtype=np.float32),
+        )
+    )
+    np.save(condition_directory / "matched_condition.npy", file_condition)
+
+    generated_motions: list[str] = []
+    received_conditions: list[np.ndarray] = []
+
+    class FakeConfig:
+        def __init__(self, motion: str, mean_strength: float):
+            self.motion = motion
+            self.mean_strength = mean_strength
+
+    class FakeGenerator:
+        def __init__(self, config: FakeConfig):
+            self.config = config
+
+        def generate(self, height: int, width: int) -> np.ndarray:
+            generated_motions.append(self.config.motion)
+            condition = np.zeros((3, height, width), dtype=np.float32)
+            condition[0] = 1
+            condition[2] = self.config.mean_strength
+            return condition
+
+    class FakePipeline:
+        def generate(
+            self,
+            image: np.ndarray,
+            condition: np.ndarray,
+            sample_timesteps: int,
+            seed: int,
+        ) -> np.ndarray:
+            assert sample_timesteps == 20
+            received_conditions.append(condition.copy())
+            return image.copy()
+
+    monkeypatch.setattr(
+        diffusionblur_motion,
+        "validate_installation",
+        lambda: (tmp_path / "DiffusionBlur", tmp_path / "ID_Blau.pth"),
+    )
+    monkeypatch.setattr(
+        diffusionblur_motion,
+        "load_components",
+        lambda root, checkpoint: (
+            FakeGenerator,
+            FakeConfig,
+            lambda image: (image, (0, 0)),
+            FakePipeline(),
+        ),
+    )
+    output_directory = tmp_path / "outputs"
+    request_path = tmp_path / "request.json"
+    result_path = tmp_path / "result.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "protocol_version": "1.0",
+                "job_id": "job-motion-condition",
+                "input_directory": str(input_directory),
+                "input_images": [
+                    str(input_directory / "matched.png"),
+                    str(input_directory / "nested" / "missing.png"),
+                ],
+                "output_directory": str(output_directory),
+                "sample_count": 2,
+                "seeds": [100],
+                "has_source_annotations": False,
+                "model_parameters": {
+                    "effect": "motion_blur",
+                    "domain": "uav_aerial",
+                    "motion": "forward",
+                    "strength": 0.14,
+                    "sample_timesteps": 20,
+                    "condition_directory": str(condition_directory),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diffusionblur_motion.run(request_path, result_path)
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["runtime"]["matched_conditions"] == 1
+    assert result["runtime"]["fallback_conditions"] == 1
+    assert result["samples"][0]["condition_source"] == "file"
+    assert result["samples"][0]["condition_file"] == "matched_condition.npy"
+    assert result["samples"][1]["condition_source"] == "random-preset-fallback"
+    expected_fallback = random.Random(101).choice(
+        sorted(diffusionblur_motion.MOTIONS)
+    )
+    assert result["samples"][1]["motion"] == expected_fallback
+    assert generated_motions == [expected_fallback]
+    np.testing.assert_array_equal(received_conditions[0], file_condition)
+    assert (output_directory / "matched.png").is_file()
+    assert (output_directory / "nested" / "missing.png").is_file()
 
 
 def make_database(tmp_path: Path) -> tuple[Database, Settings]:
@@ -104,6 +227,36 @@ def test_database_seeds_traceable_demo_data(tmp_path: Path) -> None:
     assert motion_blur["runtime_prefix"].endswith("envs/blau")
     assert motion_blur["entrypoint"] == "adapters/diffusionblur_motion.py"
     assert motion_blur["requires_gpu"] == 1
+    day_to_night = database.row(
+        "SELECT * FROM adapters WHERE id='adapter_day_to_night'"
+    )
+    assert day_to_night and day_to_night["runtime_kind"] == "conda_external"
+    assert day_to_night["runtime_prefix"].endswith("DiffusionDegrade/.venv")
+    assert day_to_night["entrypoint"] == (
+        "adapters/diffusiondegrade_day_to_night.py"
+    )
+    assert day_to_night["requires_gpu"] == 1
+    day_to_night_properties = json.loads(day_to_night["parameter_schema"])[
+        "properties"
+    ]
+    assert day_to_night_properties["image_prep"]["const"] == "resize_640x640"
+    assert day_to_night_properties["model_size"]["const"] == 640
+    assert "tile_size" not in day_to_night_properties
+    assert "overlap" not in day_to_night_properties
+    warpi2i_fog = database.row(
+        "SELECT * FROM adapters WHERE id='adapter_warpi2i_fog'"
+    )
+    assert warpi2i_fog
+    assert warpi2i_fog["runtime_prefix"].endswith("DiffusionDegrade/.venv")
+    assert warpi2i_fog["entrypoint"] == "adapters/warpi2i_driving.py"
+    warpi2i_day_to_night = database.row(
+        "SELECT * FROM adapters WHERE id='adapter_warpi2i_day_to_night'"
+    )
+    assert warpi2i_day_to_night
+    assert warpi2i_day_to_night["runtime_prefix"].endswith(
+        "DiffusionDegrade/.venv"
+    )
+    assert warpi2i_day_to_night["entrypoint"] == "adapters/warpi2i_driving.py"
     detector_model = database.row(
         "SELECT weight_path FROM models "
         "WHERE id='model_dronedets_yolov8m_visdrone'"
@@ -126,7 +279,7 @@ def test_database_does_not_restore_deleted_demo_data(tmp_path: Path) -> None:
 
     for table in ("datasets", "models", "evaluation_plans", "runs", "results", "jobs"):
         assert database.row(f"SELECT COUNT(*) AS n FROM {table}")["n"] == 0
-    assert database.row("SELECT COUNT(*) AS n FROM adapters")["n"] == 5
+    assert database.row("SELECT COUNT(*) AS n FROM adapters")["n"] == 8
 
 
 def test_diffusiondegrade_fog_strength_blends_source_and_model_output() -> None:
@@ -138,6 +291,116 @@ def test_diffusiondegrade_fog_strength_blends_source_and_model_output() -> None:
     assert blend_fog(source, fogged, 1).getpixel((0, 0)) == (200, 200, 200)
     with pytest.raises(ValueError, match="0 到 1"):
         blend_fog(source, fogged, 1.1)
+
+
+def test_uav_low_light_processes_one_full_frame_without_tiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_directory = tmp_path / "input"
+    output_directory = tmp_path / "output"
+    input_directory.mkdir()
+    input_path = input_directory / "aerial.png"
+    Image.new("RGB", (1400, 900), (40, 80, 120)).save(input_path)
+    checkpoint = tmp_path / "model.pkl"
+    checkpoint.write_bytes(b"checkpoint")
+    translated_sizes: list[tuple[int, int]] = []
+
+    class FakeCuda:
+        @staticmethod
+        def manual_seed_all(seed: int) -> None:
+            return None
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+        @staticmethod
+        def manual_seed(seed: int) -> None:
+            return None
+
+    def translate(image: Image.Image) -> Image.Image:
+        translated_sizes.append(image.size)
+        return image.resize((640, 640)).resize(image.size)
+
+    monkeypatch.setattr(
+        diffusiondegrade_day_to_night,
+        "validate_installation",
+        lambda: (tmp_path, checkpoint),
+    )
+    monkeypatch.setattr(
+        diffusiondegrade_day_to_night,
+        "load_translator",
+        lambda root, model: (FakeTorch(), translate),
+    )
+    request_path = tmp_path / "request.json"
+    result_path = tmp_path / "result.json"
+    request_path.write_text(
+        json_dump(
+            {
+                "protocol_version": "1.0",
+                "job_id": "job_low_light",
+                "sample_count": 1,
+                "input_images": [str(input_path)],
+                "input_directory": str(input_directory),
+                "output_directory": str(output_directory),
+                "model_parameters": {
+                    "effect": "day_to_night",
+                    "domain": "uav_aerial",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diffusiondegrade_day_to_night.run(request_path, result_path)
+
+    assert translated_sizes == [(1400, 900)]
+    with Image.open(output_directory / "aerial.png") as output:
+        assert output.size == (1400, 900)
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["runtime"]["image_prep"] == "resize_640x640"
+    assert result["runtime"]["output_restore"] == "original_size"
+    assert "tile_size" not in result["runtime"]
+    assert "overlap" not in result["runtime"]
+
+
+def test_resolution_summary_uses_value_or_range() -> None:
+    assert summarize_resolutions([(1920, 1080)]) == "1920×1080"
+    assert summarize_resolutions([(1920, 1080), (640, 480)]) == (
+        "640×480 ～ 1920×1080"
+    )
+
+
+def test_basegen_loading_stage_updates_job(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database, app_settings = make_database(tmp_path)
+    job = queue_job("ACQUISITION", {}, database)
+    emit_stage("加载生成模型（可能需要数分钟）")
+
+    JobAgent(database, app_settings)._handle_adapter_progress(
+        job["id"], capsys.readouterr().out.strip()
+    )
+
+    updated = database.row("SELECT progress,stage FROM jobs WHERE id=?", (job["id"],))
+    assert updated["progress"] == 1
+    assert updated["stage"] == "加载生成模型（可能需要数分钟）"
+
+    agent = JobAgent(database, app_settings)
+    agent._handle_adapter_progress(
+        job["id"], json.dumps({"type": "progress", "current": 17, "total": 100})
+    )
+    updated = database.row("SELECT progress,stage FROM jobs WHERE id=?", (job["id"],))
+    assert updated["progress"] == 17
+    assert updated["stage"] == "生成图像 17/100"
+
+    agent._handle_adapter_progress(
+        job["id"], json.dumps({"type": "progress", "current": 100, "total": 100})
+    )
+    updated = database.row("SELECT progress,stage FROM jobs WHERE id=?", (job["id"],))
+    assert updated["progress"] == 99
+    assert updated["stage"] == "生成图像 100/100"
 
 
 def test_dataset_migration_marks_existing_id_blau_motion_blur(tmp_path: Path) -> None:
@@ -225,6 +488,43 @@ def test_delete_job_rejects_active_task_and_preserves_evaluation_results(
     assert not log.exists()
 
 
+def test_delete_evaluation_result_moves_run_files_to_trash(tmp_path: Path) -> None:
+    database, app_settings = make_database(tmp_path)
+    run = database.row("SELECT * FROM runs LIMIT 1")
+    job = queue_job("EVALUATION", {"plan_id": run["plan_id"]}, database)
+    database.execute("UPDATE runs SET job_id=? WHERE id=?", (job["id"], run["id"]))
+
+    with pytest.raises(EvaluationResultDeletionError, match="尚未结束"):
+        delete_evaluation_result(run["id"], database)
+
+    database.execute(
+        "UPDATE jobs SET status='SUCCEEDED',progress=100 WHERE id=?", (job["id"],)
+    )
+    artifact = app_settings.artifact_dir / "evaluations" / run["id"]
+    artifact.mkdir(parents=True)
+    (artifact / "predictions.json").write_text("[]", encoding="utf-8")
+    workspace = app_settings.task_dir / job["id"] / "runs" / run["id"]
+    workspace.mkdir(parents=True)
+    (workspace / "request.json").write_text("{}", encoding="utf-8")
+    dataset_id = run["dataset_id"]
+    model_id = run["model_id"]
+
+    deleted = delete_evaluation_result(run["id"], database)
+
+    assert deleted and deleted["deleted"]
+    assert deleted["artifact_moved"]
+    assert deleted["workspace_moved"]
+    assert database.row("SELECT id FROM results WHERE run_id=?", (run["id"],)) is None
+    assert database.row("SELECT id FROM runs WHERE id=?", (run["id"],)) is None
+    assert database.row("SELECT id FROM datasets WHERE id=?", (dataset_id,))
+    assert database.row("SELECT id FROM models WHERE id=?", (model_id,))
+    assert database.row("SELECT id FROM jobs WHERE id=?", (job["id"],))
+    trash = app_settings.data_dir / "trash" / "evaluation_runs" / run["id"]
+    assert (trash / "artifact" / "predictions.json").read_text(encoding="utf-8") == "[]"
+    assert (trash / "workspace" / "request.json").read_text(encoding="utf-8") == "{}"
+    assert (trash / "evaluation.json").is_file()
+
+
 def test_model_metadata_migration_preserves_legacy_rows() -> None:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
@@ -287,6 +587,19 @@ def test_category_compatibility_maps_ids_and_rejects_name_mismatch(
         validate_evaluation_categories(
             ["dataset_aerial_clean"], ["model_yolov5s_demo"], database
         )
+    database.execute(
+        "UPDATE models SET categories=? WHERE id='model_yolov5s_demo'",
+        (json_dump([{"id": 9, "name": "car"}]),),
+    )
+    subset = validate_evaluation_categories(
+        ["dataset_aerial_clean"],
+        ["model_yolov5s_demo"],
+        database,
+        evaluation_categories=["car"],
+    )[0]
+    assert subset["model_to_dataset"] == {"9": 1}
+    assert subset["evaluation_categories"] == ["car"]
+    assert subset["evaluation_category_ids"] == [1]
 
 
 def test_auto_annotation_runs_registered_detector_and_preserves_existing_boxes(
@@ -1094,7 +1407,15 @@ def test_dronedets_category_mapping_and_coco_metrics(tmp_path: Path) -> None:
                         "bbox": [10, 10, 30, 20],
                         "area": 600,
                         "iscrowd": 0,
-                    }
+                    },
+                    {
+                        "id": 2,
+                        "image_id": 1,
+                        "category_id": 2,
+                        "bbox": [55, 45, 20, 15],
+                        "area": 300,
+                        "iscrowd": 0,
+                    },
                 ],
             }
         ),
@@ -1123,11 +1444,19 @@ def test_dronedets_category_mapping_and_coco_metrics(tmp_path: Path) -> None:
             "peak_memory_mb": 1024,
         },
     )
-    assert metrics["map"] == pytest.approx(1)
-    assert metrics["map50"] == pytest.approx(1)
+    assert metrics["map"] == pytest.approx(0.5)
+    assert metrics["map50"] == pytest.approx(0.5)
     assert metrics["latency_p50"] == 10
     assert metrics["fps"] == 100
     assert len(curves["recall"]) == len(curves["precision"]) == 101
+    selected_metrics, _ = evaluate_coco_predictions(
+        annotation_path,
+        predictions_path,
+        {},
+        [1],
+    )
+    assert selected_metrics["map"] == pytest.approx(1)
+    assert selected_metrics["map50"] == pytest.approx(1)
 
 
 def test_result_query_keeps_resolution_as_group_dimension(tmp_path: Path) -> None:
@@ -1137,6 +1466,36 @@ def test_result_query_keeps_resolution_as_group_dimension(tmp_path: Path) -> Non
     assert len(result["groups"]) == 6
     assert {group["resolution"] for group in result["groups"]} == {"1920×1080"}
     assert all(group["seed_count"] == 3 for group in result["groups"])
+
+
+def test_result_query_does_not_merge_different_evaluation_categories(
+    tmp_path: Path,
+) -> None:
+    database, _ = make_database(tmp_path)
+    run = database.row(
+        """
+        SELECT id,config FROM runs
+        WHERE dataset_id='dataset_aerial_clean'
+          AND model_id='model_yolov5s_demo'
+        LIMIT 1
+        """
+    )
+    config = json.loads(run["config"])
+    config["evaluation_categories"] = ["car"]
+    database.execute(
+        "UPDATE runs SET config=? WHERE id=?",
+        (json_dump(config), run["id"]),
+    )
+    result = query_results(scene="无人机航拍", database=database)
+    groups = [
+        group for group in result["groups"]
+        if group["dataset_id"] == "dataset_aerial_clean"
+        and group["model_id"] == "model_yolov5s_demo"
+    ]
+    assert len(groups) == 2
+    assert sorted(group["seed_count"] for group in groups) == [1, 2]
+    assert sorted(len(group["evaluation_categories"]) for group in groups) == [1, 6]
+    assert any(group["evaluation_categories"] == ["car"] for group in groups)
 
 
 def test_result_query_does_not_merge_different_inference_configs(
@@ -1494,7 +1853,7 @@ def test_basegen_preview_resolves_three_scenes_without_generation() -> None:
     assert all(item["prompt"] for item in preview["images"])
 
 
-def test_delete_dataset_moves_artifacts_to_trash(tmp_path: Path) -> None:
+def test_delete_frozen_dataset_moves_artifacts_to_trash(tmp_path: Path) -> None:
     database, app_settings = make_database(tmp_path)
     artifact_directory = app_settings.artifact_dir / "imports" / "delete-test"
     artifact_directory.mkdir(parents=True)
@@ -1517,7 +1876,7 @@ def test_delete_dataset_moves_artifacts_to_trash(tmp_path: Path) -> None:
             "原始分辨率",
             1,
             "UNLABELED",
-            0,
+            1,
             "imports/delete-test",
             utc_now(),
         ),
@@ -1787,13 +2146,8 @@ def test_detection_annotations_persist_and_export_coco(tmp_path: Path) -> None:
         )
 
 
-def test_delete_dataset_rejects_frozen_and_run_referenced_data(tmp_path: Path) -> None:
+def test_delete_dataset_rejects_run_referenced_data(tmp_path: Path) -> None:
     database, _ = make_database(tmp_path)
-    with pytest.raises(DatasetDeletionError, match="冻结"):
-        delete_dataset("dataset_aerial_clean", database)
-    database.execute(
-        "UPDATE datasets SET frozen=0 WHERE id='dataset_aerial_clean'"
-    )
     with pytest.raises(DatasetDeletionError, match="评测运行"):
         delete_dataset("dataset_aerial_clean", database)
     assert database.row(
@@ -1801,11 +2155,8 @@ def test_delete_dataset_rejects_frozen_and_run_referenced_data(tmp_path: Path) -
     )
 
 
-def test_delete_dataset_rejects_evaluation_plan_reference(tmp_path: Path) -> None:
+def test_delete_dataset_cleans_evaluation_plan_references(tmp_path: Path) -> None:
     database, _ = make_database(tmp_path)
-    database.execute(
-        "UPDATE datasets SET frozen=0 WHERE id='dataset_aerial_clean'"
-    )
     database.execute("DELETE FROM results")
     database.execute("DELETE FROM runs")
     database.execute(
@@ -1825,8 +2176,41 @@ def test_delete_dataset_rejects_evaluation_plan_reference(tmp_path: Path) -> Non
             utc_now(),
         ),
     )
-    with pytest.raises(DatasetDeletionError, match="评测方案"):
+    database.execute(
+        """
+        INSERT INTO evaluation_plans
+        (id,name,dataset_ids,model_ids,seeds,blur_levels,protocol,created_at)
+        VALUES (?,?,?,?,?,?,?,?)
+        """,
+        (
+            "plan_keep_other_dataset",
+            "保留其他数据集",
+            json_dump(["dataset_aerial_clean", "dataset_aerial_blur"]),
+            json_dump(["model_yolov5s_demo"]),
+            json_dump([1001]),
+            json_dump([0]),
+            json_dump({}),
+            utc_now(),
+        ),
+    )
+    job = queue_job("EVALUATION", {"plan_id": "plan_delete_guard"}, database)
+    with pytest.raises(DatasetDeletionError, match="评测任务"):
         delete_dataset("dataset_aerial_clean", database)
+    database.execute(
+        "UPDATE jobs SET status='CANCELLED' WHERE id=?", (job["id"],)
+    )
+
+    deleted = delete_dataset("dataset_aerial_clean", database)
+
+    assert deleted and deleted["deleted"]
+    assert deleted["evaluation_plans_updated"] == 2
+    assert database.row(
+        "SELECT id FROM evaluation_plans WHERE id='plan_delete_guard'"
+    ) is None
+    retained_plan = database.row(
+        "SELECT dataset_ids FROM evaluation_plans WHERE id='plan_keep_other_dataset'"
+    )
+    assert json.loads(retained_plan["dataset_ids"]) == ["dataset_aerial_blur"]
 
 
 def test_evaluation_rejects_unfrozen_dataset(tmp_path: Path) -> None:
@@ -1901,10 +2285,11 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
     )
     database.execute(
         """
-        UPDATE models SET weight_path=?,weight_sha256='test-sha',status='EXPERIMENTAL'
+        UPDATE models SET weight_path=?,weight_sha256='test-sha',status='EXPERIMENTAL',
+                          categories=?,class_count=1
         WHERE id='model_dronedets_yolov8m_visdrone'
         """,
-        (str(fake_weight),),
+        (str(fake_weight), json_dump([{"id": 3, "name": "car"}])),
     )
     database.execute(
         """
@@ -1919,7 +2304,14 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
             json_dump(["model_dronedets_yolov8m_visdrone"]),
             json_dump([1001]),
             json_dump([0]),
-            json_dump({"batch_size": 1, "precision": "FP16", "warmup": 0}),
+            json_dump(
+                {
+                    "batch_size": 1,
+                    "precision": "FP16",
+                    "warmup": 0,
+                    "evaluation_categories": ["car"],
+                }
+            ),
             utc_now(),
         ),
     )
@@ -1999,7 +2391,9 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
     assert run["map"] == pytest.approx(1)
     assert run["latency_p50"] == 10
     assert run["is_official"] == 0
-    assert json.loads(run["config"])["annotation_conversion"]["images"] == 1
+    run_config = json.loads(run["config"])
+    assert run_config["annotation_conversion"]["images"] == 1
+    assert run_config["evaluation_categories"] == ["car"]
     assert not (dataset_directory / "annotations" / "instances.json").exists()
     visualization = evaluation_run_visualization(run["id"], 0, 12, database)
     assert visualization
@@ -2013,7 +2407,7 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
     assert box["width"] == pytest.approx(0.3)
 
 
-def test_local_import_can_feed_diffusiondegrade_fog(
+def test_local_import_can_feed_nonideal_condition_adapters(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2037,10 +2431,22 @@ def test_local_import_can_feed_diffusiondegrade_fog(
     assert agent.process_one()
     imported = database.row("SELECT * FROM datasets WHERE name='真实航拍导入'")
     assert imported and imported["source_type"] == "REAL"
+    assert imported["resolution"] == "64×40"
     imported_directory = app_settings.artifact_dir / imported["artifact_path"]
     imported_image = imported_directory / "aerial.png"
     assert imported_image.is_symlink()
     assert imported_image.resolve() == source_directory / "aerial.png"
+    database.execute(
+        "UPDATE datasets SET resolution='原始分辨率' WHERE id=?",
+        (imported["id"],),
+    )
+    listed = next(
+        item for item in list_datasets(database) if item["id"] == imported["id"]
+    )
+    assert listed["resolution"] == "64×40"
+    assert database.row(
+        "SELECT resolution FROM datasets WHERE id=?", (imported["id"],)
+    )["resolution"] == "64×40"
     annotation_directory = imported_directory / "annotations"
     annotation_directory.mkdir()
     (annotation_directory / "instances.json").write_text(
@@ -2065,7 +2471,11 @@ def test_local_import_can_feed_diffusiondegrade_fog(
         encoding="utf-8",
     )
     database.execute(
-        "UPDATE datasets SET annotation_status='CANDIDATE' WHERE id=?",
+        """
+        UPDATE datasets
+        SET annotation_status='CANDIDATE',source_type='GENERATIVE',scene_domain='低空无人机'
+        WHERE id=?
+        """,
         (imported["id"],),
     )
 
@@ -2096,6 +2506,13 @@ def test_local_import_can_feed_diffusiondegrade_fog(
                         }
                     ],
                     "has_candidate_annotations": True,
+                    "runtime": (
+                        {"matched_conditions": 1, "fallback_conditions": 0}
+                        if request.get("model_parameters", {}).get(
+                            "condition_directory"
+                        )
+                        else {}
+                    ),
                 }
             ),
             encoding="utf-8",
@@ -2129,8 +2546,12 @@ def test_local_import_can_feed_diffusiondegrade_fog(
     assert transformed["source_type"] == "REAL_TRANSFORMED"
     assert transformed["scene_domain"] == "无人机航拍"
     assert transformed["weather"] == "雾"
+    assert transformed["resolution"] == "64×40"
     assert transformed["annotation_status"] == "CANDIDATE"
-    assert json.loads(transformed["sensor_conditions"])["fog_strength"] == pytest.approx(0.6)
+    sensor = json.loads(transformed["sensor_conditions"])
+    assert sensor["fog_strength"] == pytest.approx(0.6)
+    assert sensor["condition_label"] == "无人机气雾"
+    assert sensor["fog_model"] == "DiffusionDegrade · 无人机气雾"
     outputs = list((app_settings.artifact_dir / transformed["artifact_path"]).glob("*.png"))
     assert len(outputs) == 1
     assert (
@@ -2190,6 +2611,212 @@ def test_local_import_can_feed_diffusiondegrade_fog(
     assert captured["environment"]["DIFFUSION_BLUR_ROOT"].endswith(
         "DiffusionBlur"
     )
+
+    condition_directory = tmp_path / "motion-conditions"
+    condition_directory.mkdir()
+    np.save(
+        condition_directory / "aerial_condition.npy",
+        np.stack(
+            (
+                np.ones((40, 64), dtype=np.float32),
+                np.zeros((40, 64), dtype=np.float32),
+                np.full((40, 64), 0.2, dtype=np.float32),
+            )
+        ),
+    )
+    condition_file_job = queue_job(
+        "ACQUISITION",
+        {
+            "name": "真实航拍条件文件运动模糊",
+            "adapter_id": "adapter_motion_blur",
+            "source_type": "REAL_TRANSFORMED",
+            "sample_count": 1,
+            "seeds": [2023],
+            "input_dataset_id": imported["id"],
+            "conditions": {},
+            "model_parameters": {
+                "motion": "forward",
+                "strength": 0.14,
+                "condition_directory": str(condition_directory),
+            },
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
+        },
+        database,
+    )
+    assert agent.process_one()
+    completed = database.row(
+        "SELECT * FROM jobs WHERE id=?", (condition_file_job["id"],)
+    )
+    assert completed["status"] == "SUCCEEDED"
+    transformed = database.row(
+        "SELECT * FROM datasets WHERE name='真实航拍条件文件运动模糊'"
+    )
+    sensor = json.loads(transformed["sensor_conditions"])
+    assert sensor["motion"] == "condition-files"
+    assert sensor["motion_condition_directory"] == str(condition_directory)
+    assert sensor["motion_condition_matching"] == "filename"
+    assert sensor["motion_condition_fallback"] == "random-preset"
+    assert sensor["motion_condition_matched"] == 1
+    assert sensor["motion_condition_fallback_count"] == 0
+    request = captured["request"]
+    assert request["model_parameters"]["condition_directory"] == str(
+        condition_directory
+    )
+    assert request["model_parameters"]["condition_matching"] == "filename"
+    assert request["model_parameters"]["fallback_motion"] == "random-preset"
+
+    day_to_night_job = queue_job(
+        "ACQUISITION",
+        {
+            "name": "真实航拍无人机弱光",
+            "adapter_id": "adapter_day_to_night",
+            "source_type": "REAL_TRANSFORMED",
+            "sample_count": 1,
+            "seeds": [42],
+            "input_dataset_id": imported["id"],
+            "conditions": {},
+            "model_parameters": {"effect": "day_to_night"},
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
+        },
+        database,
+    )
+    assert agent.process_one()
+    completed = database.row(
+        "SELECT * FROM jobs WHERE id=?", (day_to_night_job["id"],)
+    )
+    assert completed["status"] == "SUCCEEDED"
+    transformed = database.row(
+        "SELECT * FROM datasets WHERE name='真实航拍无人机弱光'"
+    )
+    assert transformed["scene_domain"] == "无人机航拍"
+    assert transformed["weather"] == "弱光"
+    assert transformed["annotation_status"] == "CANDIDATE"
+    sensor = json.loads(transformed["sensor_conditions"])
+    assert sensor["day_to_night"] is True
+    assert sensor["condition_label"] == "无人机弱光"
+    assert sensor["source_time_of_day"] == "白天"
+    assert sensor["target_time_of_day"] == "夜间"
+    assert sensor["day_to_night_checkpoint"] == (
+        "uav_daynight_sichuan_3125_model_3125"
+    )
+    assert sensor["day_to_night_image_prep"] == "resize_640x640"
+    assert sensor["day_to_night_model_size"] == 640
+    request = captured["request"]
+    assert request["model_parameters"] == {
+        "effect": "day_to_night",
+        "domain": "uav_aerial",
+        "direction": "a2b",
+        "image_prep": "resize_640x640",
+        "model_size": 640,
+        "precision": "FP16",
+        "checkpoint": "uav_daynight_sichuan_3125_model_3125",
+    }
+    assert str(captured["command"][0]).endswith("DiffusionDegrade/.venv/bin/python")
+    assert captured["environment"][
+        "DIFFUSION_DEGRADE_UAV_DAY_TO_NIGHT_CHECKPOINT"
+    ].endswith("outputs/uav_daynight_sichuan_3125/checkpoints/model_3125.pkl")
+    assert captured["environment"]["HF_HUB_OFFLINE"] == "1"
+
+    database.execute(
+        "UPDATE datasets SET scene_domain='城市驾驶' WHERE id=?",
+        (imported["id"],),
+    )
+    driving_fog_job = queue_job(
+        "ACQUISITION",
+        {
+            "name": "城市驾驶自动驾驶气雾",
+            "adapter_id": "adapter_warpi2i_fog",
+            "source_type": "REAL_TRANSFORMED",
+            "sample_count": 1,
+            "seeds": [42],
+            "input_dataset_id": imported["id"],
+            "conditions": {},
+            "model_parameters": {"effect": "fog", "method": "paired"},
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
+        },
+        database,
+    )
+    assert agent.process_one()
+    completed = database.row(
+        "SELECT * FROM jobs WHERE id=?", (driving_fog_job["id"],)
+    )
+    assert completed["status"] == "SUCCEEDED"
+    transformed = database.row(
+        "SELECT * FROM datasets WHERE name='城市驾驶自动驾驶气雾'"
+    )
+    assert transformed["scene_domain"] == "城市驾驶"
+    assert transformed["weather"] == "雾"
+    sensor = json.loads(transformed["sensor_conditions"])
+    assert sensor["condition_label"] == "自动驾驶气雾"
+    assert sensor["fog_model"] == "WarpI2I · 自动驾驶气雾"
+    assert sensor["fog_method"] == "paired"
+    assert sensor["fog_checkpoint"] == "foggy_1.pkl"
+    assert captured["request"]["model_parameters"] == {
+        "effect": "fog",
+        "domain": "autonomous_driving",
+        "method": "paired",
+        "image_prep": "multiple_of_8",
+        "precision": "FP16",
+        "checkpoint": "foggy_1.pkl",
+    }
+    assert str(captured["command"][0]).endswith(
+        "DiffusionDegrade/.venv/bin/python"
+    )
+    assert captured["environment"]["WARPI2I_DRIVING_FOG_CHECKPOINT"].endswith(
+        "pix2pix_turbo/2_24_drive_v2_warped_128/foggy_1.pkl"
+    )
+
+    driving_night_job = queue_job(
+        "ACQUISITION",
+        {
+            "name": "城市驾驶自动驾驶弱光",
+            "adapter_id": "adapter_warpi2i_day_to_night",
+            "source_type": "REAL_TRANSFORMED",
+            "sample_count": 1,
+            "seeds": [42],
+            "input_dataset_id": imported["id"],
+            "conditions": {},
+            "model_parameters": {"effect": "day_to_night"},
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
+        },
+        database,
+    )
+    assert agent.process_one()
+    completed = database.row(
+        "SELECT * FROM jobs WHERE id=?", (driving_night_job["id"],)
+    )
+    assert completed["status"] == "SUCCEEDED"
+    transformed = database.row(
+        "SELECT * FROM datasets WHERE name='城市驾驶自动驾驶弱光'"
+    )
+    assert transformed["scene_domain"] == "城市驾驶"
+    assert transformed["weather"] == "弱光"
+    sensor = json.loads(transformed["sensor_conditions"])
+    assert sensor["day_to_night"] is True
+    assert sensor["condition_label"] == "自动驾驶弱光"
+    assert sensor["day_to_night_model"] == "WarpI2I · 自动驾驶弱光"
+    assert sensor["day_to_night_method"] == "unpaired"
+    assert sensor["day_to_night_checkpoint"] == "BDD100K_day2night.pkl"
+    assert captured["request"]["model_parameters"] == {
+        "effect": "day_to_night",
+        "domain": "autonomous_driving",
+        "method": "unpaired",
+        "direction": "a2b",
+        "image_prep": "resize_512x512",
+        "precision": "FP16",
+        "checkpoint": "BDD100K_day2night.pkl",
+    }
+    assert str(captured["command"][0]).endswith(
+        "DiffusionDegrade/.venv/bin/python"
+    )
+    assert captured["environment"][
+        "WARPI2I_DRIVING_DAY_TO_NIGHT_CHECKPOINT"
+    ].endswith("cyclegan_turbo/BDD100K_day2night.pkl")
+    assert captured["environment"]["HF_HUB_OFFLINE"] == "1"
 
 
 def test_resource_picker_upload_imports_and_cleans_staging(

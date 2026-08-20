@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -70,7 +71,7 @@ def load_components(root: Path, checkpoint: Path):
     return CameraMotionConditionGenerator, CameraMotionConfig, pad_image, pipeline
 
 
-def parse_parameters(request: dict[str, Any]) -> tuple[str, float, int]:
+def parse_parameters(request: dict[str, Any]) -> tuple[str, float, int, Path | None]:
     parameters = request.get("model_parameters", {})
     if parameters.get("effect") != "motion_blur":
         raise ValueError("本适配器当前仅支持 motion_blur")
@@ -85,14 +86,86 @@ def parse_parameters(request: dict[str, Any]) -> tuple[str, float, int]:
     sample_timesteps = int(parameters.get("sample_timesteps", 20))
     if sample_timesteps != 20:
         raise ValueError("当前平台固定使用 20 个 DDIM 采样步")
-    return motion, strength, sample_timesteps
+    condition_value = str(parameters.get("condition_directory") or "").strip()
+    condition_directory = (
+        Path(condition_value).expanduser().resolve() if condition_value else None
+    )
+    if condition_directory and not condition_directory.is_dir():
+        raise FileNotFoundError(f"运动条件目录不存在: {condition_directory}")
+    return motion, strength, sample_timesteps, condition_directory
+
+
+def index_condition_files(directory: Path) -> dict[str, Path]:
+    indexed: dict[str, Path] = {}
+    for path in sorted(directory.rglob("*.npy")):
+        key = path.stem
+        if key.endswith("_condition"):
+            key = key[: -len("_condition")]
+        if key in indexed:
+            raise ValueError(
+                f"运动条件目录存在重复文件名: {indexed[key].name} / {path.name}"
+            )
+        indexed[key] = path
+    return indexed
+
+
+def load_motion_condition(
+    path: Path,
+    height: int,
+    width: int,
+    flow_norm: float = 147.0,
+) -> tuple[np.ndarray, str]:
+    condition = np.asarray(np.load(path, allow_pickle=False))
+    if condition.ndim != 3:
+        raise ValueError(f"运动条件必须是三维数组: {path}")
+    if condition.shape[0] == 3:
+        pass
+    elif condition.shape[-1] == 3:
+        condition = np.moveaxis(condition, -1, 0)
+    else:
+        raise ValueError(f"运动条件必须为 [3,H,W] 或 [H,W,3]: {path}")
+    expected = (3, height, width)
+    if condition.shape != expected:
+        raise ValueError(
+            f"运动条件尺寸 {condition.shape} 与图片尺寸 {expected} 不一致: {path.name}"
+        )
+    condition = condition.astype(np.float32, copy=True)
+    if not np.isfinite(condition).all():
+        raise ValueError(f"运动条件包含 NaN 或 Inf: {path.name}")
+    direction_max = float(np.abs(condition[:2]).max())
+    if direction_max > 1.001:
+        raise ValueError(f"运动条件方向分量必须位于 [-1,1]: {path.name}")
+    if np.any(condition[2] < 0):
+        raise ValueError(f"运动条件幅度不能为负数: {path.name}")
+    magnitude_max = float(condition[2].max())
+    mode = "raft-raw" if magnitude_max > 1.000001 else "normalized"
+    if mode == "raft-raw":
+        condition[2] = np.clip(condition[2] / flow_norm, 0.0, 1.0)
+    else:
+        condition[2] = np.clip(condition[2], 0.0, 1.0)
+    condition[:2] = np.clip(condition[:2], -1.0, 1.0)
+    condition[:2, condition[2] <= 1e-8] = 0.0
+    if float(condition[2].max()) <= 0:
+        raise ValueError(f"运动条件幅度全部为零: {path.name}")
+    return condition, mode
+
+
+def pad_condition(condition: np.ndarray, padding: tuple[int, int]) -> np.ndarray:
+    pad_height, pad_width = padding
+    if not pad_height and not pad_width:
+        return condition
+    return np.pad(
+        condition,
+        ((0, 0), (0, pad_height), (0, pad_width)),
+        mode="reflect",
+    )
 
 
 def run(request_path: Path, result_path: Path) -> None:
     request = json.loads(request_path.read_text(encoding="utf-8"))
     if request.get("protocol_version") != "1.0":
         raise ValueError("仅支持 1.0 版 Adapter 协议")
-    motion, strength, sample_timesteps = parse_parameters(request)
+    motion, strength, sample_timesteps, condition_directory = parse_parameters(request)
     input_links = [
         Path(value).expanduser().absolute()
         for value in request.get("input_images", [])
@@ -112,20 +185,50 @@ def run(request_path: Path, result_path: Path) -> None:
     generator_class, config_class, pad_image, pipeline = load_components(
         root, checkpoint
     )
-    motion_generator = generator_class(
-        config_class(motion=motion, mean_strength=strength)
+    motion_generator = (
+        generator_class(config_class(motion=motion, mean_strength=strength))
+        if condition_directory is None
+        else None
+    )
+    condition_files = (
+        index_condition_files(condition_directory) if condition_directory else {}
     )
 
     seeds = request.get("seeds") or [request.get("seed", 2023)]
     started = time.perf_counter()
     samples: list[dict[str, Any]] = []
+    matched_conditions = 0
+    fallback_conditions = 0
     for index, (input_path, relative) in enumerate(zip(inputs, relatives)):
         seed = int(seeds[index % len(seeds)]) + index
         with Image.open(input_path) as opened:
             input_image = np.array(opened.convert("RGB"), dtype=np.uint8, copy=True)
         height, width = input_image.shape[:2]
-        padded, _ = pad_image(input_image)
-        condition = motion_generator.generate(padded.shape[0], padded.shape[1])
+        padded, padding = pad_image(input_image)
+        condition_path = condition_files.get(relative.stem)
+        condition_mode = None
+        used_motion = motion
+        if condition_path:
+            condition, condition_mode = load_motion_condition(
+                condition_path,
+                height,
+                width,
+            )
+            condition = pad_condition(condition, padding)
+            condition_source = "file"
+            matched_conditions += 1
+        else:
+            if condition_directory:
+                used_motion = random.Random(seed).choice(sorted(MOTIONS))
+                fallback_conditions += 1
+            assert motion_generator is not None or condition_directory is not None
+            generator = motion_generator or generator_class(
+                config_class(motion=used_motion, mean_strength=strength)
+            )
+            condition = generator.generate(padded.shape[0], padded.shape[1])
+            condition_source = (
+                "random-preset-fallback" if condition_directory else "preset"
+            )
         output = pipeline.generate(
             padded,
             condition,
@@ -147,8 +250,15 @@ def run(request_path: Path, result_path: Path) -> None:
                     "CANDIDATE" if request.get("has_source_annotations") else "UNLABELED"
                 ),
                 "source_path": str(input_path),
-                "motion": motion,
+                "motion": used_motion,
                 "mean_strength": float(condition[2, :height, :width].mean()),
+                "condition_source": condition_source,
+                "condition_file": (
+                    str(condition_path.relative_to(condition_directory))
+                    if condition_path and condition_directory
+                    else None
+                ),
+                "condition_mode": condition_mode,
             }
         )
         print(
@@ -176,10 +286,13 @@ def run(request_path: Path, result_path: Path) -> None:
                     "duration_ms": round((time.perf_counter() - started) * 1000, 2),
                     "model": "ID-Blau UAV Motion Blur",
                     "checkpoint": checkpoint.name,
-                    "motion": motion,
+                    "motion": motion if condition_directory is None else "condition-files",
                     "strength": strength,
                     "sample_timesteps": sample_timesteps,
                     "precision": "FP32",
+                    "condition_matching": "filename",
+                    "matched_conditions": matched_conditions,
+                    "fallback_conditions": fallback_conditions,
                 },
                 "warnings": [
                     (

@@ -130,6 +130,9 @@ class EvaluationPlanRequest(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     dataset_ids: list[str] = Field(min_length=1)
     model_ids: list[str] = Field(min_length=1)
+    evaluation_categories: list[str] | None = Field(
+        default=None, min_length=1, max_length=1000
+    )
     seeds: list[int] = Field(default_factory=lambda: [1001, 1002, 1003], min_length=1)
     blur_levels: list[float] = Field(default_factory=lambda: [0.0])
     batch_size: int = Field(default=1, ge=1, le=64)

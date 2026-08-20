@@ -10,17 +10,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 
-PROMPT = "a foggy UAV aerial image"
-IMAGE_PREP = "resize_512x512"
-
-
-def blend_fog(source: Image.Image, fogged: Image.Image, strength: float) -> Image.Image:
-    if not 0 <= strength <= 1:
-        raise ValueError("fog_strength 必须位于 0 到 1 之间")
-    return Image.blend(source.convert("RGB"), fogged.convert("RGB"), strength)
+PROMPT = "a nighttime RGB UAV aerial image"
+MODEL_SIZE = 640
 
 
 def project_root() -> Path:
@@ -32,45 +26,44 @@ def checkpoint_path() -> Path:
     default = (
         project_root()
         / "outputs"
-        / "uav_fog_8gpu_3125_content15"
+        / "uav_daynight_sichuan_3125"
         / "checkpoints"
-        / "model_2501.pkl"
+        / "model_3125.pkl"
     )
     return Path(
-        os.environ.get("DIFFUSION_DEGRADE_UAV_FOG_CHECKPOINT", default)
+        os.environ.get("DIFFUSION_DEGRADE_UAV_DAY_TO_NIGHT_CHECKPOINT", default)
     ).expanduser().resolve()
 
 
 def validate_installation() -> tuple[Path, Path]:
     root = project_root()
     checkpoint = checkpoint_path()
-    if not (root / "src" / "cyclegan_turbo.py").is_file():
-        raise FileNotFoundError(f"DiffusionDegrade 项目不存在或不完整: {root}")
+    if not (root / "scripts" / "infer_uav_daynight_tiled.py").is_file():
+        raise FileNotFoundError(f"DiffusionDegrade 无人机弱光入口不存在: {root}")
     if not checkpoint.is_file():
-        raise FileNotFoundError(f"无人机气雾权重不存在: {checkpoint}")
+        raise FileNotFoundError(f"无人机弱光权重不存在: {checkpoint}")
     return root, checkpoint
 
 
-def load_model(root: Path, checkpoint: Path):
+def load_translator(root: Path, checkpoint: Path):
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    source_directory = str(root / "src")
-    if source_directory not in sys.path:
-        sys.path.insert(0, source_directory)
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
 
     import torch
-    from cyclegan_turbo import CycleGAN_Turbo
-    from my_utils.training_utils import build_transform
-    from torchvision import transforms
+    from scripts.infer_uav_daynight_tiled import TileTranslator
 
     if not torch.cuda.is_available():
-        raise RuntimeError("DiffusionDegrade 无人机气雾仅支持 CUDA，当前进程无法访问 GPU")
-    model = CycleGAN_Turbo(pretrained_path=str(checkpoint))
-    model.eval()
-    if torch.cuda.get_device_capability()[0] < 12:
-        model.unet.enable_xformers_memory_efficient_attention()
-    model.half()
-    return torch, transforms, build_transform(IMAGE_PREP), model
+        raise RuntimeError("DiffusionDegrade 无人机弱光仅支持 CUDA，当前进程无法访问 GPU")
+    translator = TileTranslator(
+        model_path=checkpoint,
+        direction="a2b",
+        prompt=PROMPT,
+        model_size=MODEL_SIZE,
+        use_fp16=True,
+    )
+    return torch, translator
 
 
 def run(request_path: Path, result_path: Path) -> None:
@@ -78,13 +71,10 @@ def run(request_path: Path, result_path: Path) -> None:
     if request.get("protocol_version") != "1.0":
         raise ValueError("仅支持 1.0 版 Adapter 协议")
     parameters = request.get("model_parameters", {})
-    if parameters.get("effect") != "fog":
-        raise ValueError("本适配器当前仅支持 fog 气雾生成")
+    if parameters.get("effect") != "day_to_night":
+        raise ValueError("本适配器仅支持 day_to_night")
     if parameters.get("domain") != "uav_aerial":
-        raise ValueError("本适配器当前仅支持无人机航拍域")
-    strength = float(parameters.get("fog_strength", 1.0))
-    if not 0 <= strength <= 1:
-        raise ValueError("fog_strength 必须位于 0 到 1 之间")
+        raise ValueError("本适配器仅支持无人机航拍域")
 
     input_links = [
         Path(value).expanduser().absolute()
@@ -93,7 +83,7 @@ def run(request_path: Path, result_path: Path) -> None:
     inputs = [path.resolve() for path in input_links]
     count = int(request.get("sample_count", len(inputs)))
     if count < 1 or count != len(inputs):
-        raise ValueError("无人机气雾必须处理输入数据集中的全部图像")
+        raise ValueError("无人机弱光必须处理输入数据集中的全部图像")
     if not all(path.is_file() for path in inputs):
         raise FileNotFoundError("输入数据集中存在无法读取的图像")
     input_directory = Path(request["input_directory"]).expanduser().resolve()
@@ -102,9 +92,9 @@ def run(request_path: Path, result_path: Path) -> None:
     output_directory = Path(request["output_directory"]).expanduser().resolve()
     output_directory.mkdir(parents=True, exist_ok=True)
     root, checkpoint = validate_installation()
-    torch, transforms, transform, model = load_model(root, checkpoint)
+    torch, translator = load_translator(root, checkpoint)
 
-    seeds = request.get("seeds") or [request.get("seed", 1001)]
+    seeds = request.get("seeds") or [request.get("seed", 42)]
     started = time.perf_counter()
     samples: list[dict[str, Any]] = []
     for index, (input_path, relative) in enumerate(zip(inputs, relatives)):
@@ -112,18 +102,14 @@ def run(request_path: Path, result_path: Path) -> None:
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         with Image.open(input_path) as opened:
-            input_image = opened.convert("RGB")
-        prepared = transform(input_image)
-        tensor = transforms.ToTensor()(prepared)
-        tensor = transforms.Normalize([0.5], [0.5])(tensor).unsqueeze(0).cuda().half()
-        with torch.no_grad():
-            output = model(tensor, direction="a2b", caption=PROMPT)
-        output_image = transforms.ToPILImage()(output[0].float().cpu() * 0.5 + 0.5)
-        output_image = output_image.resize(input_image.size, Image.Resampling.LANCZOS)
-        output_image = blend_fog(input_image, output_image, strength)
+            input_image = ImageOps.exif_transpose(opened).convert("RGB")
+        output_image = translator(input_image)
         output_path = output_directory / relative
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_image.save(output_path)
+        if output_path.suffix.lower() in {".jpg", ".jpeg"}:
+            output_image.save(output_path, quality=95, subsampling=0)
+        else:
+            output_image.save(output_path)
         samples.append(
             {
                 "sample_id": f"{request['job_id']}-{index + 1}",
@@ -142,7 +128,7 @@ def run(request_path: Path, result_path: Path) -> None:
             json.dumps(
                 {
                     "type": "progress",
-                    "stage": "无人机气雾",
+                    "stage": "无人机弱光生成",
                     "current": index + 1,
                     "total": count,
                 },
@@ -161,17 +147,19 @@ def run(request_path: Path, result_path: Path) -> None:
                 "has_candidate_annotations": bool(request.get("has_source_annotations")),
                 "runtime": {
                     "duration_ms": round((time.perf_counter() - started) * 1000, 2),
-                    "model": "DiffusionDegrade CycleGAN-Turbo UAV Fog",
+                    "model": "DiffusionDegrade CycleGAN-Turbo Sichuan UAV Low-Light",
                     "checkpoint": checkpoint.name,
-                    "image_prep": IMAGE_PREP,
+                    "direction": "a2b",
+                    "image_prep": "resize_640x640",
+                    "model_size": MODEL_SIZE,
+                    "output_restore": "original_size",
                     "precision": "FP16",
-                    "fog_strength": strength,
                 },
                 "warnings": [
                     (
-                        "气雾生成保持输出尺寸和文件名；继承标注作为候选真值，冻结前仍需抽查。"
+                        "弱光生成保持输出尺寸和文件名；继承标注作为候选真值，冻结前需抽查目标几何是否保持。"
                         if request.get("has_source_annotations")
-                        else "源数据未提供 COCO 标注，气雾结果保持未标注状态。"
+                        else "源数据未提供 COCO 标注，弱光结果保持未标注状态。"
                     )
                 ],
             },
@@ -185,8 +173,8 @@ def run(request_path: Path, result_path: Path) -> None:
 
 def health() -> None:
     root, checkpoint = validate_installation()
-    import torch
     import diffusers
+    import torch
     import transformers
 
     print(

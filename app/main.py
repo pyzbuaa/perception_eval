@@ -36,12 +36,14 @@ from app.services import (
     DatasetArtifactError,
     DatasetDeletionError,
     DatasetImportError,
+    EvaluationResultDeletionError,
     JobDeletionError,
     LocalModelRegistrationError,
     ModelDeletionError,
     adapter_health,
     complete_dataset_annotations,
     delete_dataset,
+    delete_evaluation_result,
     delete_job,
     delete_model,
     dataset_statistics,
@@ -663,7 +665,11 @@ def create_plan(request: EvaluationPlanRequest) -> dict[str, Any]:
         if not db.row("SELECT id FROM models WHERE id=?", (model_id,)):
             raise HTTPException(status_code=404, detail=f"模型不存在: {model_id}")
     try:
-        validate_evaluation_categories(request.dataset_ids, request.model_ids)
+        category_validation = validate_evaluation_categories(
+            request.dataset_ids,
+            request.model_ids,
+            evaluation_categories=request.evaluation_categories,
+        )
     except CategoryCompatibilityError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     plan_id = new_id("plan")
@@ -677,6 +683,11 @@ def create_plan(request: EvaluationPlanRequest) -> dict[str, Any]:
         "input_height": request.input_height,
         "input_width": request.input_width,
         "max_detections": request.max_detections,
+        "evaluation_categories": (
+            category_validation[0]["evaluation_categories"]
+            if request.evaluation_categories is not None
+            else None
+        ),
         "timing": "cuda-synchronized",
         "official": False,
     }
@@ -705,13 +716,14 @@ def run_plan(plan_id: str) -> dict[str, Any]:
     if not plan:
         raise HTTPException(status_code=404, detail="评测方案不存在")
     try:
+        protocol = json.loads(plan["protocol"])
         validate_evaluation_categories(
             json.loads(plan["dataset_ids"]),
             json.loads(plan["model_ids"]),
+            evaluation_categories=protocol.get("evaluation_categories"),
         )
     except CategoryCompatibilityError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    protocol = json.loads(plan["protocol"])
     return queue_job("EVALUATION", {"plan_id": plan_id, **protocol})
 
 
@@ -783,6 +795,17 @@ def get_results(
     model_id: str | None = None,
 ) -> dict[str, Any]:
     return query_results(scene, condition, resolution, model_id)
+
+
+@app.delete("/api/evaluation-runs/{run_id}")
+def remove_evaluation_result(run_id: str) -> dict[str, Any]:
+    try:
+        result = delete_evaluation_result(run_id)
+    except EvaluationResultDeletionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="评测结果不存在")
+    return result
 
 
 @app.get("/api/evaluation-runs/{run_id}/visualization")

@@ -22,6 +22,7 @@ def evaluate_coco_predictions(
     annotation_path: Path,
     predictions_path: Path,
     runtime: dict[str, Any],
+    category_ids: list[int] | None = None,
 ) -> tuple[dict[str, Any], dict[str, list[float]]]:
     from pycocotools.coco import COCO
     from pycocotools.cocoeval import COCOeval
@@ -39,7 +40,7 @@ def evaluate_coco_predictions(
             evaluator.params.imgIds = [
                 int(image["id"]) for image in ground_truth.get("images", [])
             ]
-            evaluator.params.catIds = [
+            evaluator.params.catIds = category_ids or [
                 int(category["id"])
                 for category in ground_truth.get("categories", [])
             ]

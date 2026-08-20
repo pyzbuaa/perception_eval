@@ -214,6 +214,7 @@ export interface ResultGroup {
   is_demo: boolean
   is_official: boolean
   inference_config: Record<string, string | number | boolean>
+  evaluation_categories: string[]
   hardware_profile: Record<string, unknown>
   environment_fingerprint?: string
   condition_type: string
@@ -237,10 +238,45 @@ export interface ResultGroup {
   curves: { recall: number[]; precision: number[] }
 }
 
+export interface ResultRun {
+  id: string
+  run_id: string
+  dataset_id: string
+  dataset_name: string
+  model_id: string
+  model_name: string
+  family: string
+  backbone: string
+  scene_domain: string
+  weather: string
+  resolution: string
+  source_type: string
+  sensor_conditions: Record<string, unknown>
+  is_demo: boolean
+  is_official: boolean
+  evaluation_categories: string[]
+  config: Record<string, unknown>
+  hardware_profile: Record<string, unknown>
+  environment_fingerprint?: string
+  seed: number
+  map: number
+  map50: number
+  map75: number
+  precision: number
+  recall: number
+  f1: number
+  latency_p50: number
+  latency_p95: number
+  fps: number
+  peak_memory: number
+  curves: { recall: number[]; precision: number[] }
+  created_at: string
+}
+
 export interface ResultResponse {
   count: number
   groups: ResultGroup[]
-  runs: Array<Record<string, unknown>>
+  runs: ResultRun[]
   dimensions: {
     scenes: string[]
     conditions: string[]

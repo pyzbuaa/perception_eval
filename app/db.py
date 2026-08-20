@@ -123,6 +123,48 @@ class Database:
                 "UPDATE datasets SET sensor_conditions=? WHERE id=?",
                 (json_dump(conditions), row["id"]),
             )
+        rows = connection.execute(
+            """
+            SELECT id,name,sensor_conditions,weather FROM datasets
+            WHERE scene_domain IN ('无人机航拍','low-altitude-uav')
+              AND sensor_conditions LIKE '%\"day_to_night\":true%'
+            """
+        ).fetchall()
+        for row in rows:
+            conditions = json_load(row["sensor_conditions"], {})
+            conditions["condition_label"] = "无人机弱光"
+            if conditions.get("degradation") == "DiffusionDegrade UAV Day-to-Night":
+                conditions["degradation"] = "DiffusionDegrade UAV Low-Light"
+            connection.execute(
+                "UPDATE datasets SET name=?,sensor_conditions=?,weather=? WHERE id=?",
+                (
+                    row["name"]
+                    .replace("白天转夜晚", "弱光")
+                    .replace("无人机航拍 · 无人机弱光", "无人机航拍 · 弱光"),
+                    json_dump(conditions),
+                    "弱光" if row["weather"] == "夜间" else row["weather"],
+                    row["id"],
+                ),
+            )
+        rows = connection.execute(
+            """
+            SELECT id,name,sensor_conditions,weather FROM datasets
+            WHERE sensor_conditions LIKE '%WarpI2I Driving Day-to-Night%'
+            """
+        ).fetchall()
+        for row in rows:
+            conditions = json_load(row["sensor_conditions"], {})
+            conditions["condition_label"] = "自动驾驶弱光"
+            conditions["day_to_night_model"] = "WarpI2I · 自动驾驶弱光"
+            connection.execute(
+                "UPDATE datasets SET name=?,sensor_conditions=?,weather=? WHERE id=?",
+                (
+                    row["name"].replace("白天转夜晚", "自动驾驶弱光"),
+                    json_dump(conditions),
+                    "弱光" if row["weather"] == "夜间" else row["weather"],
+                    row["id"],
+                ),
+            )
 
     def rows(self, query: str, parameters: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -203,7 +245,7 @@ class Database:
                 ),
                 (
                     "adapter_condition",
-                    "DiffusionDegrade · 无人机加雾",
+                    "DiffusionDegrade · 无人机气雾",
                     "OPERATOR",
                     "1.0.0",
                     "EXPERIMENTAL",
@@ -213,8 +255,53 @@ class Database:
                     "adapters/diffusiondegrade_fog.py",
                     1,
                     "REGISTERED",
-                    "使用 DiffusionDegrade 对无人机航拍图像执行真实域加雾；保持原图尺寸和文件名。",
+                    "使用 DiffusionDegrade 对无人机航拍图像执行气雾生成；保持原图尺寸和文件名。",
                     json_dump(CONDITION_SCHEMA),
+                ),
+                (
+                    "adapter_day_to_night",
+                    "DiffusionDegrade · 四川无人机弱光",
+                    "OPERATOR",
+                    "1.0.0",
+                    "EXPERIMENTAL",
+                    "conda_external",
+                    str(self.settings.diffusion_degrade_runtime_prefix),
+                    "read_only",
+                    "adapters/diffusiondegrade_day_to_night.py",
+                    1,
+                    "REGISTERED",
+                    "使用 DiffusionDegrade Sichuan 权重将无人机航拍图像转换为弱光域；保持原图尺寸和文件名。",
+                    json_dump(DAY_TO_NIGHT_SCHEMA),
+                ),
+                (
+                    "adapter_warpi2i_fog",
+                    "WarpI2I · 自动驾驶气雾",
+                    "OPERATOR",
+                    "1.0.0",
+                    "EXPERIMENTAL",
+                    "conda_external",
+                    str(self.settings.warpi2i_runtime_prefix),
+                    "read_only",
+                    "adapters/warpi2i_driving.py",
+                    1,
+                    "REGISTERED",
+                    "使用 WarpI2I paired Pix2Pix-Turbo 生成自动驾驶气雾；保持原图尺寸和文件名。",
+                    json_dump(WARPI2I_DRIVING_FOG_SCHEMA),
+                ),
+                (
+                    "adapter_warpi2i_day_to_night",
+                    "WarpI2I · 自动驾驶弱光",
+                    "OPERATOR",
+                    "1.0.0",
+                    "EXPERIMENTAL",
+                    "conda_external",
+                    str(self.settings.warpi2i_runtime_prefix),
+                    "read_only",
+                    "adapters/warpi2i_driving.py",
+                    1,
+                    "REGISTERED",
+                    "使用 WarpI2I CycleGAN-Turbo 生成自动驾驶弱光图像；保持原图尺寸和文件名。",
+                    json_dump(WARPI2I_DRIVING_DAY_TO_NIGHT_SCHEMA),
                 ),
                 (
                     "adapter_motion_blur",
@@ -261,12 +348,66 @@ class Database:
                 """
                 UPDATE adapters
                 SET status=CASE
+                        WHEN entrypoint!='adapters/diffusiondegrade_day_to_night.py'
+                        THEN 'REGISTERED' ELSE status END,
+                    name='DiffusionDegrade · 四川无人机弱光',maturity='EXPERIMENTAL',
+                    runtime_kind='conda_external',runtime_prefix=?,policy='read_only',
+                    entrypoint='adapters/diffusiondegrade_day_to_night.py',requires_gpu=1,
+                    description='使用 DiffusionDegrade Sichuan 权重将无人机航拍图像转换为弱光域；保持原图尺寸和文件名。',
+                    parameter_schema=?,updated_at=?
+                WHERE id='adapter_day_to_night'
+                """,
+                (
+                    str(self.settings.diffusion_degrade_runtime_prefix),
+                    json_dump(DAY_TO_NIGHT_SCHEMA),
+                    now,
+                ),
+            )
+            for adapter_id, name, description, schema in (
+                (
+                    "adapter_warpi2i_fog",
+                    "WarpI2I · 自动驾驶气雾",
+                    "使用 WarpI2I paired Pix2Pix-Turbo 生成自动驾驶气雾；保持原图尺寸和文件名。",
+                    WARPI2I_DRIVING_FOG_SCHEMA,
+                ),
+                (
+                    "adapter_warpi2i_day_to_night",
+                    "WarpI2I · 自动驾驶弱光",
+                    "使用 WarpI2I CycleGAN-Turbo 生成自动驾驶弱光图像；保持原图尺寸和文件名。",
+                    WARPI2I_DRIVING_DAY_TO_NIGHT_SCHEMA,
+                ),
+            ):
+                connection.execute(
+                    """
+                    UPDATE adapters
+                    SET status=CASE
+                            WHEN entrypoint!='adapters/warpi2i_driving.py'
+                            THEN 'REGISTERED' ELSE status END,
+                        name=?,maturity='EXPERIMENTAL',runtime_kind='conda_external',
+                        runtime_prefix=?,policy='read_only',
+                        entrypoint='adapters/warpi2i_driving.py',requires_gpu=1,
+                        description=?,parameter_schema=?,updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        name,
+                        str(self.settings.warpi2i_runtime_prefix),
+                        description,
+                        json_dump(schema),
+                        now,
+                        adapter_id,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE adapters
+                SET status=CASE
                         WHEN entrypoint!='adapters/diffusiondegrade_fog.py'
                         THEN 'REGISTERED' ELSE status END,
-                    name='DiffusionDegrade · 无人机加雾',maturity='EXPERIMENTAL',
+                    name='DiffusionDegrade · 无人机气雾',maturity='EXPERIMENTAL',
                     runtime_kind='conda_external',runtime_prefix=?,policy='read_only',
                     entrypoint='adapters/diffusiondegrade_fog.py',requires_gpu=1,
-                    description='使用 DiffusionDegrade 对无人机航拍图像执行真实域加雾；保持原图尺寸和文件名。',
+                    description='使用 DiffusionDegrade 对无人机航拍图像执行气雾生成；保持原图尺寸和文件名。',
                     parameter_schema=?,updated_at=?
                 WHERE id='adapter_condition'
                 """,
@@ -735,6 +876,47 @@ CONDITION_SCHEMA = {
     },
 }
 
+DAY_TO_NIGHT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "effect": {"type": "string", "const": "day_to_night"},
+        "domain": {"type": "string", "const": "uav_aerial"},
+        "direction": {"type": "string", "const": "a2b"},
+        "image_prep": {"type": "string", "const": "resize_640x640"},
+        "model_size": {"type": "integer", "const": 640},
+        "precision": {"type": "string", "const": "FP16"},
+        "checkpoint": {
+            "type": "string",
+            "const": "uav_daynight_sichuan_3125_model_3125",
+        },
+    },
+}
+
+WARPI2I_DRIVING_FOG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "effect": {"type": "string", "const": "fog"},
+        "domain": {"type": "string", "const": "autonomous_driving"},
+        "method": {"type": "string", "const": "paired"},
+        "image_prep": {"type": "string", "const": "multiple_of_8"},
+        "precision": {"type": "string", "const": "FP16"},
+        "checkpoint": {"type": "string", "const": "foggy_1.pkl"},
+    },
+}
+
+WARPI2I_DRIVING_DAY_TO_NIGHT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "effect": {"type": "string", "const": "day_to_night"},
+        "domain": {"type": "string", "const": "autonomous_driving"},
+        "method": {"type": "string", "const": "unpaired"},
+        "direction": {"type": "string", "const": "a2b"},
+        "image_prep": {"type": "string", "const": "resize_512x512"},
+        "precision": {"type": "string", "const": "FP16"},
+        "checkpoint": {"type": "string", "const": "BDD100K_day2night.pkl"},
+    },
+}
+
 MOTION_BLUR_SCHEMA = {
     "type": "object",
     "properties": {
@@ -766,6 +948,9 @@ MOTION_BLUR_SCHEMA = {
             "default": 0.14,
         },
         "sample_timesteps": {"type": "integer", "const": 20},
+        "condition_directory": {"type": "string"},
+        "condition_matching": {"type": "string", "const": "filename"},
+        "fallback_motion": {"type": "string", "const": "random-preset"},
         "precision": {"type": "string", "const": "FP32"},
         "checkpoint": {"type": "string", "const": "ID_Blau.pth"},
     },
