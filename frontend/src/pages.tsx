@@ -2427,42 +2427,12 @@ export function EvaluationPage({ navigate, refresh }: PageProps) {
   </Space>
 }
 
-type ExplorerMode = 'parameters' | 'datasets' | 'robustness' | 'models' | 'selection' | 'pareto'
-
-const explorerModeOptions = [
-  { value: 'parameters', label: '推理参数' },
-  { value: 'datasets', label: '数据集泛化' },
-  { value: 'robustness', label: '条件鲁棒性' },
-  { value: 'models', label: '模型对比' },
-  { value: 'selection', label: '场景选型' },
-  { value: 'pareto', label: '精度—效率' },
-]
-
-const analysisParameterLabels: Record<string, string> = {
-  input_resolution: '推理分辨率', confidence: '置信度阈值', nms_iou: 'NMS IoU',
-  precision: '精度模式', batch_size: '批大小', max_detections: '最大检测数', warmup: '预热次数',
-}
-
 const resultDimensions = () => ({ scenes: [], conditions: [], resolutions: [], models: [], model_options: [], dataset_options: [], condition_types: [], hardware: [] })
 
 function evaluationCategoryLabel(categories: string[]) {
   if (!categories.length) return '历史结果（类别范围未记录）'
   if (categories.length <= 4) return categories.join('、')
   return `${categories.length} 类（${categories.slice(0, 3).join('、')}…）`
-}
-
-function configSummary(group: ResultGroup, omitted: string[] = []) {
-  const hidden = new Set(omitted)
-  if (hidden.has('input_resolution')) ['input_resolution', 'input_height', 'input_width', 'image_size'].forEach((key) => hidden.add(key))
-  const inference = Object.entries(group.inference_config)
-    .filter(([key]) => !hidden.has(key) && key !== 'metric_protocol' && key !== 'timing')
-    .map(([key, value]) => `${analysisParameterLabels[key] || key}=${String(value)}`)
-    .join('，') || '默认配置'
-  return `${inference}，评测类别=${evaluationCategoryLabel(group.evaluation_categories)}`
-}
-
-function parameterValue(group: ResultGroup, key: string) {
-  return group.inference_config[key]
 }
 
 function runInferenceResolution(config: Record<string, unknown>) {
@@ -2480,141 +2450,29 @@ function runParameterValue(config: Record<string, unknown>, key: string) {
 export function ExplorerPage({ dark }: PageProps) {
   const [data, setData] = useState<ResultResponse>({ count: 0, groups: [], runs: [], dimensions: resultDimensions() })
   const [loading, setLoading] = useState(true)
-  const [mode, setMode] = useState<ExplorerMode>('models')
-  const [scene, setScene] = useState<string>()
-  const [condition, setCondition] = useState<string>()
-  const [resolution, setResolution] = useState<string>()
-  const [hardware, setHardware] = useState<string>()
-  const [modelId, setModelId] = useState<string>()
-  const [datasetId, setDatasetId] = useState<string>()
-  const [configurationId, setConfigurationId] = useState<string>()
-  const [parameterKey, setParameterKey] = useState('input_resolution')
-  const [parameterCohort, setParameterCohort] = useState<string>()
-  const [robustnessSourceId, setRobustnessSourceId] = useState<string>()
-  const [minimumMap, setMinimumMap] = useState(0)
-  const [maximumLatency, setMaximumLatency] = useState<number>()
-  const [selected, setSelected] = useState<ResultGroup>()
   const [selectedRun, setSelectedRun] = useState<ResultRun>()
   const [visualizationGroup, setVisualizationGroup] = useState<ResultGroup>()
   const [runPage, setRunPage] = useState(1)
   const [runPageSize, setRunPageSize] = useState(20)
   const load = async () => { setLoading(true); try { setData(await api<ResultResponse>('/api/results')) } catch (error) { message.error((error as Error).message) } finally { setLoading(false) } }
   useEffect(() => { load() }, [])
-  useEffect(() => {
-    if (!modelId && data.dimensions.model_options[0]) setModelId(data.dimensions.model_options[0][0])
-    if (!datasetId && data.dimensions.dataset_options[0]) setDatasetId(data.dimensions.dataset_options[0][0])
-  }, [data.dimensions.model_options, data.dimensions.dataset_options, modelId, datasetId])
-
-  const scopeGroups = useMemo(() => data.groups.filter((group) => (
-    (!scene || group.scene_domain === scene)
-    && (!condition || group.condition_type === condition)
-    && (!resolution || group.resolution === resolution)
-    && (!hardware || (group.environment_fingerprint || 'unknown') === hardware)
-    && (!['selection', 'pareto'].includes(mode) || !datasetId || group.dataset_id === datasetId)
-  )), [data.groups, scene, condition, resolution, hardware, mode, datasetId])
-  const configurationCandidates = scopeGroups.filter((group) => (
-    (['datasets', 'robustness'].includes(mode) && group.model_id === modelId)
-    || !['datasets', 'robustness'].includes(mode)
-  ))
-  const configurationOptions = useMemo(() => [...new Map(configurationCandidates.map((group) => [group.configuration_id, { value: group.configuration_id, label: `${group.configuration_id} · ${configSummary(group)}` }])).values()], [configurationCandidates])
-  useEffect(() => {
-    if (configurationOptions.length && !configurationOptions.some((item) => item.value === configurationId)) setConfigurationId(configurationOptions[0].value)
-  }, [configurationOptions, configurationId])
-
-  const parameterCandidates = scopeGroups.filter((group) => group.model_id === modelId && group.dataset_id === datasetId && parameterValue(group, parameterKey) !== undefined)
-  const parameterKeys = [...new Set(scopeGroups.filter((group) => group.model_id === modelId && group.dataset_id === datasetId).flatMap((group) => Object.keys(group.inference_config).filter((key) => analysisParameterLabels[key])))]
-  useEffect(() => {
-    if (parameterKeys.length && !parameterKeys.includes(parameterKey)) setParameterKey(parameterKeys[0])
-  }, [parameterKeys.join(','), parameterKey])
-  const cohortEntries = useMemo(() => {
-    const grouped = new Map<string, ResultGroup[]>()
-    parameterCandidates.forEach((group) => {
-      const signature = configSummary(group, [parameterKey])
-      grouped.set(signature, [...(grouped.get(signature) || []), group])
-    })
-    return [...grouped.entries()]
-  }, [parameterCandidates, parameterKey])
-  useEffect(() => {
-    if (cohortEntries.length && !cohortEntries.some(([key]) => key === parameterCohort)) setParameterCohort(cohortEntries[0][0])
-  }, [cohortEntries, parameterCohort])
-  const robustnessCandidates = condition && condition !== '基准' ? scopeGroups.filter((group) => group.model_id === modelId && group.configuration_id === configurationId && group.condition_strength !== null) : []
-  const robustnessSourceIds = [...new Set(robustnessCandidates.map((group) => group.source_dataset_id).filter((value): value is string => Boolean(value)))]
-  useEffect(() => {
-    if (robustnessSourceIds.length && !robustnessSourceIds.includes(robustnessSourceId || '')) setRobustnessSourceId(robustnessSourceIds[0])
-  }, [robustnessSourceIds.join(','), robustnessSourceId])
-
-  let analysisGroups = scopeGroups
-  if (mode === 'parameters') analysisGroups = cohortEntries.find(([key]) => key === parameterCohort)?.[1] || []
-  if (mode === 'datasets') analysisGroups = scopeGroups.filter((group) => group.model_id === modelId && group.configuration_id === configurationId)
-  if (mode === 'robustness') {
-    const degraded = robustnessSourceIds.length ? robustnessCandidates.filter((group) => group.source_dataset_id === robustnessSourceId) : robustnessCandidates
-    const sourceIds = new Set(degraded.map((group) => group.source_dataset_id).filter(Boolean))
-    const baselines = data.groups.filter((group) => sourceIds.has(group.dataset_id) && group.model_id === modelId && group.configuration_id === configurationId && (!scene || group.scene_domain === scene) && (!resolution || group.resolution === resolution) && (!hardware || (group.environment_fingerprint || 'unknown') === hardware))
-    analysisGroups = [...new Map([...baselines, ...degraded].map((group) => [group.comparison_id, group])).values()]
-  }
-  if (mode === 'selection') analysisGroups = scopeGroups.filter((group) => group.map_mean >= minimumMap && (maximumLatency === undefined || group.latency_mean <= maximumLatency))
-  const bestAccuracy = mode === 'selection' ? [...analysisGroups].sort((left, right) => right.map_mean - left.map_mean || left.latency_mean - right.latency_mean)[0] : undefined
-  const fastest = mode === 'selection' ? [...analysisGroups].sort((left, right) => left.latency_mean - right.latency_mean || right.map_mean - left.map_mean)[0] : undefined
-  const robustnessPoints = mode === 'robustness' ? [...analysisGroups].filter((group) => group.condition_strength !== null).sort((left, right) => Number(left.condition_strength) - Number(right.condition_strength)) : []
-  const robustnessBaseline = robustnessPoints[0]
-  const robustnessWorst = robustnessPoints[robustnessPoints.length - 1]
-  const robustnessSpan = robustnessPoints.length > 1 ? Number(robustnessWorst?.condition_strength) - Number(robustnessBaseline?.condition_strength) : 0
-  const robustnessAuc = robustnessSpan > 0 ? robustnessPoints.slice(1).reduce((total, point, index) => {
-    const previous = robustnessPoints[index]
-    return total + (previous.map_mean + point.map_mean) / 2 * (Number(point.condition_strength) - Number(previous.condition_strength))
-  }, 0) / robustnessSpan : undefined
-
-  const chartTextColor = dark ? '#c6d1df' : '#4b5565'
-  const splitColor = dark ? '#263449' : '#eef1f5'
-  const categoryChart = useMemo(() => {
-    const parameterMode = mode === 'parameters'
-    const robustnessMode = mode === 'robustness'
-    const sorted = [...analysisGroups].sort((left, right) => {
-      if (parameterMode) return String(parameterValue(left, parameterKey)).localeCompare(String(parameterValue(right, parameterKey)), 'zh-CN', { numeric: true })
-      if (robustnessMode) return (left.condition_strength ?? 0) - (right.condition_strength ?? 0)
-      return right.map_mean - left.map_mean
-    })
-    const labels = sorted.map((group) => parameterMode ? String(parameterValue(group, parameterKey)) : robustnessMode ? String(group.condition_strength ?? '基准') : group.dataset_name)
-    return {
-      tooltip: { trigger: 'axis' },
-      legend: { top: 0, textStyle: { color: chartTextColor } },
-      grid: { left: 62, right: 64, top: 50, bottom: 70 },
-      xAxis: { type: 'category', name: parameterMode ? analysisParameterLabels[parameterKey] : robustnessMode ? '条件强度' : '数据集', data: labels, axisLabel: { color: chartTextColor, rotate: labels.some((label) => label.length > 10) ? 20 : 0 } },
-      yAxis: [
-        { type: 'value', name: 'mAP', scale: true, axisLabel: { formatter: (value: number) => `${Math.round(value * 100)}%`, color: chartTextColor }, splitLine: { lineStyle: { color: splitColor } } },
-        { type: 'value', name: '时延 / ms', scale: true, axisLabel: { color: chartTextColor }, splitLine: { show: false } },
-      ],
-      series: [
-        { name: 'mAP', type: parameterMode || robustnessMode ? 'line' : 'bar', smooth: true, data: sorted.map((group) => group.map_mean), itemStyle: { color: '#1677FF' } },
-        { name: '时延P50', type: 'line', yAxisIndex: 1, smooth: true, data: sorted.map((group) => group.latency_mean), itemStyle: { color: '#FA8C16' } },
-      ],
-    }
-  }, [analysisGroups, mode, parameterKey, chartTextColor, splitColor])
-
   const natureTag = (result: { is_demo: boolean; is_official: boolean }) => result.is_demo ? <DemoTag /> : result.is_official ? <Tag color="green">真实模型 · 正式结果</Tag> : <Tag color="purple">真实模型 · 实验性结果</Tag>
-  const containsRealResults = analysisGroups.some((item) => !item.is_demo)
-  const comparableWarning = new Set(analysisGroups.map((group) => group.environment_fingerprint || 'unknown')).size > 1 || ((mode === 'pareto' || mode === 'selection') && new Set(analysisGroups.map((group) => group.dataset_id)).size > 1)
-  const modeDescriptions: Record<ExplorerMode, string> = {
-    parameters: '固定模型、数据集、硬件及其他参数，只观察一个推理参数变化。', datasets: '固定模型与推理配置，比较不同数据版本上的泛化表现。', robustness: '固定模型与推理配置，观察非理想条件强度增加时的性能变化。', models: '固定数据集与推理配置，横向比较不同模型。', selection: '在场景和部署约束下筛选可行的模型—配置组合。', pareto: '比较所有候选配置，并高亮不存在“更快且更准”替代项的Pareto前沿。',
+  const runs = [...data.runs].sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
+  const visualize = (run: ResultRun) => {
+    const group = data.groups.find((item) => item.run_ids.includes(run.run_id))
+    if (group) setVisualizationGroup({ ...group, comparison_id: `${group.comparison_id}:${run.run_id}`, run_ids: [run.run_id] })
   }
-  if (mode === 'models') {
-    const runs = [...data.runs].sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
-    const visualize = (run: ResultRun) => {
-      const group = data.groups.find((item) => item.run_ids.includes(run.run_id))
-      if (group) setVisualizationGroup({ ...group, comparison_id: `${group.comparison_id}:${run.run_id}`, run_ids: [run.run_id] })
-    }
-    const removeRun = async (run: ResultRun) => {
-      try {
-        await api(`/api/evaluation-runs/${run.run_id}`, { method: 'DELETE' })
-        if (selectedRun?.run_id === run.run_id) setSelectedRun(undefined)
-        if (visualizationGroup?.run_ids.includes(run.run_id)) setVisualizationGroup(undefined)
-        message.success('评测结果已移入回收站')
-        await load()
-      } catch (error) { message.error((error as Error).message) }
-    }
-    return <Space direction="vertical" size={18} style={{ width: '100%' }}>
-      <Card><Segmented block value={mode} onChange={(value) => setMode(value as ExplorerMode)} options={explorerModeOptions} /></Card>
-      <Card title="评测结果" extra={<Button icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新结果</Button>}>
+  const removeRun = async (run: ResultRun) => {
+    try {
+      await api(`/api/evaluation-runs/${run.run_id}`, { method: 'DELETE' })
+      if (selectedRun?.run_id === run.run_id) setSelectedRun(undefined)
+      if (visualizationGroup?.run_ids.includes(run.run_id)) setVisualizationGroup(undefined)
+      message.success('评测结果已移入回收站')
+      await load()
+    } catch (error) { message.error((error as Error).message) }
+  }
+  return <Space direction="vertical" size={18} style={{ width: '100%' }}>
+      <Card title="模型对比" extra={<Button icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新结果</Button>}>
         <Table<ResultRun>
           size="small"
           loading={loading}
@@ -2681,58 +2539,6 @@ export function ExplorerPage({ dark }: PageProps) {
       </Drawer>
       <EvaluationVisualizationDrawer group={visualizationGroup} onClose={() => setVisualizationGroup(undefined)} />
     </Space>
-  }
-  return <Space direction="vertical" size={18} style={{ width: '100%' }}>
-    <Card><Segmented block value={mode} onChange={(value) => setMode(value as ExplorerMode)} options={explorerModeOptions} /><Typography.Paragraph type="secondary" style={{ margin: '12px 0 0' }}>{modeDescriptions[mode]}</Typography.Paragraph></Card>
-    <Card className="filter-card"><Row gutter={[12, 12]} align="bottom">
-      <Col xs={24} md={4}><Typography.Text type="secondary">场景域</Typography.Text><Select allowClear value={scene} onChange={setScene} placeholder="全部场景" style={{ width: '100%', marginTop: 6 }} options={data.dimensions.scenes.map((value) => ({ value }))} /></Col>
-      <Col xs={24} md={4}><Typography.Text type="secondary">非理想条件</Typography.Text><Select allowClear value={condition} onChange={setCondition} placeholder="全部条件" style={{ width: '100%', marginTop: 6 }} options={data.dimensions.condition_types.filter((value) => mode !== 'robustness' || value !== '基准').map((value) => ({ value }))} /></Col>
-      <Col xs={24} md={4}><Typography.Text type="secondary">数据分辨率</Typography.Text><Select allowClear value={resolution} onChange={setResolution} placeholder="全部分辨率" style={{ width: '100%', marginTop: 6 }} options={data.dimensions.resolutions.map((value) => ({ value }))} /></Col>
-      <Col xs={24} md={5}><Typography.Text type="secondary">硬件环境</Typography.Text><Select allowClear value={hardware} onChange={setHardware} placeholder="全部硬件" style={{ width: '100%', marginTop: 6 }} options={data.dimensions.hardware.map((value) => ({ value, label: value === 'unknown' ? '未记录' : value.slice(0, 16) }))} /></Col>
-      <Col xs={24} md={3}><Button block icon={<ReloadOutlined />} onClick={load} loading={loading}>刷新结果</Button></Col>
-    </Row><Divider />
-      <Row gutter={[12, 12]}>
-        {['parameters', 'datasets', 'robustness'].includes(mode) && <Col xs={24} md={6}><Typography.Text type="secondary">固定模型</Typography.Text><Select value={modelId} onChange={setModelId} style={{ width: '100%', marginTop: 6 }} options={data.dimensions.model_options.map(([value, label]) => ({ value, label }))} /></Col>}
-        {mode === 'parameters' && <Col xs={24} md={6}><Typography.Text type="secondary">固定数据集</Typography.Text><Select value={datasetId} onChange={setDatasetId} style={{ width: '100%', marginTop: 6 }} options={data.dimensions.dataset_options.map(([value, label]) => ({ value, label }))} /></Col>}
-        {['selection', 'pareto'].includes(mode) && <Col xs={24} md={6}><Typography.Text type="secondary">比较数据集</Typography.Text><Select value={datasetId} onChange={setDatasetId} placeholder="请选择同一数据集" style={{ width: '100%', marginTop: 6 }} options={data.dimensions.dataset_options.map(([value, label]) => ({ value, label }))} /></Col>}
-        {mode === 'parameters' && <Col xs={24} md={5}><Typography.Text type="secondary">变化参数</Typography.Text><Select value={parameterKey} onChange={setParameterKey} style={{ width: '100%', marginTop: 6 }} options={parameterKeys.map((value) => ({ value, label: analysisParameterLabels[value] }))} /></Col>}
-        {mode === 'parameters' && <Col xs={24} md={7}><Typography.Text type="secondary">固定其他参数</Typography.Text><Select value={parameterCohort} onChange={setParameterCohort} style={{ width: '100%', marginTop: 6 }} options={cohortEntries.map(([value, groups]) => ({ value, label: `${value}（${groups.length}点）` }))} /></Col>}
-        {mode === 'robustness' && robustnessSourceIds.length > 0 && <Col xs={24} md={6}><Typography.Text type="secondary">源数据集</Typography.Text><Select value={robustnessSourceId} onChange={setRobustnessSourceId} style={{ width: '100%', marginTop: 6 }} options={robustnessSourceIds.map((value) => ({ value, label: data.dimensions.dataset_options.find(([id]) => id === value)?.[1] || value }))} /></Col>}
-        {['datasets', 'robustness'].includes(mode) && <Col xs={24} md={10}><Typography.Text type="secondary">固定推理配置</Typography.Text><Select value={configurationId} onChange={setConfigurationId} style={{ width: '100%', marginTop: 6 }} options={configurationOptions} /></Col>}
-        {mode === 'selection' && <><Col xs={12} md={4}><Typography.Text type="secondary">最低mAP</Typography.Text><InputNumber min={0} max={1} step={0.01} value={minimumMap} onChange={(value) => setMinimumMap(value ?? 0)} style={{ width: '100%', marginTop: 6 }} /></Col><Col xs={12} md={4}><Typography.Text type="secondary">时延上限/ms</Typography.Text><InputNumber min={0} value={maximumLatency} onChange={(value) => setMaximumLatency(value ?? undefined)} style={{ width: '100%', marginTop: 6 }} /></Col></>}
-      </Row>
-    </Card>
-    <Alert type={comparableWarning ? 'warning' : 'info'} showIcon message={`找到 ${data.count} 次运行，当前展示 ${analysisGroups.length} 个可比单元`} description={comparableWarning ? '当前仍包含多个硬件环境或多个待选数据集，不能直接解释为公平对比；请继续限定筛选条件。' : '仅对模型、数据、推理配置、硬件和指标协议完全相同的重复运行计算均值与标准差。'} action={containsRealResults ? <Tag color="purple">包含真实模型结果</Tag> : <DemoTag />} />
-    {mode === 'parameters' && analysisGroups.length < 2 && <Alert type="warning" showIcon message="当前参数只有一个取值" description="请先在评测中心使用相同模型、数据集和硬件提交多个不同参数的评测任务。" />}
-    {mode === 'robustness' && (!condition || condition === '基准') && <Alert type="warning" showIcon message="请选择一种非理想条件" description="雾、运动模糊等不同退化类型不能放在同一条强度曲线上。" />}
-    {mode === 'robustness' && condition && condition !== '基准' && scopeGroups.some((group) => group.model_id === modelId && group.configuration_id === configurationId && group.condition_strength === null) && <Alert type="warning" showIcon message="部分条件数据没有记录强度" description="这些结果不会进入强度曲线；新生成的雾和运动模糊数据会保存结构化强度。" />}
-    {mode === 'robustness' && robustnessPoints.length > 1 && robustnessBaseline && robustnessWorst && <Row gutter={16}><Col xs={24} md={8}><Card><Statistic title={robustnessBaseline.condition_strength === 0 ? '基准mAP' : '最低强度mAP'} value={robustnessBaseline.map_mean * 100} precision={2} suffix="%" /></Card></Col><Col xs={24} md={8}><Card><Statistic title="最强条件性能保持率" value={robustnessBaseline.map_mean ? robustnessWorst.map_mean / robustnessBaseline.map_mean * 100 : 0} precision={1} suffix="%" /></Card></Col><Col xs={24} md={8}><Card><Statistic title="鲁棒性AUC（归一化）" value={(robustnessAuc || 0) * 100} precision={2} suffix="%" /></Card></Col></Row>}
-    {mode === 'selection' && analysisGroups.length > 0 && <Row gutter={16}><Col xs={24} md={12}><Card hoverable onClick={() => setSelected(bestAccuracy)}><Statistic title="精度优先候选" value={bestAccuracy?.map_mean ? bestAccuracy.map_mean * 100 : 0} precision={2} suffix="% mAP" /><Typography.Text>{bestAccuracy?.model_name} · {bestAccuracy?.latency_mean} ms</Typography.Text></Card></Col><Col xs={24} md={12}><Card hoverable onClick={() => setSelected(fastest)}><Statistic title="实时优先候选" value={fastest?.latency_mean || 0} precision={2} suffix="ms" /><Typography.Text>{fastest?.model_name} · {percent(fastest?.map_mean || 0)} mAP</Typography.Text></Card></Col></Row>}
-    <Card title={explorerModeOptions.find((item) => item.value === mode)?.label} extra={mode === 'selection' && <Tag color="blue">约束优先，不计算不透明综合分</Tag>}>
-      {!analysisGroups.length ? <Empty description="当前条件下没有可比较结果" /> : mode === 'pareto' || mode === 'selection' ? <ParetoChart groups={analysisGroups} dark={dark} height={390} onSelect={setSelected} /> : <ReactECharts option={categoryChart} style={{ height: 390 }} />}
-    </Card>
-    <Card title="可比单元明细"><Table size="small" loading={loading} rowKey="comparison_id" dataSource={analysisGroups} pagination={{ pageSize: 10 }} scroll={{ x: 1530 }} onRow={(record) => ({ onClick: () => setSelected(record), style: { cursor: 'pointer' } })} columns={[
-      { title: '模型', dataIndex: 'model_name', fixed: 'left', width: 170, render: (value) => <Typography.Text strong>{value.split('·')[0]}</Typography.Text> },
-      { title: '数据集', dataIndex: 'dataset_name', width: 210 },
-      { title: '评测类别', width: 180, render: (_, row) => evaluationCategoryLabel(row.evaluation_categories) },
-      { title: '条件', width: 150, render: (_, row) => `${row.condition_type}${row.condition_strength === null ? '' : ` ${row.condition_strength}`}` },
-      { title: '推理分辨率', width: 120, render: (_, row) => String(row.inference_config.input_resolution || '默认') },
-      { title: '精度', width: 80, render: (_, row) => String(row.inference_config.precision || '默认') },
-      { title: 'mAP', dataIndex: 'map_mean', width: 90, sorter: (a, b) => a.map_mean - b.map_mean, render: (value) => <Typography.Text strong className="map-value">{percent(value)}</Typography.Text> },
-      { title: 'AP50', dataIndex: 'map50_mean', width: 90, render: percent },
-      { title: 'AP75', dataIndex: 'map75_mean', width: 90, render: percent },
-      { title: '时延P50', dataIndex: 'latency_mean', width: 105, render: (value) => `${value} ms` },
-      { title: '时延P95', dataIndex: 'latency_p95_mean', width: 105, render: (value) => `${value} ms` },
-      { title: '显存', dataIndex: 'peak_memory_mean', width: 100, render: (value) => `${value} MB` },
-      { title: '重复', dataIndex: 'seed_count', width: 70 },
-    ]} /></Card>
-    <Drawer open={Boolean(selected)} onClose={() => setSelected(undefined)} title="可比单元详情" width={720}>
-      {selected && <Space direction="vertical" size={18} style={{ width: '100%' }}><Space wrap>{natureTag(selected)}<Tag>{selected.configuration_id}</Tag><Button icon={<EyeOutlined />} disabled={selected.is_demo} onClick={() => setVisualizationGroup(selected)}>查看推理结果</Button></Space><Row gutter={12}><Col span={8}><Card><Statistic title="mAP" value={selected.map_mean * 100} precision={2} suffix="%" /></Card></Col><Col span={8}><Card><Statistic title="时延P50" value={selected.latency_mean} precision={2} suffix="ms" /></Card></Col><Col span={8}><Card><Statistic title="FPS" value={selected.fps_mean} precision={1} /></Card></Col></Row><Descriptions bordered column={1} items={[
-        { key: 'model', label: '模型', children: selected.model_name }, { key: 'backbone', label: 'Backbone', children: selected.backbone }, { key: 'dataset', label: '数据版本', children: selected.dataset_name }, { key: 'categories', label: '评测类别', children: selected.evaluation_categories.length ? <Space wrap>{selected.evaluation_categories.map((name) => <Tag key={name}>{name}</Tag>)}</Space> : evaluationCategoryLabel(selected.evaluation_categories) }, { key: 'scene', label: '场景 / 条件', children: `${selected.scene_domain} / ${selected.condition_type}${selected.condition_strength === null ? '（强度未记录）' : ` / 强度 ${selected.condition_strength}`}` }, { key: 'resolution', label: '数据分辨率', children: selected.resolution }, { key: 'config', label: '推理配置', children: <Typography.Text code copyable>{JSON.stringify(selected.inference_config)}</Typography.Text> }, { key: 'hardware', label: '硬件环境', children: <Typography.Text code copyable>{JSON.stringify(selected.hardware_profile)}</Typography.Text> }, { key: 'fingerprint', label: '环境指纹', children: <Typography.Text code copyable>{selected.environment_fingerprint || '未记录'}</Typography.Text> }, { key: 'seeds', label: '重复运行', children: `${selected.seed_count} 次：${selected.seeds.join(', ')}` }, { key: 'runs', label: '运行ID', children: <Typography.Text code copyable>{selected.run_ids.join(', ')}</Typography.Text> }, { key: 'official', label: '结果性质', children: natureTag(selected) },
-      ]} /><PRChart groups={[selected]} dark={dark} /></Space>}
-    </Drawer>
-    <EvaluationVisualizationDrawer group={visualizationGroup} onClose={() => setVisualizationGroup(undefined)} />
-  </Space>
 }
 
 export function TasksPage(_: PageProps) {
