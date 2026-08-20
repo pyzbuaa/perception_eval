@@ -126,6 +126,21 @@ class LocalDetectorModelRequest(BaseModel):
     weight_path: str
 
 
+class LocalDetectorModelUpdateRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    architecture: str = Field(min_length=1, max_length=80)
+    backbone: str = Field(min_length=1, max_length=80)
+    detector_head: str = Field(min_length=1, max_length=80)
+    training_dataset: str = Field(min_length=1, max_length=120)
+    pretrained_dataset: str = Field(min_length=1, max_length=120)
+    precision: Literal["FP32", "FP16"] = "FP16"
+    working_directory: str
+    runtime_prefix: str
+    inference_defaults: DetectorInferenceDefaults = Field(
+        default_factory=DetectorInferenceDefaults
+    )
+
+
 class EvaluationPlanRequest(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     dataset_ids: list[str] = Field(min_length=1)

@@ -26,6 +26,7 @@ from app.schemas import (
     DatasetImportRequest,
     EvaluationPlanRequest,
     LocalDetectorModelRequest,
+    LocalDetectorModelUpdateRequest,
     ModelCreateRequest,
     SampleAnnotationUpdate,
 )
@@ -69,6 +70,7 @@ from app.services import (
     resolve_local_dataset_import,
     save_sample_annotation,
     update_annotation_schema,
+    update_local_detector_model,
     validate_evaluation_categories,
 )
 from app.worker import JobAgent
@@ -611,6 +613,20 @@ def create_local_detector_model(
         return register_local_detector_model(request.model_dump())
     except LocalModelRegistrationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.put("/api/local-detector-models/{model_id}")
+def edit_local_detector_model(
+    model_id: str,
+    request: LocalDetectorModelUpdateRequest,
+) -> dict[str, Any]:
+    try:
+        result = update_local_detector_model(model_id, request.model_dump())
+    except LocalModelRegistrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not result:
+        raise HTTPException(status_code=404, detail="模型不存在")
+    return result
 
 
 @app.delete("/api/models/{model_id}")

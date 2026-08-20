@@ -23,7 +23,6 @@ import {
   BulbOutlined,
   DatabaseOutlined,
   ExperimentOutlined,
-  FullscreenOutlined,
   HomeOutlined,
   LaptopOutlined,
   MoonOutlined,
@@ -41,7 +40,6 @@ import {
   EvaluationPage,
   ExplorerPage,
   OverviewPage,
-  PresentationPage,
   RegistryPage,
   TasksPage,
 } from './pages'
@@ -71,7 +69,6 @@ function AppShell() {
   const [route, setRoute] = useState<RouteKey>(routeFromHash())
   const [dark, setDark] = useState(() => localStorage.getItem('perception-theme') === 'dark')
   const [collapsed, setCollapsed] = useState(false)
-  const [presentation, setPresentation] = useState(false)
   const [overview, setOverview] = useState<Overview>()
   const [environment, setEnvironment] = useState<EnvironmentStatus>()
 
@@ -129,16 +126,12 @@ function AppShell() {
     }
   }, [route, dark, overview])
 
-  if (presentation) {
-    return <PresentationPage dark onExit={() => setPresentation(false)} />
-  }
-
   return (
     <Layout className={dark ? 'app-shell theme-dark' : 'app-shell theme-light'}>
       <Header className="top-header">
         <div className="brand" onClick={() => navigate('overview')}>
-          <div className="brand-mark"><ExperimentOutlined /></div>
-          <div><Typography.Text className="brand-title">Perception Lab</Typography.Text><span>效能评估平台</span></div>
+          <div className="brand-logo-frame"><img className="brand-logo" src="/qy-logo.png" alt="Qiyu Lab" /></div>
+          <div><Typography.Text className="brand-title">视觉感知效能评估</Typography.Text><span>Perception Evaluation</span></div>
         </div>
         <Space className="project-switcher" size={8}>
           <Select value="生成式视觉感知评测" options={[{ value: '生成式视觉感知评测', label: '生成式视觉感知评测' }]} style={{ width: 190 }} />
@@ -148,7 +141,6 @@ function AppShell() {
         <EnvironmentBadge gpuAvailable={environment?.gpu.available} running={overview?.counts.running} />
         <Tooltip title="通知"><Badge dot={Boolean(overview?.counts.running)}><Button type="text" icon={<BellOutlined />} /></Badge></Tooltip>
         <Tooltip title={dark ? '切换浅色主题' : '切换深色主题'}><Button type="text" icon={dark ? <SunOutlined /> : <MoonOutlined />} onClick={toggleTheme} /></Tooltip>
-        <Button type="primary" ghost icon={<FullscreenOutlined />} onClick={() => setPresentation(true)}>演示模式</Button>
         <Dropdown menu={{ items: [{ key: 'local', label: '单用户 · 本地模式' }] }}>
           <Avatar size="small" icon={<LaptopOutlined />} />
         </Dropdown>
@@ -190,7 +182,7 @@ export default function App() {
   return (
     <ConfigProvider theme={{
       algorithm: dark ? theme.darkAlgorithm : theme.defaultAlgorithm,
-      token: { colorPrimary: dark ? '#22b8cf' : '#1677ff', borderRadius: 8, fontFamily: "Inter, 'Noto Sans SC', system-ui, sans-serif" },
+      token: { colorPrimary: dark ? '#22b8cf' : '#1677ff', borderRadius: 8, fontSize: 15, fontFamily: "Inter, 'Noto Sans SC', system-ui, sans-serif" },
       components: { Layout: { headerBg: dark ? '#0c1525' : '#ffffff', siderBg: dark ? '#0c1525' : '#ffffff' }, Card: { headerFontSize: 15 } },
     }}>
       <AntApp><AppShell /></AntApp>

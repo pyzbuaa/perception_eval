@@ -901,6 +901,126 @@ def register_local_detector_model(
     )
 
 
+def update_local_detector_model(
+    model_id: str,
+    values: dict[str, Any],
+    database: Database = db,
+) -> dict[str, Any] | None:
+    model = database.row("SELECT * FROM models WHERE id=?", (model_id,))
+    if not model:
+        return None
+    if model["is_demo"]:
+        raise LocalModelRegistrationError("流程样例模型不支持编辑")
+    adapter = database.row(
+        "SELECT * FROM adapters WHERE id=?", (model["adapter_id"],)
+    )
+    if not adapter:
+        raise LocalModelRegistrationError("模型的推理适配器不存在")
+
+    schema = json_load(adapter["parameter_schema"], {})
+    execution = schema.get("execution", {})
+    properties = schema.get("properties", {})
+    project_directory_value = properties.get("project_directory", {}).get("const")
+    if execution.get("mode") != "command" or not project_directory_value:
+        raise LocalModelRegistrationError("该模型没有可编辑的本地命令配置")
+
+    app_settings = database.settings
+    model_root = app_settings.model_library_root.expanduser().resolve()
+    environment_root = app_settings.model_environment_root.expanduser().resolve()
+    project_directory = Path(project_directory_value).expanduser().resolve()
+    if (
+        not project_directory.is_relative_to(model_root)
+        or not project_directory.is_dir()
+    ):
+        raise LocalModelRegistrationError(
+            f"模型目录必须位于 {model_root} 内"
+        )
+
+    def project_path(value: str) -> Path:
+        path = Path(value).expanduser()
+        return (
+            path.resolve()
+            if path.is_absolute()
+            else (project_directory / path).resolve()
+        )
+
+    working_directory = project_path(values["working_directory"])
+    if (
+        not working_directory.is_relative_to(project_directory)
+        or not working_directory.is_dir()
+    ):
+        raise LocalModelRegistrationError(
+            "命令工作目录必须位于模型项目目录内"
+        )
+    runtime_prefix = project_path(values["runtime_prefix"])
+    if not (
+        runtime_prefix.is_relative_to(project_directory)
+        or runtime_prefix.is_relative_to(environment_root)
+    ):
+        raise LocalModelRegistrationError(
+            "Python 环境必须位于模型目录或允许的环境根目录内"
+        )
+    executable = runtime_prefix / "bin" / "python"
+    if not executable.is_file():
+        raise LocalModelRegistrationError(
+            f"Python 解释器不存在: {executable}"
+        )
+    if not os.access(executable, os.X_OK):
+        raise LocalModelRegistrationError(
+            f"Python 解释器没有执行权限: {executable}"
+        )
+
+    for name, value in values["inference_defaults"].items():
+        specification = properties.get(name)
+        if isinstance(specification, dict):
+            specification["default"] = value
+    precision = model["precision"]
+    if isinstance(properties.get("precision"), dict):
+        properties["precision"]["default"] = values["precision"]
+        precision = values["precision"]
+    execution["working_directory"] = str(working_directory)
+    execution["executable"] = str(executable)
+
+    with database.connect() as connection:
+        connection.execute(
+            """
+            UPDATE models
+            SET name=?,architecture=?,backbone=?,detector_head=?,training_dataset=?,
+                pretrained_dataset=?,precision=?
+            WHERE id=?
+            """,
+            (
+                values["name"],
+                values["architecture"],
+                values["backbone"],
+                values["detector_head"],
+                values["training_dataset"],
+                values["pretrained_dataset"],
+                precision,
+                model_id,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE adapters
+            SET name=?,runtime_prefix=?,entrypoint=?,status='REGISTERED',
+                parameter_schema=?,updated_at=?
+            WHERE id=?
+            """,
+            (
+                f"{values['name']} 推理适配器",
+                str(runtime_prefix),
+                str(executable),
+                json_dump(schema),
+                utc_now(),
+                adapter["id"],
+            ),
+        )
+    return next(
+        item for item in list_models(database) if item["id"] == model_id
+    )
+
+
 def get_basegen_scene_schema() -> dict[str, Any]:
     catalog_directory = settings.basegen_root / "configs" / "field_options"
     filenames = (

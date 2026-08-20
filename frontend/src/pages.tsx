@@ -3,7 +3,6 @@ import {
   Alert,
   Button,
   Card,
-  Carousel,
   Checkbox,
   Col,
   Descriptions,
@@ -46,7 +45,6 @@ import {
   ExperimentOutlined,
   EyeOutlined,
   FileImageOutlined,
-  FullscreenExitOutlined,
   ImportOutlined,
   LeftOutlined,
   LockOutlined,
@@ -1983,6 +1981,7 @@ export function RegistryPage({ refresh }: PageProps) {
   const [registerOpen, setRegisterOpen] = useState(false)
   const [registering, setRegistering] = useState(false)
   const [copySourceName, setCopySourceName] = useState<string>()
+  const [editSource, setEditSource] = useState<ModelVersion>()
   const [selectedModel, setSelectedModel] = useState<ModelVersion>()
   const [categoryTemplateId, setCategoryTemplateId] = useState('visdrone')
   const [customModelCategories, setCustomModelCategories] = useState<CategoryDefinition[]>([{ id: 0, name: '' }])
@@ -2006,6 +2005,7 @@ export function RegistryPage({ refresh }: PageProps) {
     setCategoryTemplateId('visdrone')
     setCustomModelCategories([{ id: 0, name: '' }])
     setCopySourceName(undefined)
+    setEditSource(undefined)
     setRegisterOpen(true)
   }
   const copyRegistration = (model: ModelVersion) => {
@@ -2022,6 +2022,25 @@ export function RegistryPage({ refresh }: PageProps) {
     setCategoryTemplateId(templateId)
     setCustomModelCategories(model.categories.map((item) => ({ ...item })))
     setCopySourceName(model.name)
+    setEditSource(undefined)
+    setSelectedModel(undefined)
+    setRegisterOpen(true)
+  }
+  const editModel = (model: ModelVersion) => {
+    const adapter = adapters.data.find((item) => item.id === model.adapter_id)
+    const editableDraft = adapter && copiedLocalModelDraft(model, adapter)
+    if (!editableDraft) {
+      message.error('该模型没有可编辑的本地命令配置')
+      return
+    }
+    const templateId = categoryTemplates.data.some((item) => item.id === model.category_template)
+      ? model.category_template
+      : 'custom'
+    setDraft({ ...editableDraft, name: model.name })
+    setCategoryTemplateId(templateId)
+    setCustomModelCategories(model.categories.map((item) => ({ ...item })))
+    setCopySourceName(undefined)
+    setEditSource(model)
     setSelectedModel(undefined)
     setRegisterOpen(true)
   }
@@ -2065,22 +2084,48 @@ export function RegistryPage({ refresh }: PageProps) {
   const register = async () => {
     setRegistering(true)
     try {
-      await post<ModelVersion>('/api/local-detector-models', {
-        ...draft,
-        category_template: categoryTemplateId,
-        categories: modelCategories.map(({ id, name }) => ({ id, name })),
-        command_arguments: draft.command_arguments
-          .split('\n')
-          .map((value) => value.trim())
-          .filter(Boolean),
-      })
-      message.success('本地检测模型已注册')
+      if (editSource) {
+        await api<ModelVersion>(`/api/local-detector-models/${editSource.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            name: draft.name,
+            architecture: draft.architecture,
+            backbone: draft.backbone,
+            detector_head: draft.detector_head,
+            training_dataset: draft.training_dataset,
+            pretrained_dataset: draft.pretrained_dataset,
+            precision: draft.precision,
+            working_directory: draft.working_directory,
+            runtime_prefix: draft.runtime_prefix,
+            inference_defaults: draft.inference_defaults,
+          }),
+        })
+        try {
+          const result = await post<{ healthy: boolean }>(`/api/adapters/${editSource.adapter_id}/health-check`)
+          result.healthy ? message.success('模型信息已保存，接口测试通过') : message.warning('模型信息已保存，但接口测试未通过')
+        } catch (healthError) {
+          message.warning(`模型信息已保存，但接口测试请求失败：${(healthError as Error).message}`)
+        }
+      } else {
+        await post<ModelVersion>('/api/local-detector-models', {
+          ...draft,
+          category_template: categoryTemplateId,
+          categories: modelCategories.map(({ id, name }) => ({ id, name })),
+          command_arguments: draft.command_arguments
+            .split('\n')
+            .map((value) => value.trim())
+            .filter(Boolean),
+        })
+        message.success('本地检测模型已注册')
+      }
       setRegisterOpen(false)
       setDraft(emptyLocalModelDraft())
       setCategoryTemplateId('visdrone')
       setCustomModelCategories([{ id: 0, name: '' }])
       setCopySourceName(undefined)
+      setEditSource(undefined)
       await Promise.all([models.reload(), adapters.reload()])
+      refresh()
     } catch (error) {
       message.error((error as Error).message)
     } finally {
@@ -2118,7 +2163,7 @@ export function RegistryPage({ refresh }: PageProps) {
         { title: '权重', dataIndex: 'weight_path', render: (value) => value ? <Typography.Text ellipsis={{ tooltip: value }} style={{ maxWidth: 180 }}>{String(value).split('/').pop()}</Typography.Text> : '—' },
         { title: '状态', dataIndex: 'status', render: (value) => <StatusTag status={value} /> },
         { title: '运行环境', render: (_, row) => <StatusTag status={adapters.data.find((item) => item.id === row.adapter_id)?.status || (adapters.loading ? 'CHECKING' : 'UNAVAILABLE')} /> },
-        { title: '操作', render: (_, row) => <span onClick={(event) => event.stopPropagation()}><Space>{!row.is_demo && <Button type="link" onClick={() => copyRegistration(row)}>复制注册</Button>}<Button type="link" onClick={() => health(row.adapter_id)}>接口测试</Button><Popconfirm title="确认删除这个模型？" description="仅删除平台注册记录，不删除模型项目、环境或权重；存在评测引用时会拒绝删除。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => removeModel(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm></Space></span> },
+        { title: '操作', render: (_, row) => <span onClick={(event) => event.stopPropagation()}><Space>{!row.is_demo && <><Button type="link" onClick={() => editModel(row)}>编辑信息</Button><Button type="link" onClick={() => copyRegistration(row)}>复制注册</Button></>}<Button type="link" onClick={() => health(row.adapter_id)}>接口测试</Button><Popconfirm title="确认删除这个模型？" description="仅删除平台注册记录，不删除模型项目、环境或权重；存在评测引用时会拒绝删除。" okText="删除" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => removeModel(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm></Space></span> },
       ]} />
     </Card>
   )
@@ -2128,33 +2173,35 @@ export function RegistryPage({ refresh }: PageProps) {
       <Drawer
         open={registerOpen}
         width={760}
-        title={copySourceName ? `基于“${copySourceName}”复制注册` : '注册本地检测模型'}
+        title={editSource ? `编辑“${editSource.name}”` : copySourceName ? `基于“${copySourceName}”复制注册` : '注册本地检测模型'}
         onClose={() => setRegisterOpen(false)}
       >
         <Alert
           type="info"
           showIcon
-          message={copySourceName ? '已复制已有模型配置' : '配置结构化执行命令'}
-          description={copySourceName ? '请重点检查模型名称、版本、结构差异、权重和命令中的固定配置参数，然后注册为新的模型记录。' : '平台按参数数组直接启动进程，不经过 Shell。命令只需在指定位置生成 COCO predictions.json；同一项目的不同模型可以登记不同权重和参数。'}
+          message={editSource ? '编辑当前模型版本的信息' : copySourceName ? '已复制已有模型配置' : '配置结构化执行命令'}
+          description={editSource ? '可以修正描述信息、推理参数默认值和运行路径。权重、类别、模型族、版本及命令参数属于模型版本标识，请使用“复制注册”创建新版本。' : copySourceName ? '请重点检查模型名称、版本、结构差异、权重和命令中的固定配置参数，然后注册为新的模型记录。' : '平台按参数数组直接启动进程，不经过 Shell。命令只需在指定位置生成 COCO predictions.json；同一项目的不同模型可以登记不同权重和参数。'}
         />
         <Form layout="vertical" className="top-gap">
           <Row gutter={12}>
             <Col span={12}><Form.Item label="模型名称" required><Input value={draft.name} onChange={(event) => setField('name', event.target.value)} maxLength={120} placeholder="例如 YOLOv8m VisDrone" /></Form.Item></Col>
-            <Col span={12}><Form.Item label="模型族" required><Input value={draft.family} onChange={(event) => setField('family', event.target.value)} maxLength={80} placeholder="例如 YOLOv8" /></Form.Item></Col>
+            <Col span={12}><Form.Item label="模型族" required><Input disabled={Boolean(editSource)} value={draft.family} onChange={(event) => setField('family', event.target.value)} maxLength={80} placeholder="例如 YOLOv8" /></Form.Item></Col>
             <Col span={8}><Form.Item label="模型架构" required><Input value={draft.architecture} onChange={(event) => setField('architecture', event.target.value)} maxLength={80} placeholder="例如 DETR" /></Form.Item></Col>
             <Col span={8}><Form.Item label="Backbone" required><Input value={draft.backbone} onChange={(event) => setField('backbone', event.target.value)} maxLength={80} placeholder="例如 HGNetv2-B2" /></Form.Item></Col>
             <Col span={8}><Form.Item label="检测头" required><Input value={draft.detector_head} onChange={(event) => setField('detector_head', event.target.value)} maxLength={80} placeholder="例如 D-FINE Transformer" /></Form.Item></Col>
-            <Col span={24}><Form.Item label="版本"><Input value={draft.version} onChange={(event) => setField('version', event.target.value)} maxLength={40} /></Form.Item></Col>
+            <Col span={24}><Form.Item label="版本"><Input disabled={Boolean(editSource)} value={draft.version} onChange={(event) => setField('version', event.target.value)} maxLength={40} /></Form.Item></Col>
             <Col span={12}><Form.Item label="训练数据" required><Input value={draft.training_dataset} onChange={(event) => setField('training_dataset', event.target.value)} maxLength={120} placeholder="例如 VisDrone2019-DET" /></Form.Item></Col>
             <Col span={12}><Form.Item label="预训练数据" required><Input value={draft.pretrained_dataset} onChange={(event) => setField('pretrained_dataset', event.target.value)} maxLength={120} placeholder="例如 Objects365；没有则填写无" /></Form.Item></Col>
           </Row>
           <Form.Item label={`检测类别（${modelCategories.length} 类）`} required>
-            <CategoryConfiguration templates={categoryTemplates.data} templateId={categoryTemplateId} scope="model" customCategories={customModelCategories} onTemplateChange={setCategoryTemplateId} onCustomChange={setCustomModelCategories} />
+            {editSource
+              ? <Space wrap>{modelCategories.map((item) => <Tag key={item.id}>{item.id}:{item.name}</Tag>)}</Space>
+              : <CategoryConfiguration templates={categoryTemplates.data} templateId={categoryTemplateId} scope="model" customCategories={customModelCategories} onTemplateChange={setCategoryTemplateId} onCustomChange={setCustomModelCategories} />}
           </Form.Item>
           <Form.Item label={<>模型项目目录 <Typography.Text code>{'{project_directory}'}</Typography.Text></>} required>
             <Space.Compact block>
               <Input readOnly value={draft.project_directory} placeholder="从服务器模型库选择目录" />
-              <Button onClick={() => setPicker({ field: 'project_directory', title: '选择模型项目目录', scope: 'model', kind: 'directory', initialPath: draft.project_directory || undefined })}>选择目录</Button>
+              {!editSource && <Button onClick={() => setPicker({ field: 'project_directory', title: '选择模型项目目录', scope: 'model', kind: 'directory', initialPath: draft.project_directory || undefined })}>选择目录</Button>}
             </Space.Compact>
           </Form.Item>
           <Form.Item label="命令工作目录" required>
@@ -2172,7 +2219,7 @@ export function RegistryPage({ refresh }: PageProps) {
           <Form.Item label={<>模型权重 <Typography.Text code>{'{weight_path}'}</Typography.Text></>} required>
             <Space.Compact block>
               <Input readOnly value={draft.weight_path} placeholder="选择模型权重文件" />
-              <Button disabled={!draft.project_directory} onClick={() => setPicker({ field: 'weight_path', title: '选择模型权重', scope: 'model', kind: 'weight', initialPath: draft.project_directory || undefined })}>选择权重</Button>
+              {!editSource && <Button disabled={!draft.project_directory} onClick={() => setPicker({ field: 'weight_path', title: '选择模型权重', scope: 'model', kind: 'weight', initialPath: draft.project_directory || undefined })}>选择权重</Button>}
             </Space.Compact>
           </Form.Item>
           <Form.Item
@@ -2182,6 +2229,7 @@ export function RegistryPage({ refresh }: PageProps) {
           >
             <Input.TextArea
               value={draft.command_arguments}
+              disabled={Boolean(editSource)}
               onChange={(event) => setField('command_arguments', event.target.value)}
               autoSize={{ minRows: 9, maxRows: 18 }}
               placeholder={'tools/evaluate.py\n--weights\n{weight_path}\n--images\n{image_directory}\n--annotations\n{annotation_path}\n--output\n{predictions_path}'}
@@ -2204,7 +2252,7 @@ export function RegistryPage({ refresh }: PageProps) {
             可用占位符：模型权重 <Typography.Text code>{'{weight_path}'}</Typography.Text> · 模型项目目录 <Typography.Text code>{'{project_directory}'}</Typography.Text> · 图片目录 <Typography.Text code>{'{image_directory}'}</Typography.Text> · 标注文件 <Typography.Text code>{'{annotation_path}'}</Typography.Text> · 预测结果 <Typography.Text code>{'{predictions_path}'}</Typography.Text> · 输出目录 <Typography.Text code>{'{output_directory}'}</Typography.Text> · 设备 <Typography.Text code>{'{device}'}</Typography.Text> · 推理精度 <Typography.Text code>{'{precision}'}</Typography.Text> · 批大小 <Typography.Text code>{'{batch_size}'}</Typography.Text> · 置信度 <Typography.Text code>{'{confidence}'}</Typography.Text> · NMS阈值 <Typography.Text code>{'{nms_iou}'}</Typography.Text> · 方形推理尺寸 <Typography.Text code>{'{image_size}'}</Typography.Text> · 输入高度 <Typography.Text code>{'{input_height}'}</Typography.Text> · 输入宽度 <Typography.Text code>{'{input_width}'}</Typography.Text> · 最大检测数 <Typography.Text code>{'{max_detections}'}</Typography.Text> · 预热次数 <Typography.Text code>{'{warmup}'}</Typography.Text> · 数据集ID <Typography.Text code>{'{dataset_id}'}</Typography.Text> · 模型ID <Typography.Text code>{'{model_id}'}</Typography.Text> · 请求文件 <Typography.Text code>{'{request_path}'}</Typography.Text> · 结果文件 <Typography.Text code>{'{result_path}'}</Typography.Text>
           </Typography.Paragraph>
           <Space>
-            <Button type="primary" loading={registering} disabled={!ready} onClick={register}>注册模型</Button>
+            <Button type="primary" loading={registering} disabled={!ready} onClick={register}>{editSource ? '保存并接口测试' : '注册模型'}</Button>
             <Button onClick={() => setRegisterOpen(false)}>取消</Button>
           </Space>
         </Form>
@@ -2213,7 +2261,7 @@ export function RegistryPage({ refresh }: PageProps) {
         open={Boolean(selectedModel)}
         width={720}
         title={selectedModel ? `${selectedModel.name} · 模型参数` : '模型参数'}
-        extra={selectedModel && !selectedModel.is_demo ? <Button onClick={() => copyRegistration(selectedModel)}>复制注册</Button> : undefined}
+        extra={selectedModel && !selectedModel.is_demo ? <Space><Button onClick={() => editModel(selectedModel)}>编辑信息</Button><Button onClick={() => copyRegistration(selectedModel)}>复制注册</Button></Space> : undefined}
         onClose={() => setSelectedModel(undefined)}
       >
         {selectedModel && (
@@ -2676,12 +2724,4 @@ export function EnvironmentPage(_: PageProps) {
   if (loading || !data) return <Card loading />
   const diskPercent = Math.round(data.disk.used / data.disk.total * 100)
   return <Space direction="vertical" size={18} style={{ width: '100%' }}><Alert type="success" showIcon message="工作区隔离已启用" description="平台不修改 base、.condarc、.bashrc 或已有 conda 环境。所有平台环境、缓存、数据库和 Artifact 均位于项目目录。" action={<Button icon={<ReloadOutlined />} onClick={reload}>重新检查</Button>} /><Row gutter={[16, 16]}><Col xs={24} md={8}><Card><Statistic title="隔离模式" value="Workspace" prefix={<SafetyCertificateOutlined />} /><Typography.Text type="secondary">写入工作区外：{data.isolation.writes_outside_workspace ? '是' : '否'}</Typography.Text></Card></Col><Col xs={24} md={8}><Card><Statistic title="GPU 状态" value={data.gpu.available ? '可用' : '当前受限'} prefix={<ThunderboltOutlined />} /><Typography.Text type="secondary"></Typography.Text></Card></Col><Col xs={24} md={8}><Card><Statistic title="磁盘使用" value={diskPercent} suffix="%" /><Progress percent={diskPercent} showInfo={false} /><Typography.Text type="secondary">剩余 {formatBytes(data.disk.free)}</Typography.Text></Card></Col></Row><Card title="写入边界"><Descriptions bordered column={1} items={[{ key: 'runtime', label: '平台环境与缓存', children: <Typography.Text code copyable>{data.isolation.runtime_dir}</Typography.Text> }, { key: 'data', label: '数据库与 Artifact', children: <Typography.Text code copyable>{data.isolation.data_dir}</Typography.Text> }, { key: 'shell', label: 'Shell 配置修改', children: data.isolation.shell_configuration_modified ? <Tag color="error">有</Tag> : <Tag color="success">无</Tag> }, { key: 'conda', label: '外部环境策略', children: <Tag icon={<LockOutlined />} color="success">只读调用</Tag> }]} /></Card><Card title={`发现 ${data.conda.envs.length} 个 conda 环境`} extra={<Typography.Text type="secondary">仅读取 conda-meta/history 指纹</Typography.Text>}><Table rowKey="prefix" pagination={false} dataSource={data.conda.envs} columns={[{ title: '名称', dataIndex: 'name', render: (value) => <Typography.Text strong>{value}</Typography.Text> }, { title: '路径', dataIndex: 'prefix', render: (value) => <Typography.Text code copyable>{value}</Typography.Text> }, { title: '策略', render: () => <Tag icon={<LockOutlined />} color="success">external_read_only</Tag> }, { title: '环境指纹', dataIndex: 'fingerprint', render: (value) => value ? <Typography.Text code>{value}</Typography.Text> : '未找到' }, { title: '状态', dataIndex: 'exists', render: (value) => <StatusTag status={value ? 'HEALTHY' : 'UNAVAILABLE'} /> }]} /></Card>{!data.gpu.available && <Alert type="warning" showIcon message="当前进程无法访问 NVIDIA 驱动" description={data.gpu.error || '宿主机预检失败。Web 和 CPU 功能仍可使用，GPU Adapter 会被安全阻止。'} />}</Space>
-}
-
-export function PresentationPage({ onExit }: { dark: boolean; onExit: () => void }) {
-  const overviewResource = useResource<Overview | undefined>('/api/overview', undefined)
-  const resultResource = useResource<ResultResponse>('/api/results?scene=无人机航拍', { count: 0, groups: [], runs: [], dimensions: resultDimensions() })
-  const datasetResource = useResource<Dataset[]>('/api/datasets', [])
-  const overview = overviewResource.data
-  return <div className="presentation-shell"><div className="presentation-top"><div className="presentation-brand"><ExperimentOutlined /> 视觉感知效能评估平台 <Tag color="cyan">演示模式 · 只读</Tag></div><Button ghost icon={<FullscreenExitOutlined />} onClick={onExit}>退出演示</Button></div><Carousel autoplay autoplaySpeed={8000} dots className="presentation-carousel"><section className="presentation-slide"><div className="slide-kicker">GENERATIVE PERCEPTION EVALUATION</div><Typography.Title>从条件数据到感知效能结论</Typography.Title><Typography.Paragraph>统一纳管图像来源、真值、检测模型、运行环境与评测指标</Typography.Paragraph><div className="flow-band">{['场景与传感器条件', '生成 / 仿真 / 真实导入', '真值版本冻结', '多模型批量评测', '效能查询与对比'].map((item, index) => <div className="flow-node" key={item}><span>0{index + 1}</span><strong>{item}</strong>{index < 4 && <ArrowRightOutlined />}</div>)}</div><Row gutter={20} className="slide-metrics"><Col span={6}><Statistic title="数据版本" value={overview?.counts.datasets || 0} /></Col><Col span={6}><Statistic title="模型版本" value={overview?.counts.models || 0} /></Col><Col span={6}><Statistic title="完成运行" value={overview?.counts.completed || 0} /></Col><Col span={6}><Statistic title="环境策略" value="只读隔离" /></Col></Row></section><section className="presentation-slide"><div className="slide-kicker">DATA PROVENANCE</div><Typography.Title>多源图像统一纳管</Typography.Title><Typography.Paragraph>真实导入、基础图像生成和非理想条件生成的数据均统一记录来源与处理谱系。</Typography.Paragraph><div className="presentation-gallery"><Gallery images={datasetResource.data.flatMap((item) => item.preview_images.slice(0, 2)).slice(0, 8)} height={178} /></div><Space size="large"><DatasetSourceTag value="REAL" /><DatasetSourceTag value="GENERATIVE" /><DatasetSourceTag value="REAL_TRANSFORMED" /><Tag color="green">VERIFIED GROUND TRUTH</Tag></Space></section><section className="presentation-slide"><div className="slide-kicker">DETECTION QUALITY</div><Typography.Title>检测结果与 PR 曲线</Typography.Title><Row gutter={24} align="middle"><Col span={11}><Gallery images={datasetResource.data[0]?.preview_images.slice(0, 2) || []} height={235} /></Col><Col span={13}><PRChart groups={resultResource.data.groups} dark height={360} /></Col></Row><Alert type="warning" showIcon message="当前为流程样例指标" description="真实检测 Adapter 接入后沿用相同数据、指标和展示协议。" /></section><section className="presentation-slide"><div className="slide-kicker">PERFORMANCE EXPLORER</div><Typography.Title>精度、时延与鲁棒性联合决策</Typography.Title><Row gutter={24}><Col span={15}><ParetoChart groups={resultResource.data.groups} dark height={460} /></Col><Col span={9}><div className="rank-panel">{resultResource.data.groups.slice(0, 5).map((item, index) => <div className="rank-row" key={item.comparison_id}><span className="rank-index">0{index + 1}</span><div><strong>{item.model_name.split('·')[0]}</strong><small>{item.dataset_name}</small></div><b>{percent(item.map_mean)}</b><em>{item.latency_mean} ms</em></div>)}</div></Col></Row></section></Carousel></div>
 }

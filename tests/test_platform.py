@@ -62,6 +62,7 @@ from app.services import (
     save_sample_annotation,
     summarize_resolutions,
     update_annotation_schema,
+    update_local_detector_model,
     validate_evaluation_categories,
 )
 from app.schemas import DatasetImportRequest
@@ -931,6 +932,80 @@ def test_local_detector_model_registration_uses_bounded_resources(
     assert schema["properties"]["input_height"]["default"] == 960
     assert schema["properties"]["input_width"]["default"] == 1280
     assert "nms_iou" not in schema["properties"]
+    alternate_runtime = environment_root / "alternate"
+    (alternate_runtime / "bin").mkdir(parents=True)
+    (alternate_runtime / "bin" / "python").write_text("", encoding="utf-8")
+    (alternate_runtime / "bin" / "python").chmod(0o755)
+    working_directory = project / "runtime"
+    working_directory.mkdir()
+    updated = update_local_detector_model(
+        model["id"],
+        {
+            "name": "自定义检测模型（修订）",
+            "architecture": "One-stage revised",
+            "backbone": "CustomNet-v2",
+            "detector_head": "CustomHead-v2",
+            "training_dataset": "Custom Detection v2",
+            "pretrained_dataset": "COCO",
+            "precision": "FP32",
+            "working_directory": str(working_directory),
+            "runtime_prefix": str(alternate_runtime),
+            "inference_defaults": {
+                "confidence": 0.42,
+                "nms_iou": 0.65,
+                "image_size": 1024,
+                "input_height": 1024,
+                "input_width": 1024,
+                "max_detections": 500,
+                "batch_size": 2,
+                "warmup": 3,
+            },
+        },
+        database,
+    )
+    assert updated["id"] == model["id"]
+    assert updated["name"] == "自定义检测模型（修订）"
+    assert updated["family"] == "Custom"
+    assert updated["version"] == "v1"
+    assert updated["categories"] == model["categories"]
+    assert updated["weight_path"] == model["weight_path"]
+    adapter = database.row(
+        "SELECT * FROM adapters WHERE id=?", (model["adapter_id"],)
+    )
+    assert adapter["runtime_prefix"] == str(alternate_runtime)
+    assert adapter["entrypoint"] == str(alternate_runtime / "bin" / "python")
+    schema = json.loads(adapter["parameter_schema"])
+    assert schema["execution"]["working_directory"] == str(working_directory)
+    assert schema["execution"]["arguments"][-1] == "{predictions_path}"
+    assert schema["properties"]["confidence"]["default"] == 0.42
+    assert schema["properties"]["input_height"]["default"] == 1024
+    assert "nms_iou" not in schema["properties"]
+    with pytest.raises(LocalModelRegistrationError, match="允许的环境根目录"):
+        update_local_detector_model(
+            model["id"],
+            {
+                "name": updated["name"],
+                "architecture": updated["architecture"],
+                "backbone": updated["backbone"],
+                "detector_head": updated["detector_head"],
+                "training_dataset": updated["training_dataset"],
+                "pretrained_dataset": updated["pretrained_dataset"],
+                "precision": "FP32",
+                "working_directory": str(working_directory),
+                "runtime_prefix": str(tmp_path),
+                "inference_defaults": {
+                    "confidence": 0.4,
+                    "nms_iou": 0.7,
+                    "image_size": 1024,
+                    "input_height": 1024,
+                    "input_width": 1024,
+                    "max_detections": 300,
+                    "batch_size": 1,
+                    "warmup": 0,
+                },
+            },
+            database,
+        )
     with pytest.raises(CommandTemplateError, match="不支持的命令占位符"):
         validate_command_arguments(["--output", "{unknown_path}"])
     assert command_placeholders(["--confidence", "{confidence}"]) == {
