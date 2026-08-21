@@ -15,6 +15,8 @@ from PIL import Image, ImageOps
 
 PROMPT = "a nighttime RGB UAV aerial image"
 MODEL_SIZE = 640
+DEFAULT_TILE_SIZE = 1024
+DEFAULT_OVERLAP = 256
 
 
 def project_root() -> Path:
@@ -66,6 +68,26 @@ def load_translator(root: Path, checkpoint: Path):
     return torch, translator
 
 
+def translate_tiled_image(
+    root: Path,
+    image: Image.Image,
+    translator,
+    tile_size: int,
+    overlap: int,
+) -> Image.Image:
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from scripts.infer_uav_daynight_tiled import translate_tiled
+
+    return translate_tiled(
+        image,
+        translator,
+        tile_size=tile_size,
+        overlap=overlap,
+        description="tiles",
+    )
+
+
 def run(request_path: Path, result_path: Path) -> None:
     request = json.loads(request_path.read_text(encoding="utf-8"))
     if request.get("protocol_version") != "1.0":
@@ -75,6 +97,18 @@ def run(request_path: Path, result_path: Path) -> None:
         raise ValueError("本适配器仅支持 day_to_night")
     if parameters.get("domain") != "uav_aerial":
         raise ValueError("本适配器仅支持无人机航拍域")
+    inference_mode = str(parameters.get("inference_mode", "fixed_resolution"))
+    if inference_mode not in {"fixed_resolution", "tiled"}:
+        raise ValueError("无人机弱光推理方式仅支持 fixed_resolution 或 tiled")
+    try:
+        tile_size = int(parameters.get("tile_size", DEFAULT_TILE_SIZE))
+        overlap = int(parameters.get("overlap", DEFAULT_OVERLAP))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("分块大小和重叠像素必须是整数") from exc
+    if inference_mode == "tiled" and tile_size <= 0:
+        raise ValueError("分块大小必须大于 0")
+    if inference_mode == "tiled" and not 0 <= overlap < tile_size:
+        raise ValueError("重叠像素必须大于等于 0 且小于分块大小")
 
     input_links = [
         Path(value).expanduser().absolute()
@@ -103,7 +137,17 @@ def run(request_path: Path, result_path: Path) -> None:
         torch.cuda.manual_seed_all(seed)
         with Image.open(input_path) as opened:
             input_image = ImageOps.exif_transpose(opened).convert("RGB")
-        output_image = translator(input_image)
+        output_image = (
+            translate_tiled_image(
+                root,
+                input_image,
+                translator,
+                tile_size,
+                overlap,
+            )
+            if inference_mode == "tiled"
+            else translator(input_image)
+        )
         output_path = output_directory / relative
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.suffix.lower() in {".jpg", ".jpeg"}:
@@ -150,10 +194,18 @@ def run(request_path: Path, result_path: Path) -> None:
                     "model": "DiffusionDegrade CycleGAN-Turbo Sichuan UAV Low-Light",
                     "checkpoint": checkpoint.name,
                     "direction": "a2b",
-                    "image_prep": "resize_640x640",
+                    "inference_mode": inference_mode,
+                    "image_prep": (
+                        "overlap_tiled" if inference_mode == "tiled" else "resize_640x640"
+                    ),
                     "model_size": MODEL_SIZE,
                     "output_restore": "original_size",
                     "precision": "FP16",
+                    **(
+                        {"tile_size": tile_size, "overlap": overlap}
+                        if inference_mode == "tiled"
+                        else {}
+                    ),
                 },
                 "warnings": [
                     (

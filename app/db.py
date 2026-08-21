@@ -910,8 +910,19 @@ DAY_TO_NIGHT_SCHEMA = {
         "effect": {"type": "string", "const": "day_to_night"},
         "domain": {"type": "string", "const": "uav_aerial"},
         "direction": {"type": "string", "const": "a2b"},
-        "image_prep": {"type": "string", "const": "resize_640x640"},
+        "inference_mode": {
+            "type": "string",
+            "enum": ["fixed_resolution", "tiled"],
+            "default": "fixed_resolution",
+        },
+        "image_prep": {
+            "type": "string",
+            "enum": ["resize_640x640", "overlap_tiled"],
+            "default": "resize_640x640",
+        },
         "model_size": {"type": "integer", "const": 640},
+        "tile_size": {"type": "integer", "minimum": 1, "default": 1024},
+        "overlap": {"type": "integer", "minimum": 0, "default": 256},
         "precision": {"type": "string", "const": "FP16"},
         "checkpoint": {
             "type": "string",

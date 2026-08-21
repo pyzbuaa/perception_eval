@@ -240,6 +240,28 @@ class JobAgent:
                     "checkpoint": "uav_fog_content15_model_2501",
                 }
             elif payload["adapter_id"] == "adapter_day_to_night":
+                day_to_night_parameters = payload.get("model_parameters", {})
+                inference_mode = str(
+                    day_to_night_parameters.get(
+                        "inference_mode", "fixed_resolution"
+                    )
+                )
+                if inference_mode not in {"fixed_resolution", "tiled"}:
+                    raise ValueError("无人机弱光推理方式仅支持固定分辨率或分块推理")
+                try:
+                    tile_size = int(day_to_night_parameters.get("tile_size", 1024))
+                    overlap = int(day_to_night_parameters.get("overlap", 256))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("分块大小和重叠像素必须是整数") from exc
+                if inference_mode == "tiled" and tile_size <= 0:
+                    raise ValueError("分块大小必须大于 0")
+                if inference_mode == "tiled" and not 0 <= overlap < tile_size:
+                    raise ValueError("重叠像素必须大于等于 0 且小于分块大小")
+                image_prep = (
+                    "overlap_tiled"
+                    if inference_mode == "tiled"
+                    else "resize_640x640"
+                )
                 request["conditions"] = {
                     "scene": {"domain": "无人机航拍", "weather": "弱光"},
                     "sensor": {
@@ -254,18 +276,33 @@ class JobAgent:
                         ),
                         "source_time_of_day": "白天",
                         "target_time_of_day": "夜间",
-                        "day_to_night_image_prep": "resize_640x640",
+                        "day_to_night_inference_mode": inference_mode,
+                        "day_to_night_image_prep": image_prep,
                         "day_to_night_model_size": 640,
+                        **(
+                            {
+                                "day_to_night_tile_size": tile_size,
+                                "day_to_night_overlap": overlap,
+                            }
+                            if inference_mode == "tiled"
+                            else {}
+                        ),
                     },
                 }
                 request["model_parameters"] = {
                     "effect": "day_to_night",
                     "domain": "uav_aerial",
                     "direction": "a2b",
-                    "image_prep": "resize_640x640",
+                    "inference_mode": inference_mode,
+                    "image_prep": image_prep,
                     "model_size": 640,
                     "precision": "FP16",
                     "checkpoint": "uav_daynight_sichuan_3125_model_3125",
+                    **(
+                        {"tile_size": tile_size, "overlap": overlap}
+                        if inference_mode == "tiled"
+                        else {}
+                    ),
                 }
             elif payload["adapter_id"] == "adapter_warpi2i_fog":
                 request["conditions"] = {

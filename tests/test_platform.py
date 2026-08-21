@@ -240,10 +240,20 @@ def test_database_seeds_traceable_demo_data(tmp_path: Path) -> None:
     day_to_night_properties = json.loads(day_to_night["parameter_schema"])[
         "properties"
     ]
-    assert day_to_night_properties["image_prep"]["const"] == "resize_640x640"
+    assert day_to_night_properties["inference_mode"]["enum"] == [
+        "fixed_resolution",
+        "tiled",
+    ]
+    assert day_to_night_properties["inference_mode"]["default"] == (
+        "fixed_resolution"
+    )
+    assert day_to_night_properties["image_prep"]["enum"] == [
+        "resize_640x640",
+        "overlap_tiled",
+    ]
     assert day_to_night_properties["model_size"]["const"] == 640
-    assert "tile_size" not in day_to_night_properties
-    assert "overlap" not in day_to_night_properties
+    assert day_to_night_properties["tile_size"]["default"] == 1024
+    assert day_to_night_properties["overlap"]["default"] == 256
     warpi2i_fog = database.row(
         "SELECT * FROM adapters WHERE id='adapter_warpi2i_fog'"
     )
@@ -359,10 +369,99 @@ def test_uav_low_light_processes_one_full_frame_without_tiling(
     with Image.open(output_directory / "aerial.png") as output:
         assert output.size == (1400, 900)
     result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["runtime"]["inference_mode"] == "fixed_resolution"
     assert result["runtime"]["image_prep"] == "resize_640x640"
     assert result["runtime"]["output_restore"] == "original_size"
     assert "tile_size" not in result["runtime"]
     assert "overlap" not in result["runtime"]
+
+
+def test_uav_low_light_supports_overlap_tiled_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_directory = tmp_path / "input"
+    output_directory = tmp_path / "output"
+    input_directory.mkdir()
+    input_path = input_directory / "aerial.png"
+    Image.new("RGB", (1400, 900), (40, 80, 120)).save(input_path)
+    checkpoint = tmp_path / "model.pkl"
+    checkpoint.write_bytes(b"checkpoint")
+    tiled_calls: list[tuple[tuple[int, int], int, int]] = []
+
+    class FakeCuda:
+        @staticmethod
+        def manual_seed_all(seed: int) -> None:
+            return None
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+        @staticmethod
+        def manual_seed(seed: int) -> None:
+            return None
+
+    translator = object()
+
+    def translate_tiled(
+        root: Path,
+        image: Image.Image,
+        loaded_translator,
+        tile_size: int,
+        overlap: int,
+    ) -> Image.Image:
+        assert loaded_translator is translator
+        tiled_calls.append((image.size, tile_size, overlap))
+        return image.copy()
+
+    monkeypatch.setattr(
+        diffusiondegrade_day_to_night,
+        "validate_installation",
+        lambda: (tmp_path, checkpoint),
+    )
+    monkeypatch.setattr(
+        diffusiondegrade_day_to_night,
+        "load_translator",
+        lambda root, model: (FakeTorch(), translator),
+    )
+    monkeypatch.setattr(
+        diffusiondegrade_day_to_night,
+        "translate_tiled_image",
+        translate_tiled,
+    )
+    request_path = tmp_path / "request.json"
+    result_path = tmp_path / "result.json"
+    request_path.write_text(
+        json_dump(
+            {
+                "protocol_version": "1.0",
+                "job_id": "job_low_light_tiled",
+                "sample_count": 1,
+                "input_images": [str(input_path)],
+                "input_directory": str(input_directory),
+                "output_directory": str(output_directory),
+                "model_parameters": {
+                    "effect": "day_to_night",
+                    "domain": "uav_aerial",
+                    "inference_mode": "tiled",
+                    "tile_size": 1024,
+                    "overlap": 256,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diffusiondegrade_day_to_night.run(request_path, result_path)
+
+    assert tiled_calls == [((1400, 900), 1024, 256)]
+    with Image.open(output_directory / "aerial.png") as output:
+        assert output.size == (1400, 900)
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["runtime"]["inference_mode"] == "tiled"
+    assert result["runtime"]["image_prep"] == "overlap_tiled"
+    assert result["runtime"]["tile_size"] == 1024
+    assert result["runtime"]["overlap"] == 256
 
 
 def test_resolution_summary_uses_value_or_range() -> None:
@@ -2940,11 +3039,13 @@ def test_local_import_can_feed_nonideal_condition_adapters(
     )
     assert sensor["day_to_night_image_prep"] == "resize_640x640"
     assert sensor["day_to_night_model_size"] == 640
+    assert sensor["day_to_night_inference_mode"] == "fixed_resolution"
     request = captured["request"]
     assert request["model_parameters"] == {
         "effect": "day_to_night",
         "domain": "uav_aerial",
         "direction": "a2b",
+        "inference_mode": "fixed_resolution",
         "image_prep": "resize_640x640",
         "model_size": 640,
         "precision": "FP16",
@@ -2955,6 +3056,47 @@ def test_local_import_can_feed_nonideal_condition_adapters(
         "DIFFUSION_DEGRADE_UAV_DAY_TO_NIGHT_CHECKPOINT"
     ].endswith("outputs/uav_daynight_sichuan_3125/checkpoints/model_3125.pkl")
     assert captured["environment"]["HF_HUB_OFFLINE"] == "1"
+
+    tiled_day_to_night_job = queue_job(
+        "ACQUISITION",
+        {
+            "name": "真实航拍无人机弱光分块",
+            "adapter_id": "adapter_day_to_night",
+            "source_type": "REAL_TRANSFORMED",
+            "sample_count": 1,
+            "seeds": [42],
+            "input_dataset_id": imported["id"],
+            "conditions": {},
+            "model_parameters": {
+                "effect": "day_to_night",
+                "inference_mode": "tiled",
+                "tile_size": 1024,
+                "overlap": 256,
+            },
+            "category_template": "custom",
+            "categories": [{"id": 1, "name": "car"}],
+        },
+        database,
+    )
+    assert agent.process_one()
+    completed = database.row(
+        "SELECT * FROM jobs WHERE id=?", (tiled_day_to_night_job["id"],)
+    )
+    assert completed["status"] == "SUCCEEDED"
+    transformed = database.row(
+        "SELECT * FROM datasets WHERE name='真实航拍无人机弱光分块'"
+    )
+    sensor = json.loads(transformed["sensor_conditions"])
+    assert sensor["day_to_night_inference_mode"] == "tiled"
+    assert sensor["day_to_night_image_prep"] == "overlap_tiled"
+    assert sensor["day_to_night_tile_size"] == 1024
+    assert sensor["day_to_night_overlap"] == 256
+    assert captured["request"]["model_parameters"]["inference_mode"] == "tiled"
+    assert captured["request"]["model_parameters"]["image_prep"] == (
+        "overlap_tiled"
+    )
+    assert captured["request"]["model_parameters"]["tile_size"] == 1024
+    assert captured["request"]["model_parameters"]["overlap"] == 256
 
     database.execute(
         "UPDATE datasets SET scene_domain='城市驾驶' WHERE id=?",

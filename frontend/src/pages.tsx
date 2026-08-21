@@ -410,14 +410,16 @@ function conditionDatasetItems(dataset: Dataset, datasets: Dataset[] = []) {
     const tileSize = Number(conditions.day_to_night_tile_size)
     const overlap = Number(conditions.day_to_night_overlap)
     const imagePrep = String(conditions.day_to_night_image_prep || '')
+    const inferenceMode = String(conditions.day_to_night_inference_mode || '')
     return [
       { key: 'condition-type', label: '非理想条件', children: <Tag color="geekblue">{isDrivingDayToNight ? '自动驾驶弱光' : '无人机弱光'}</Tag> },
       { key: 'time-domain', label: '光照条件', children: '白天 → 弱光' },
       ...(model ? [{ key: 'condition-model', label: '生成模型', children: model }] : []),
       ...(method ? [{ key: 'condition-method', label: '推理方法', children: method }] : []),
       ...(checkpoint ? [{ key: 'condition-checkpoint', label: '权重版本', children: checkpoint }] : []),
+      ...(inferenceMode ? [{ key: 'condition-inference-mode', label: '推理方式', children: inferenceMode === 'tiled' ? '分块推理' : '固定分辨率推理' }] : []),
       ...(Number.isFinite(tileSize) && Number.isFinite(overlap) ? [{ key: 'condition-tiling', label: '分块参数', children: `${tileSize}px / 重叠 ${overlap}px` }] : []),
-      ...(imagePrep ? [{ key: 'condition-image-prep', label: '模型输入', children: imagePrep === 'resize_640x640' ? '整图缩放至 640×640' : imagePrep === 'resize_512x512' ? '整图缩放至 512×512' : imagePrep }] : []),
+      ...(imagePrep ? [{ key: 'condition-image-prep', label: '模型输入', children: imagePrep === 'resize_640x640' ? '整图缩放至 640×640' : imagePrep === 'resize_512x512' ? '整图缩放至 512×512' : imagePrep === 'overlap_tiled' ? '原图重叠分块，每块缩放至 640×640' : imagePrep }] : []),
       ...sourceItem,
     ]
   }
@@ -513,6 +515,9 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
   const [blur, setBlur] = useState(0.3)
   const [fogStrength, setFogStrength] = useState(1)
   const [conditionEffect, setConditionEffect] = useState<'fog' | 'motion_blur' | 'day_to_night' | 'driving_fog' | 'driving_day_to_night'>('fog')
+  const [uavLowLightInferenceMode, setUavLowLightInferenceMode] = useState<'fixed_resolution' | 'tiled'>('fixed_resolution')
+  const [uavLowLightTileSize, setUavLowLightTileSize] = useState(1024)
+  const [uavLowLightOverlap, setUavLowLightOverlap] = useState(256)
   const [motionConditionMode, setMotionConditionMode] = useState<'preset' | 'files'>('preset')
   const [motionConditionDirectory, setMotionConditionDirectory] = useState('')
   const [motionPreset, setMotionPreset] = useState('forward')
@@ -774,7 +779,7 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
       } : isCondition ? { domain: conditionSceneDomain, weather: isMotionBlur ? inputDataset?.weather || '未记录' : isDayToNight ? '弱光' : '雾' } : { domain, weather },
       sensor: isBaseGen ? { resolution } : isCondition ? { resolution: inputDataset?.resolution || '原始分辨率' } : { resolution, motion_blur: blur, fog_density: weather === '雾' ? 0.4 : 0 },
     },
-    model_parameters: isBaseGen ? { steps: generatorSteps, guidance_scale: 0, device_policy: devicePolicy, local_files_only: false } : isMotionBlur ? { effect: 'motion_blur', domain: 'uav_aerial', motion: motionPreset, strength: motionStrength, sample_timesteps: 20, precision: 'FP32', checkpoint: 'ID_Blau.pth', ...(motionConditionMode === 'files' ? { condition_directory: motionConditionDirectory, condition_matching: 'filename', fallback_motion: 'random-preset' } : {}) } : isDrivingFog ? { effect: 'fog', domain: 'autonomous_driving', method: 'paired', image_prep: 'multiple_of_8', precision: 'FP16', checkpoint: 'foggy_1.pkl' } : isDrivingDayToNight ? { effect: 'day_to_night', domain: 'autonomous_driving', method: 'unpaired', direction: 'a2b', image_prep: 'resize_512x512', precision: 'FP16', checkpoint: 'BDD100K_day2night.pkl' } : isUavDayToNight ? { effect: 'day_to_night', domain: 'uav_aerial', direction: 'a2b', image_prep: 'resize_640x640', model_size: 640, precision: 'FP16', checkpoint: 'uav_daynight_sichuan_3125_model_3125' } : isCondition ? { effect: 'fog', domain: 'uav_aerial', image_prep: 'resize_512x512', precision: 'FP16', fog_strength: fogStrength, checkpoint: 'uav_fog_content15_model_2501' } : {},
+    model_parameters: isBaseGen ? { steps: generatorSteps, guidance_scale: 0, device_policy: devicePolicy, local_files_only: false } : isMotionBlur ? { effect: 'motion_blur', domain: 'uav_aerial', motion: motionPreset, strength: motionStrength, sample_timesteps: 20, precision: 'FP32', checkpoint: 'ID_Blau.pth', ...(motionConditionMode === 'files' ? { condition_directory: motionConditionDirectory, condition_matching: 'filename', fallback_motion: 'random-preset' } : {}) } : isDrivingFog ? { effect: 'fog', domain: 'autonomous_driving', method: 'paired', image_prep: 'multiple_of_8', precision: 'FP16', checkpoint: 'foggy_1.pkl' } : isDrivingDayToNight ? { effect: 'day_to_night', domain: 'autonomous_driving', method: 'unpaired', direction: 'a2b', image_prep: 'resize_512x512', precision: 'FP16', checkpoint: 'BDD100K_day2night.pkl' } : isUavDayToNight ? { effect: 'day_to_night', domain: 'uav_aerial', direction: 'a2b', inference_mode: uavLowLightInferenceMode, image_prep: uavLowLightInferenceMode === 'tiled' ? 'overlap_tiled' : 'resize_640x640', model_size: 640, precision: 'FP16', checkpoint: 'uav_daynight_sichuan_3125_model_3125', ...(uavLowLightInferenceMode === 'tiled' ? { tile_size: uavLowLightTileSize, overlap: uavLowLightOverlap } : {}) } : isCondition ? { effect: 'fog', domain: 'uav_aerial', image_prep: 'resize_512x512', precision: 'FP16', fog_strength: fogStrength, checkpoint: 'uav_fog_content15_model_2501' } : {},
     input_dataset_id: isCondition ? inputDatasetId : null,
     category_template: isCondition ? inputDataset?.category_template || 'custom' : categoryTemplateId,
     categories: selectedCategories.map(({ id, name }) => ({ id, name })),
@@ -822,7 +827,7 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
       : isDrivingDayToNight
         ? [{ key: 'model', label: '模型', children: 'WarpI2I · 自动驾驶弱光' }, { key: 'method', label: '方法', children: 'unpaired / a2b' }, { key: 'checkpoint', label: '权重', children: 'BDD100K_day2night.pkl' }, { key: 'prep', label: '模型输入', children: '缩放至 512×512' }, { key: 'output', label: '模型输出', children: '恢复原图分辨率和文件名' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP16' }]
         : isUavDayToNight
-        ? [{ key: 'model', label: '模型', children: 'DiffusionDegrade' }, { key: 'checkpoint', label: '权重', children: 'model_3125' }, { key: 'model-size', label: '模型输入', children: '整图缩放至 640×640' }, { key: 'output', label: '模型输出', children: '恢复原图分辨率和文件名' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP16' }]
+        ? [{ key: 'model', label: '模型', children: 'DiffusionDegrade' }, { key: 'checkpoint', label: '权重', children: 'model_3125' }, { key: 'mode', label: '推理方式', children: uavLowLightInferenceMode === 'tiled' ? '分块推理' : '固定分辨率推理' }, { key: 'model-size', label: '模型输入', children: uavLowLightInferenceMode === 'tiled' ? `原图 ${uavLowLightTileSize}px 分块，每块缩放至 640×640` : '整图缩放至 640×640' }, { key: 'output', label: '模型输出', children: '恢复原图分辨率和文件名' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP16' }]
       : [{ key: 'model', label: '模型', children: 'DiffusionDegrade · 无人机气雾' }, { key: 'checkpoint', label: '权重', children: 'content15 / model_2501' }, { key: 'prep', label: '模型输入', children: '缩放至 512×512' }, { key: 'output', label: '模型输出', children: '恢复原图分辨率' }, { key: 'precision', label: '推理精度', children: 'CUDA / FP16' }]
   const conditionBuildName = isMotionBlur ? '非理想条件生成 · 无人机运动模糊' : isDrivingFog ? '非理想条件生成 · 自动驾驶气雾' : isDrivingDayToNight ? '非理想条件生成 · 自动驾驶弱光' : isUavDayToNight ? '非理想条件生成 · 无人机弱光' : '非理想条件生成 · 无人机气雾'
   const conditionSceneSummary = isMotionBlur ? '无人机航拍 / 保持源天气' : `${conditionSceneDomain} / ${isDayToNight ? '弱光' : '气雾'}`
@@ -833,7 +838,7 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
       : isDrivingDayToNight
         ? `${inputDataset?.resolution || '原始分辨率'} / 自动驾驶弱光 / WarpI2I unpaired / 512×512 / FP16`
         : isUavDayToNight
-      ? `${inputDataset?.resolution || '原始分辨率'} / 整图 640×640 / FP16`
+      ? `${inputDataset?.resolution || '原始分辨率'} / ${uavLowLightInferenceMode === 'tiled' ? `分块 ${uavLowLightTileSize}px（重叠 ${uavLowLightOverlap}px）` : '整图 640×640'} / FP16`
       : `${inputDataset?.resolution || '原始分辨率'} / DiffusionDegrade 无人机气雾 / FP16 / 强度 ${fogStrength.toFixed(1)}`
   const conditionSeedSummary = isMotionBlur ? '固定为 2023' : isDayToNight || isDrivingFog ? '固定为 42' : '固定为 1001'
   const conditionExecutionMessage = isMotionBlur ? '本任务将调用 DiffusionBlur 执行无人机运动模糊生成' : isDrivingFog ? '本任务将调用 WarpI2I paired 方法执行自动驾驶气雾生成' : isDrivingDayToNight ? '本任务将调用 WarpI2I 执行自动驾驶弱光生成' : isUavDayToNight ? '本任务将调用 DiffusionDegrade 执行无人机弱光生成' : '本任务将调用 DiffusionDegrade 执行无人机气雾生成'
@@ -933,7 +938,16 @@ export function DataBuilderPage({ navigate, refresh }: PageProps) {
                     : isDrivingDayToNight
                       ? <Alert className="top-gap" type="info" showIcon message="当前模型不提供夜间强度控制" description="使用 WarpI2I BDD100K 权重执行固定的白天到夜晚域转换。" />
                       : isUavDayToNight
-                        ? null
+                        ? <Form layout="vertical" className="top-gap">
+                            <Form.Item label="推理方式">
+                              <Segmented block value={uavLowLightInferenceMode} onChange={(value) => setUavLowLightInferenceMode(value as 'fixed_resolution' | 'tiled')} options={[{ value: 'fixed_resolution', label: '固定分辨率（640×640）' }, { value: 'tiled', label: '分块推理' }]} />
+                            </Form.Item>
+                            {uavLowLightInferenceMode === 'tiled' && <Row gutter={12}>
+                              <Col span={12}><Form.Item label="分块大小" extra="原图像素"><InputNumber min={1} max={8192} step={64} precision={0} value={uavLowLightTileSize} onChange={(value) => { const next = value || 1; setUavLowLightTileSize(next); if (uavLowLightOverlap >= next) setUavLowLightOverlap(Math.max(0, next - 1)) }} addonAfter="px" style={{ width: '100%' }} /></Form.Item></Col>
+                              <Col span={12}><Form.Item label="重叠像素" extra="用于分块边界融合"><InputNumber min={0} max={Math.max(0, uavLowLightTileSize - 1)} step={32} precision={0} value={uavLowLightOverlap} onChange={(value) => setUavLowLightOverlap(value ?? 0)} addonAfter="px" style={{ width: '100%' }} /></Form.Item></Col>
+                            </Row>}
+                            <Alert type="info" showIcon message={uavLowLightInferenceMode === 'tiled' ? '原图重叠分块后逐块推理，融合为原分辨率输出' : '整图缩放至 640×640 推理，再恢复原分辨率'} />
+                          </Form>
                       : isDrivingFog
                         ? <Alert className="top-gap" type="info" showIcon message="自动驾驶气雾为固定模型效果" description="当前 WarpI2I paired 权重不提供连续气雾强度控制。" />
                         : <Form layout="vertical" className="top-gap"><Form.Item label={`气雾强度 ${fogStrength.toFixed(1)}`}><Slider value={fogStrength} onChange={setFogStrength} min={0} max={1} step={0.1} marks={{ 0: '0', 1: '1' }} /></Form.Item></Form>}
