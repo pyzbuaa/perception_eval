@@ -281,9 +281,37 @@ tools/evaluate.py
 ```
 
 `image_id` 和 `category_id` 必须与输入 COCO 标注一致，`bbox` 使用绝对像素
-`[x,y,width,height]`。模型若不生成 `result.json`，平台使用进程总耗时计算平均时延；
-若需要预处理、推理、后处理和显存等详细指标，可通过 `{result_path}` 额外输出完整运行
-元数据。
+`[x,y,width,height]`。模型若不生成 `result.json`，平台仍计算检测精度，但会将 FPS、
+时延、显存和模型复杂度标记为“未采集”，不会用进程总耗时或 `0 MB` 代替真实性能。
+当前内置的 Ultralytics、RT-DETRv2 和 D-FINE 命令会自动升级到平台只读基准适配器。
+
+支持性能评测的命令应通过 `{result_path}` 输出逐批次原始数据。平台统一计算 P50、P95
+和吞吐率，并分别保存 PyTorch 已分配/保留显存与平台采样的进程显存。复杂度必须注明
+输入尺寸、统计范围和 FLOP 换算约定；当前统一采用 forward-only、1 MAC = 2 FLOPs。
+
+```json
+{
+  "protocol_version": "1.0",
+  "benchmark_schema_version": "1.0",
+  "runtime": {
+    "inference_ms": [8.1, 8.0],
+    "end_to_end_ms": [12.3, 12.1],
+    "batch_duration_ms": [12.3, 12.1],
+    "batch_image_counts": [1, 1]
+  },
+  "memory": {
+    "torch_peak_allocated_mb": 1024,
+    "torch_peak_reserved_mb": 1280
+  },
+  "complexity": {
+    "parameters_total": 25000000,
+    "input_shape": [1, 3, 960, 1280],
+    "macs": 75000000000,
+    "flops": 150000000000,
+    "scope": "forward_only"
+  }
+}
+```
 
 注册完成后，模型会出现在评测中心的“模型版本”选择框中。同一个项目可以通过不同的
 权重和参数列表注册多个模型版本。模型命令不应写平台数据库，也不应修改输入数据集。

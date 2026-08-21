@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,19 @@ def _percentile(values: list[float], percentile: float) -> float:
     upper = min(lower + 1, len(ordered) - 1)
     fraction = position - lower
     return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
+
+
+def _measurements(runtime: dict[str, Any], name: str) -> list[float]:
+    values = runtime.get(name, [])
+    if not isinstance(values, list):
+        return []
+    return [
+        float(value)
+        for value in values
+        if isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value) >= 0
+    ]
 
 
 def evaluate_coco_predictions(
@@ -66,20 +80,44 @@ def evaluate_coco_predictions(
             best_recall = recall
             best_f1 = f1
 
-    preprocess = [float(value) for value in runtime.get("preprocess_ms", [])]
-    inference = [float(value) for value in runtime.get("inference_ms", [])]
-    postprocess = [float(value) for value in runtime.get("postprocess_ms", [])]
+    preprocess = _measurements(runtime, "preprocess_ms")
+    inference = _measurements(runtime, "inference_ms")
+    postprocess = _measurements(runtime, "postprocess_ms")
+    end_to_end = _measurements(runtime, "end_to_end_ms")
     count = max(len(preprocess), len(inference), len(postprocess))
-    end_to_end = [
-        (preprocess[index] if index < len(preprocess) else 0.0)
-        + (inference[index] if index < len(inference) else 0.0)
-        + (postprocess[index] if index < len(postprocess) else 0.0)
-        for index in range(count)
-    ]
-    if not end_to_end and runtime.get("duration_ms") and ground_truth.get("images"):
-        average = float(runtime["duration_ms"]) / len(ground_truth["images"])
-        end_to_end = [average] * len(ground_truth["images"])
+    if not end_to_end:
+        end_to_end = [
+            (preprocess[index] if index < len(preprocess) else 0.0)
+            + (inference[index] if index < len(inference) else 0.0)
+            + (postprocess[index] if index < len(postprocess) else 0.0)
+            for index in range(count)
+        ]
+    batch_durations = _measurements(runtime, "batch_duration_ms")
+    batch_counts = runtime.get("batch_image_counts", [])
+    measured_images = sum(
+        int(value)
+        for value in batch_counts
+        if isinstance(value, int) and value > 0
+    )
+    measured_duration_ms = sum(batch_durations)
+    if not measured_images:
+        measured_images = len(end_to_end)
+        measured_duration_ms = sum(end_to_end)
     mean_latency = sum(end_to_end) / len(end_to_end) if end_to_end else 0.0
+    performance_status = "MEASURED" if end_to_end and inference else "UNAVAILABLE"
+    throughput_fps = (
+        measured_images * 1000 / measured_duration_ms
+        if measured_images and measured_duration_ms
+        else 0.0
+    )
+    torch_allocated = float(runtime.get("torch_peak_allocated_mb", 0.0) or 0.0)
+    torch_reserved = float(runtime.get("torch_peak_reserved_mb", 0.0) or 0.0)
+    nvml_peak = float(runtime.get("nvml_process_peak_mb", 0.0) or 0.0)
+    peak_memory = max(
+        torch_allocated,
+        nvml_peak,
+        float(runtime.get("peak_memory_mb", 0.0) or 0.0),
+    )
     metrics = {
         "map": round(stats[0], 6),
         "map50": round(stats[1], 6),
@@ -93,8 +131,16 @@ def evaluate_coco_predictions(
         "f1": round(best_f1, 6),
         "latency_p50": round(_percentile(end_to_end, 0.5), 3),
         "latency_p95": round(_percentile(end_to_end, 0.95), 3),
-        "fps": round(1000 / mean_latency, 3) if mean_latency else 0.0,
-        "peak_memory": round(float(runtime.get("peak_memory_mb", 0.0)), 3),
+        "latency_mean": round(mean_latency, 3),
+        "inference_latency_p50": round(_percentile(inference, 0.5), 3),
+        "inference_latency_p95": round(_percentile(inference, 0.95), 3),
+        "throughput_fps": round(throughput_fps, 3),
+        "fps": round(throughput_fps, 3),
+        "peak_memory": round(peak_memory, 3),
+        "torch_peak_allocated": round(torch_allocated, 3),
+        "torch_peak_reserved": round(torch_reserved, 3),
+        "nvml_process_peak": round(nvml_peak, 3),
+        "performance_status": performance_status,
         "model_load_ms": round(float(runtime.get("model_load_ms", 0.0)), 3),
         "metric_protocol": "pycocotools-2.0.11",
     }

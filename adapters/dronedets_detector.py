@@ -162,6 +162,18 @@ def run(request_path: Path, result_path: Path) -> None:
     load_started = time.perf_counter()
     model = YOLO(weight_path)
     model_load_ms = (time.perf_counter() - load_started) * 1000
+    parameters_total = sum(parameter.numel() for parameter in model.model.parameters())
+    parameters_trainable = sum(
+        parameter.numel()
+        for parameter in model.model.parameters()
+        if parameter.requires_grad
+    )
+    try:
+        from ultralytics.utils.torch_utils import get_flops
+
+        flops = float(get_flops(model.model, imgsz=image_size)) * 1e9
+    except Exception:
+        flops = 0.0
     options = {
         "save": False,
         "verbose": False,
@@ -183,9 +195,16 @@ def run(request_path: Path, result_path: Path) -> None:
     preprocess_ms = []
     inference_ms = []
     postprocess_ms = []
+    end_to_end_ms = []
     started = time.perf_counter()
     for index, (image, image_path) in enumerate(zip(images, image_paths), start=1):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        image_started = time.perf_counter()
         prediction = model.predict(source=str(image_path), **options)[0]
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        end_to_end_ms.append((time.perf_counter() - image_started) * 1000)
         speed = prediction.speed or {}
         preprocess_ms.append(float(speed.get("preprocess", 0.0)))
         inference_ms.append(float(speed.get("inference", 0.0)))
@@ -231,6 +250,11 @@ def run(request_path: Path, result_path: Path) -> None:
         if torch.cuda.is_available()
         else 0.0
     )
+    reserved_memory_mb = (
+        torch.cuda.max_memory_reserved() / 1024**2
+        if torch.cuda.is_available()
+        else 0.0
+    )
 
     predictions_path = output_directory / "predictions.json"
     predictions_path.write_text(
@@ -247,15 +271,36 @@ def run(request_path: Path, result_path: Path) -> None:
         "prediction_count": len(predictions),
         "unmatched_labels": dict(unmatched),
         "runtime": {
+            "timing_source": "ultralytics_speed+cuda_synchronized_wall_clock",
             "model_load_ms": round(model_load_ms, 3),
             "duration_ms": round(duration_ms, 3),
             "preprocess_ms": preprocess_ms,
             "inference_ms": inference_ms,
             "postprocess_ms": postprocess_ms,
+            "end_to_end_ms": end_to_end_ms,
+            "batch_duration_ms": end_to_end_ms,
+            "batch_image_counts": [1] * len(end_to_end_ms),
             "peak_memory_mb": round(peak_memory_mb, 3),
+            "torch_peak_allocated_mb": round(peak_memory_mb, 3),
+            "torch_peak_reserved_mb": round(reserved_memory_mb, 3),
             "warmup": warmup,
             "batch_size": 1,
             "precision": precision,
+        },
+        "memory": {
+            "torch_peak_allocated_mb": round(peak_memory_mb, 3),
+            "torch_peak_reserved_mb": round(reserved_memory_mb, 3),
+        },
+        "complexity": {
+            "parameters_total": parameters_total,
+            "parameters_trainable": parameters_trainable,
+            "input_shape": [1, 3, image_size, image_size],
+            "macs": flops / 2 if flops else None,
+            "flops": flops or None,
+            "scope": "forward_only",
+            "profiler": "ultralytics.get_flops(thop)",
+            "flop_convention": "1_MAC_equals_2_FLOPs",
+            "unsupported_ops": [] if flops else ["FLOPs 分析器未统计到完整算子"],
         },
         "environment": {
             "versions": _package_versions(),

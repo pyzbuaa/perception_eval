@@ -43,6 +43,7 @@ class JobAgent:
         self.db = database
         self.settings = app_settings
         self.stop_event = threading.Event()
+        self._process_peak_memory_mb: dict[str, float] = {}
 
     def run_forever(self, poll_interval: float = 0.5) -> None:
         while not self.stop_event.is_set():
@@ -627,6 +628,7 @@ class JobAgent:
             bufsize=1,
             start_new_session=True,
         )
+        self._process_peak_memory_mb[job_id] = 0.0
 
         def read_output() -> None:
             assert process.stdout is not None
@@ -637,6 +639,7 @@ class JobAgent:
         reader = threading.Thread(target=read_output, daemon=True)
         reader.start()
         started = time.monotonic()
+        last_gpu_sample = 0.0
         output_finished = False
         try:
             with log_path.open("w", encoding="utf-8") as log:
@@ -653,7 +656,14 @@ class JobAgent:
                         tail.append(line)
                         self._handle_adapter_progress(job_id, line)
                     self._check_cancelled(job_id)
-                    if time.monotonic() - started > self.settings.adapter_timeout_seconds:
+                    now = time.monotonic()
+                    if now - last_gpu_sample >= 0.1:
+                        self._process_peak_memory_mb[job_id] = max(
+                            self._process_peak_memory_mb[job_id],
+                            self._gpu_process_group_memory_mb(process.pid),
+                        )
+                        last_gpu_sample = now
+                    if now - started > self.settings.adapter_timeout_seconds:
                         raise TimeoutError(
                             f"适配器执行超过 {self.settings.adapter_timeout_seconds} 秒"
                         )
@@ -665,6 +675,40 @@ class JobAgent:
                 process.stdout.close()
             reader.join(timeout=1)
         return process.wait(), "".join(tail)
+
+    @staticmethod
+    def _gpu_process_group_memory_mb(process_group_id: int) -> float:
+        try:
+            completed = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return 0.0
+        if completed.returncode != 0:
+            return 0.0
+        total = 0.0
+        for line in completed.stdout.splitlines():
+            fields = [value.strip() for value in line.split(",")]
+            if len(fields) != 2:
+                continue
+            try:
+                pid = int(fields[0])
+                memory = float(fields[1])
+                stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+                process_group = int(stat[stat.rfind(")") + 2 :].split()[2])
+            except (OSError, ValueError):
+                continue
+            if process_group == process_group_id:
+                total += memory
+        return total
 
     def _handle_adapter_progress(self, job_id: str, line: str) -> None:
         try:
@@ -1612,6 +1656,10 @@ class JobAgent:
                 isinstance(value, str) for value in arguments
             ):
                 raise ValueError("检测命令参数必须是字符串数组")
+            arguments = self._benchmark_command_arguments(
+                arguments,
+                working_directory,
+            )
             placeholders = {
                 "annotation_path": str(inference_annotation_path),
                 "batch_size": str(config["batch_size"]),
@@ -1744,12 +1792,41 @@ class JobAgent:
         predictions = mapped_predictions
         predictions_path.write_text(json_dump(predictions), encoding="utf-8")
         self._progress(job["id"], 78, "计算 COCO 检测指标")
+        runtime = dict(result.get("runtime") or {})
+        memory = result.get("memory") or {}
+        if isinstance(memory, dict):
+            for source, target in (
+                ("torch_peak_allocated_mb", "torch_peak_allocated_mb"),
+                ("torch_peak_reserved_mb", "torch_peak_reserved_mb"),
+                ("nvml_process_peak_mb", "nvml_process_peak_mb"),
+            ):
+                if source in memory:
+                    runtime[target] = memory[source]
+        platform_nvml_peak = self._process_peak_memory_mb.pop(job["id"], 0.0)
+        runtime["nvml_process_peak_mb"] = max(
+            float(runtime.get("nvml_process_peak_mb", 0.0) or 0.0),
+            platform_nvml_peak,
+        )
         metrics, curves = evaluate_coco_predictions(
             annotation_path,
             predictions_path,
-            result.get("runtime", {}),
+            runtime,
             compatibility["evaluation_category_ids"],
         )
+        complexity = result.get("complexity") or {}
+        if isinstance(complexity, dict):
+            for name in (
+                "parameters_total",
+                "parameters_trainable",
+                "macs",
+                "flops",
+                "input_shape",
+                "scope",
+                "profiler",
+                "unsupported_ops",
+            ):
+                if name in complexity:
+                    metrics[name] = complexity[name]
         config.update(
             {
                 "predictions_path": predictions_path.relative_to(
@@ -1758,6 +1835,7 @@ class JobAgent:
                 "unmatched_labels": result.get("unmatched_labels", {}),
                 "warnings": result.get("warnings", []),
                 "category_mapping": compatibility["model_to_dataset"],
+                "performance_status": metrics["performance_status"],
             }
         )
         environment_details = result.get("environment", {})
@@ -1772,6 +1850,7 @@ class JobAgent:
         is_official = (
             adapter["maturity"] == "BENCHMARK_READY"
             and model["status"] == "BENCHMARK_READY"
+            and metrics["performance_status"] == "MEASURED"
         )
         now = utc_now()
         with self.db.connect() as connection:
@@ -1800,9 +1879,11 @@ class JobAgent:
                 """
                 INSERT INTO results
                 (id,run_id,map,map50,map75,precision,recall,f1,latency_p50,
-                 latency_p95,fps,peak_memory,delta_map,metrics,curves,is_official,
-                 created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 latency_p95,fps,peak_memory,performance_status,latency_mean,
+                 inference_latency_p50,inference_latency_p95,throughput_fps,
+                 torch_peak_allocated,torch_peak_reserved,nvml_process_peak,
+                 delta_map,metrics,curves,is_official,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     new_id("result"),
@@ -1817,6 +1898,14 @@ class JobAgent:
                     metrics["latency_p95"],
                     metrics["fps"],
                     metrics["peak_memory"],
+                    metrics["performance_status"],
+                    metrics["latency_mean"],
+                    metrics["inference_latency_p50"],
+                    metrics["inference_latency_p95"],
+                    metrics["throughput_fps"],
+                    metrics["torch_peak_allocated"],
+                    metrics["torch_peak_reserved"],
+                    metrics["nvml_process_peak"],
                     None,
                     json_dump(metrics),
                     json_dump(curves),
@@ -1824,7 +1913,79 @@ class JobAgent:
                     now,
                 ),
             )
+            if complexity and complexity.get("input_shape"):
+                connection.execute(
+                    """
+                    INSERT INTO model_profiles
+                    (id,model_id,weight_sha256,input_shape,parameters_total,
+                     parameters_trainable,macs,flops,scope,profiler,
+                     unsupported_ops,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(model_id,weight_sha256,input_shape,scope)
+                    DO UPDATE SET
+                        parameters_total=excluded.parameters_total,
+                        parameters_trainable=excluded.parameters_trainable,
+                        macs=excluded.macs,flops=excluded.flops,
+                        profiler=excluded.profiler,
+                        unsupported_ops=excluded.unsupported_ops,
+                        created_at=excluded.created_at
+                    """,
+                    (
+                        new_id("profile"),
+                        model["id"],
+                        model.get("weight_sha256"),
+                        json_dump(complexity["input_shape"]),
+                        complexity.get("parameters_total"),
+                        complexity.get("parameters_trainable"),
+                        complexity.get("macs"),
+                        complexity.get("flops"),
+                        str(complexity.get("scope") or "forward_only"),
+                        complexity.get("profiler"),
+                        json_dump(complexity.get("unsupported_ops", [])),
+                        now,
+                    ),
+                )
         return run_id
+
+    def _benchmark_command_arguments(
+        self,
+        arguments: list[str],
+        working_directory: Path,
+    ) -> list[str]:
+        if not arguments or any("{result_path}" in value for value in arguments):
+            return arguments
+        if not arguments[0].replace("\\", "/").endswith(
+            "tools/inference/platform_coco.py"
+        ):
+            return arguments
+        project_name = working_directory.as_posix().casefold()
+        if "ultralytics" in project_name:
+            backend = "ultralytics"
+        elif "d-fine" in project_name or "dfine" in project_name:
+            backend = "dfine"
+        elif "rt-detr" in project_name or "rtdetr" in project_name:
+            backend = "rtdetrv2"
+        else:
+            return arguments
+        upgraded = [
+            str(self.settings.root_dir / "adapters" / "detector_benchmark.py"),
+            "--backend",
+            backend,
+            *arguments[1:],
+            "--request",
+            "{request_path}",
+            "--result",
+            "{result_path}",
+        ]
+        options = set(upgraded)
+        for option, placeholder in (
+            ("--device", "{device}"),
+            ("--warmup", "{warmup}"),
+            ("--max-detections", "{max_detections}"),
+        ):
+            if option not in options:
+                upgraded.extend([option, placeholder])
+        return upgraded
 
     @staticmethod
     def _prepare_blurred_evaluation_images(

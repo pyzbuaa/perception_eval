@@ -1962,7 +1962,7 @@ const emptyLocalModelDraft = (): LocalModelDraft => ({
     input_width: 1280,
     max_detections: 300,
     batch_size: 1,
-    warmup: 0,
+    warmup: 20,
   },
   weight_path: '',
 })
@@ -2346,7 +2346,7 @@ export function EvaluationPage({ navigate, refresh }: PageProps) {
   const [inputWidth, setInputWidth] = useState(1280)
   const [maxDetections, setMaxDetections] = useState(300)
   const [batchSize, setBatchSize] = useState(1)
-  const [warmup, setWarmup] = useState(0)
+  const warmup = 20
   const [jobId, setJobId] = useState<string>()
   const [submitting, setSubmitting] = useState(false)
   const selectedModels = models.data.filter((item) => modelIds.includes(item.id))
@@ -2386,7 +2386,6 @@ export function EvaluationPage({ navigate, refresh }: PageProps) {
     setInputWidth(selectedDefault('input_width', 1280))
     setMaxDetections(selectedDefault('max_detections', 300))
     setBatchSize(selectedDefault('batch_size', 1))
-    setWarmup(selectedDefault('warmup', 0))
   }, [modelIds.join(','), adapters.data])
   const count = datasetIds.length * modelIds.length
   const commonNames = new Set(commonEvaluationCategories.map((name) => name.trim().toLocaleLowerCase()))
@@ -2398,7 +2397,53 @@ export function EvaluationPage({ navigate, refresh }: PageProps) {
       : unavailableCategories.length
         ? [`以下类别不再是共同类别：${unavailableCategories.join('、')}`]
         : []
-  const submit = async () => { setSubmitting(true); try { const plan = await post<{ id: string }>('/api/evaluation-plans', { name: `感知效能评测 ${new Date().toLocaleString('zh-CN')}`, dataset_ids: datasetIds, model_ids: modelIds, evaluation_categories: evaluationCategories, seeds: [1001], blur_levels: [0], batch_size: batchSize, precision, warmup, confidence, nms_iou: nmsIou, image_size: imageSize, input_height: inputHeight, input_width: inputWidth, max_detections: maxDetections }); const job = await post<Job>(`/api/evaluation-plans/${plan.id}/runs`); setJobId(job.id); refresh(); message.success('评测矩阵已提交') } catch (error) { message.error((error as Error).message) } finally { setSubmitting(false) } }
+  const submit = async () => {
+    setSubmitting(true)
+    try {
+      const existing = await api<ResultResponse>('/api/results')
+      const existingCounts = new Map<string, number>()
+      existing.runs.forEach((run) => {
+        const key = `${run.dataset_id}\u0000${run.model_id}`
+        existingCounts.set(key, (existingCounts.get(key) || 0) + 1)
+      })
+      const duplicatePairs = selectedDatasets.flatMap((dataset) => selectedModels.flatMap((model) => {
+        const runCount = existingCounts.get(`${dataset.id}\u0000${model.id}`) || 0
+        return runCount ? [{ dataset: dataset.name, model: model.name, runCount }] : []
+      }))
+      if (duplicatePairs.length) {
+        const confirmed = await new Promise<boolean>((resolve) => {
+          Modal.confirm({
+            title: '检测到已评测组合',
+            width: 620,
+            content: <Space direction="vertical" size={12} style={{ width: '100%' }}>
+              <Typography.Text>以下数据集与模型已在效能模型库中存在结果。继续评测会新增记录，不会覆盖历史结果。</Typography.Text>
+              <List
+                size="small"
+                bordered
+                dataSource={duplicatePairs.slice(0, 8)}
+                renderItem={(item) => <List.Item><Typography.Text>{item.dataset} / {item.model}</Typography.Text><Tag>{item.runCount} 次历史评测</Tag></List.Item>}
+              />
+              {duplicatePairs.length > 8 && <Typography.Text type="secondary">另有 {duplicatePairs.length - 8} 个重复组合未展开。</Typography.Text>}
+            </Space>,
+            okText: '继续评测',
+            cancelText: '取消',
+            onOk: () => resolve(true),
+            onCancel: () => resolve(false),
+          })
+        })
+        if (!confirmed) return
+      }
+      const plan = await post<{ id: string }>('/api/evaluation-plans', { name: `感知效能评测 ${new Date().toLocaleString('zh-CN')}`, dataset_ids: datasetIds, model_ids: modelIds, evaluation_categories: evaluationCategories, seeds: [1001], blur_levels: [0], batch_size: batchSize, precision, warmup, confidence, nms_iou: nmsIou, image_size: imageSize, input_height: inputHeight, input_width: inputWidth, max_detections: maxDetections })
+      const job = await post<Job>(`/api/evaluation-plans/${plan.id}/runs`)
+      setJobId(job.id)
+      refresh()
+      message.success('评测矩阵已提交')
+    } catch (error) {
+      message.error((error as Error).message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
   return <Space direction="vertical" size={18} style={{ width: '100%' }}>
     {hasRealDetector && <Alert
       type="info"
@@ -2419,7 +2464,6 @@ export function EvaluationPage({ navigate, refresh }: PageProps) {
         {supportsInference('input_width') && <Col xs={12} md={6}><Form.Item label="输入宽度"><InputNumber min={32} max={8192} step={32} value={inputWidth} onChange={(value) => setInputWidth(value || 32)} style={{ width: '100%' }} /></Form.Item></Col>}
         {supportsInference('max_detections') && <Col xs={12} md={6}><Form.Item label="每图最大检测数"><InputNumber min={1} max={5000} value={maxDetections} onChange={(value) => setMaxDetections(value || 1)} style={{ width: '100%' }} /></Form.Item></Col>}
         {supportsInference('batch_size') && <Col xs={12} md={6}><Form.Item label="批大小"><InputNumber min={1} max={64} value={batchSize} onChange={(value) => setBatchSize(value || 1)} style={{ width: '100%' }} /></Form.Item></Col>}
-        {supportsInference('warmup') && <Col xs={12} md={6}><Form.Item label="预热次数"><InputNumber min={0} max={200} value={warmup} onChange={(value) => setWarmup(value || 0)} style={{ width: '100%' }} /></Form.Item></Col>}
       </Row></Form></Card></Col>
     </Row>
     {categoryIssues.length > 0 && <Alert type="error" showIcon message="评测类别不可用，无法启动评测" description={<Space direction="vertical" size={2}>{categoryIssues.map((item) => <Typography.Text key={item}>{item}</Typography.Text>)}</Space>} />}
@@ -2449,6 +2493,28 @@ function runParameterValue(config: Record<string, unknown>, key: string) {
   return value === undefined || value === null || value === '' ? '默认' : String(value)
 }
 
+function hasMeasuredPerformance(run: ResultRun) {
+  return run.performance_status === 'MEASURED'
+}
+
+function performanceValue(run: ResultRun, value: number | null | undefined, suffix = '') {
+  return hasMeasuredPerformance(run) && value !== null && value !== undefined
+    ? `${Number(value).toFixed(2)}${suffix}`
+    : '—'
+}
+
+function compactMetric(value: unknown, unit: string) {
+  const number = Number(value)
+  if (!Number.isFinite(number) || number <= 0) return '—'
+  return `${(number / 1e9).toFixed(2)} ${unit}`
+}
+
+function parameterMetric(value: unknown) {
+  const number = Number(value)
+  if (!Number.isFinite(number) || number <= 0) return '—'
+  return `${(number / 1e6).toFixed(2)} M`
+}
+
 const resultParameterLabels: Record<string, string> = {
   input_resolution: '推理分辨率',
   confidence: '置信度阈值',
@@ -2473,6 +2539,7 @@ function resultInferenceParameters(run: ResultRun) {
 
 function parameterComparisonIssue(runs: ResultRun[]) {
   if (runs.length < 2) return '请至少选择两次评测结果'
+  if (runs.some((run) => !hasMeasuredPerformance(run))) return '所选结果包含未采集真实性能数据的运行'
   const first = runs[0]
   const categories = [...first.evaluation_categories].sort().join('\u0000')
   const hardware = first.environment_fingerprint || JSON.stringify(first.hardware_profile)
@@ -2554,7 +2621,7 @@ export function ExplorerPage({ dark }: PageProps) {
     const available = new Set(data.runs.map((run) => run.run_id))
     setSelectedRunIds((current) => current.filter((runId) => available.has(runId)))
   }, [data.runs])
-  const natureTag = (result: { is_demo: boolean; is_official: boolean }) => result.is_demo ? <DemoTag /> : result.is_official ? <Tag color="green">真实模型 · 正式结果</Tag> : <Tag color="purple">真实模型 · 实验性结果</Tag>
+  const natureTag = (result: { is_demo: boolean; is_official: boolean }) => result.is_demo ? <DemoTag /> : result.is_official ? <Tag color="green">真实模型 · 正式结果</Tag> : null
   const runs = [...data.runs].sort((left, right) => Date.parse(right.created_at) - Date.parse(left.created_at))
   const comparisonRows = useMemo(() => aggregateParameterRuns(comparisonRuns), [comparisonRuns])
   const changedParameterKeys = Object.keys(resultParameterLabels).filter((key) => new Set(comparisonRows.map((row) => row.parameters[key])).size > 1)
@@ -2635,38 +2702,39 @@ export function ExplorerPage({ dark }: PageProps) {
           dataSource={runs}
           rowSelection={{ fixed: true, selectedRowKeys: selectedRunIds, preserveSelectedRowKeys: true, onChange: (keys) => setSelectedRunIds(keys.map(String)) }}
           pagination={{ current: runPage, pageSize: runPageSize, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100], showTotal: (total) => `共 ${total} 次评测`, onChange: (page, pageSize) => { setRunPage(page); setRunPageSize(pageSize) } }}
-          scroll={{ x: 1920 }}
+          scroll={{ x: 2060 }}
           columns={[
             { title: '序号', fixed: 'left', width: 70, render: (_, _row, index) => (runPage - 1) * runPageSize + index + 1 },
             { title: '模型', dataIndex: 'model_name', fixed: 'left', width: 190, render: (value) => <Typography.Text strong>{value}</Typography.Text> },
             { title: '数据集', dataIndex: 'dataset_name', width: 180 },
-            { title: '评测类别', width: 180, render: (_, row) => evaluationCategoryLabel(row.evaluation_categories) },
-            { title: '场景 / 条件', width: 170, render: (_, row) => `${row.scene_domain} / ${row.weather}` },
+            { title: '场景 / 条件', width: 190, render: (_, row) => `${row.scene_domain} / ${row.condition_type || '无'}` },
             { title: '推理分辨率', width: 120, render: (_, row) => runInferenceResolution(row.config) },
-            { title: '推理精度', width: 90, render: (_, row) => runParameterValue(row.config, 'precision') },
-            { title: '置信度阈值', width: 110, render: (_, row) => runParameterValue(row.config, 'confidence') },
-            { title: 'NMS IoU', width: 90, render: (_, row) => runParameterValue(row.config, 'nms_iou') },
             { title: 'mAP', dataIndex: 'map', width: 90, sorter: (a, b) => a.map - b.map, render: (value) => <Typography.Text strong className="map-value">{percent(value)}</Typography.Text> },
             { title: 'AP50', dataIndex: 'map50', width: 85, sorter: (a, b) => a.map50 - b.map50, render: percent },
             { title: 'AP75', dataIndex: 'map75', width: 85, sorter: (a, b) => a.map75 - b.map75, render: percent },
-            { title: '时延P50', dataIndex: 'latency_p50', width: 105, sorter: (a, b) => a.latency_p50 - b.latency_p50, render: (value) => `${value} ms` },
-            { title: '时延P95', dataIndex: 'latency_p95', width: 105, render: (value) => `${value} ms` },
-            { title: 'FPS', dataIndex: 'fps', width: 80 },
-            { title: '操作', fixed: 'right', width: 180, render: (_, row) => <Space size={0}><Button type="link" icon={<EyeOutlined />} onClick={() => setSelectedRun(row)}>查看结果</Button><Popconfirm title="确认删除这次评测结果？" description="运行记录、指标、预测结果和工作目录将移入回收站；模型与数据集不受影响。" okText="移入回收站" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => removeRun(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm></Space> },
+            { title: '端到端P50', dataIndex: 'latency_p50', width: 115, sorter: (a, b) => a.latency_p50 - b.latency_p50, render: (value, row) => performanceValue(row, value, ' ms') },
+            { title: '端到端P95', dataIndex: 'latency_p95', width: 115, render: (value, row) => performanceValue(row, value, ' ms') },
+            { title: '推理P50', dataIndex: 'inference_latency_p50', width: 105, render: (value, row) => performanceValue(row, value, ' ms') },
+            { title: 'FPS', dataIndex: 'throughput_fps', width: 90, render: (value, row) => performanceValue(row, value) },
+            { title: '进程峰值显存', dataIndex: 'nvml_process_peak', width: 125, render: (value, row) => performanceValue(row, value, ' MB') },
+            { title: '参数量', width: 95, render: (_, row) => hasMeasuredPerformance(row) ? parameterMetric(row.metrics.parameters_total) : '—' },
+            { title: '计算量', width: 105, render: (_, row) => hasMeasuredPerformance(row) ? compactMetric(row.metrics.flops, 'GFLOPs') : '—' },
+            { title: '操作', fixed: 'right', width: 220, render: (_, row) => <Space size={0}><Button type="link" icon={<EyeOutlined />} onClick={() => setSelectedRun(row)}>查看结果</Button><Popconfirm title="确认删除这次评测结果？" description="运行记录、指标、预测结果和工作目录将移入回收站；模型与数据集不受影响。" okText="移入回收站" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => removeRun(row)}><Button danger type="link" icon={<DeleteOutlined />}>删除</Button></Popconfirm></Space> },
           ]}
         />
       </Card>
-      <Drawer open={Boolean(selectedRun)} onClose={() => setSelectedRun(undefined)} title="评测结果详情" width={760}>
+      <Drawer open={Boolean(selectedRun)} onClose={() => setSelectedRun(undefined)} title="模型详情" width={760}>
         {selectedRun && <Space direction="vertical" size={18} style={{ width: '100%' }}>
           <Space wrap>
             {natureTag(selectedRun)}
             <Typography.Text code copyable>{selectedRun.run_id}</Typography.Text>
             <Button icon={<EyeOutlined />} disabled={selectedRun.is_demo} onClick={() => visualize(selectedRun)}>查看推理结果</Button>
           </Space>
+          {!hasMeasuredPerformance(selectedRun) && <Alert type="warning" showIcon message="本次运行未采集真实性能数据" description="该结果仍可用于准确率分析，但 FPS、时延、显存、参数量和计算量不会使用整进程耗时或 0 值代替。请使用支持 result.json 性能协议的适配器重新评测。" />}
           <Row gutter={12}>
             <Col span={8}><Card><Statistic title="mAP" value={selectedRun.map * 100} precision={2} suffix="%" /></Card></Col>
-            <Col span={8}><Card><Statistic title="时延P50" value={selectedRun.latency_p50} precision={2} suffix="ms" /></Card></Col>
-            <Col span={8}><Card><Statistic title="FPS" value={selectedRun.fps} precision={2} /></Card></Col>
+            <Col span={8}><Card><Statistic title="端到端时延P50" value={performanceValue(selectedRun, selectedRun.latency_p50, ' ms')} /></Card></Col>
+            <Col span={8}><Card><Statistic title="FPS" value={performanceValue(selectedRun, selectedRun.throughput_fps)} /></Card></Col>
           </Row>
           <Descriptions bordered size="small" column={3} items={[
             { key: 'map50', label: 'AP50', children: percent(selectedRun.map50) },
@@ -2674,8 +2742,17 @@ export function ExplorerPage({ dark }: PageProps) {
             { key: 'precision', label: '最佳F1点 Precision', children: percent(selectedRun.precision) },
             { key: 'recall', label: '最佳F1点 Recall', children: percent(selectedRun.recall) },
             { key: 'f1', label: '最佳 F1', children: percent(selectedRun.f1) },
-            { key: 'latency95', label: '时延P95', children: `${selectedRun.latency_p95} ms` },
-            { key: 'memory', label: '峰值显存', children: `${selectedRun.peak_memory} MB` },
+            { key: 'latency95', label: '端到端时延P95', children: performanceValue(selectedRun, selectedRun.latency_p95, ' ms') },
+            { key: 'inference50', label: '纯推理时延P50', children: performanceValue(selectedRun, selectedRun.inference_latency_p50, ' ms') },
+            { key: 'inference95', label: '纯推理时延P95', children: performanceValue(selectedRun, selectedRun.inference_latency_p95, ' ms') },
+            { key: 'allocated', label: 'PyTorch 已分配峰值', children: performanceValue(selectedRun, selectedRun.torch_peak_allocated, ' MB') },
+            { key: 'reserved', label: 'PyTorch 保留峰值', children: performanceValue(selectedRun, selectedRun.torch_peak_reserved, ' MB') },
+            { key: 'nvml', label: '进程峰值显存', children: performanceValue(selectedRun, selectedRun.nvml_process_peak, ' MB') },
+            { key: 'parameters', label: '模型参数量', children: hasMeasuredPerformance(selectedRun) ? parameterMetric(selectedRun.metrics.parameters_total) : '—' },
+            { key: 'flops', label: '计算量', children: hasMeasuredPerformance(selectedRun) ? compactMetric(selectedRun.metrics.flops, 'GFLOPs') : '—' },
+            { key: 'inferencePrecision', label: '推理精度', children: runParameterValue(selectedRun.config, 'precision') },
+            { key: 'confidence', label: '置信度阈值', children: runParameterValue(selectedRun.config, 'confidence') },
+            { key: 'nmsIou', label: 'NMS IoU', children: runParameterValue(selectedRun.config, 'nms_iou') },
           ]} />
           <Alert type="info" showIcon message="Precision / Recall 取值依据" description="取自 COCOeval 在评测 IoU=0.5 下生成的 PR 曲线：先对全部评测类别的 Precision 求平均，再选择 F1 最大的曲线点。该点没有记录对应的置信度阈值，不代表 confidence=0.001 的固定工作点；NMS IoU=0.7 仅用于预测框去重。" />
           <Descriptions bordered column={1} items={[
@@ -2683,7 +2760,7 @@ export function ExplorerPage({ dark }: PageProps) {
             { key: 'architecture', label: '架构 / Backbone', children: `${selectedRun.family} / ${selectedRun.backbone}` },
             { key: 'dataset', label: '数据集', children: selectedRun.dataset_name },
             { key: 'categories', label: '评测类别', children: selectedRun.evaluation_categories.length ? <Space wrap>{selectedRun.evaluation_categories.map((name) => <Tag key={name}>{name}</Tag>)}</Space> : evaluationCategoryLabel(selectedRun.evaluation_categories) },
-            { key: 'scene', label: '场景 / 条件', children: `${selectedRun.scene_domain} / ${selectedRun.weather}` },
+            { key: 'scene', label: '场景 / 条件', children: `${selectedRun.scene_domain} / ${selectedRun.condition_type || '无'}` },
             { key: 'conditions', label: '条件参数', children: Object.keys(selectedRun.sensor_conditions).length ? <Typography.Text code copyable>{JSON.stringify(selectedRun.sensor_conditions)}</Typography.Text> : '未记录' },
             { key: 'resolution', label: '数据分辨率', children: selectedRun.resolution },
             { key: 'config', label: '推理配置', children: <Typography.Text code copyable>{JSON.stringify(selectedRun.config)}</Typography.Text> },

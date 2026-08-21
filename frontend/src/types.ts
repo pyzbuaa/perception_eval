@@ -214,6 +214,7 @@ export interface ResultGroup {
   source_type: string
   is_demo: boolean
   is_official: boolean
+  performance_status: string
   inference_config: Record<string, string | number | boolean>
   evaluation_categories: string[]
   hardware_profile: Record<string, unknown>
@@ -232,6 +233,10 @@ export interface ResultGroup {
   latency_p95_mean: number
   fps_mean: number
   peak_memory_mean: number
+  parameters_total?: number | null
+  parameters_trainable?: number | null
+  macs?: number | null
+  flops?: number | null
   delta_map_mean: number
   seed_count: number
   seeds: number[]
@@ -255,6 +260,10 @@ export interface ResultRun {
   sensor_conditions: Record<string, unknown>
   is_demo: boolean
   is_official: boolean
+  performance_status: string
+  condition_type: string
+  condition_strength: number | null
+  source_dataset_id?: string
   evaluation_categories: string[]
   config: Record<string, unknown>
   hardware_profile: Record<string, unknown>
@@ -268,8 +277,16 @@ export interface ResultRun {
   f1: number
   latency_p50: number
   latency_p95: number
+  latency_mean?: number | null
+  inference_latency_p50?: number | null
+  inference_latency_p95?: number | null
+  throughput_fps?: number | null
   fps: number
   peak_memory: number
+  torch_peak_allocated?: number | null
+  torch_peak_reserved?: number | null
+  nvml_process_peak?: number | null
+  metrics: Record<string, unknown>
   curves: { recall: number[]; precision: number[] }
   created_at: string
 }

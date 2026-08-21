@@ -786,7 +786,7 @@ def register_local_detector_model(
         "input_width": 1280,
         "max_detections": 300,
         "batch_size": 1,
-        "warmup": 0,
+        "warmup": 20,
         **values.get("inference_defaults", {}),
     }
     inference_properties = {
@@ -2114,6 +2114,9 @@ def delete_model(
             )
 
         adapter_id = model["adapter_id"]
+        connection.execute(
+            "DELETE FROM model_profiles WHERE model_id=?", (model_id,)
+        )
         connection.execute("DELETE FROM models WHERE id=?", (model_id,))
         adapter = connection.execute(
             "SELECT description FROM adapters WHERE id=?",
@@ -2399,7 +2402,7 @@ def _condition_metadata(
             "condition_strength": None,
             "source_dataset_id": source_dataset_id,
         }
-    if "fog_strength" in sensor_conditions:
+    if float(sensor_conditions.get("fog_strength") or 0) > 0:
         return {
             "condition_type": str(
                 sensor_conditions.get("condition_label")
@@ -2413,7 +2416,7 @@ def _condition_metadata(
             "condition_strength": float(sensor_conditions["fog_strength"]),
             "source_dataset_id": source_dataset_id,
         }
-    if "fog_density" in sensor_conditions:
+    if float(sensor_conditions.get("fog_density") or 0) > 0:
         return {
             "condition_type": "雾",
             "condition_strength": float(sensor_conditions["fog_density"]),
@@ -2434,14 +2437,18 @@ def _condition_metadata(
             "condition_strength": None,
             "source_dataset_id": source_dataset_id,
         }
-    if "motion_blur_strength" in sensor_conditions:
+    if float(sensor_conditions.get("motion_blur_strength") or 0) > 0:
         return {
             "condition_type": "无人机运动模糊",
             "condition_strength": float(sensor_conditions["motion_blur_strength"]),
             "source_dataset_id": source_dataset_id,
         }
     motion_blur = sensor_conditions.get("motion_blur")
-    if isinstance(motion_blur, (int, float)) and not isinstance(motion_blur, bool):
+    if (
+        isinstance(motion_blur, (int, float))
+        and not isinstance(motion_blur, bool)
+        and float(motion_blur) > 0
+    ):
         return {
             "condition_type": "运动模糊",
             "condition_strength": float(motion_blur),
@@ -2459,9 +2466,7 @@ def _condition_metadata(
     )
     if recorded_condition:
         return {
-            "condition_type": (
-                "基准" if recorded_condition == "无" else recorded_condition
-            ),
+            "condition_type": recorded_condition,
             "condition_strength": 0.0 if recorded_condition == "无" else None,
             "source_dataset_id": source_dataset_id,
         }
@@ -2472,7 +2477,7 @@ def _condition_metadata(
             "source_dataset_id": source_dataset_id,
         }
     return {
-        "condition_type": "基准",
+        "condition_type": "无",
         "condition_strength": 0.0,
         "source_dataset_id": source_dataset_id,
     }
@@ -2699,6 +2704,15 @@ def query_results(
             if configured_categories
             else dataset_categories.get(row["dataset_id"], [])
         )
+        row["performance_status"] = str(
+            row.get("performance_status") or "LEGACY"
+        )
+        row.update(
+            _condition_metadata(
+                str(row.get("weather") or ""),
+                row.get("sensor_conditions") or {},
+            )
+        )
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in decoded:
         comparison_config = _comparison_config(
@@ -2793,6 +2807,14 @@ def query_results(
                 "source_type": first["source_type"],
                 "is_demo": first["is_demo"],
                 "is_official": all(item["is_official"] for item in values),
+                "performance_status": (
+                    "MEASURED"
+                    if all(
+                        item.get("performance_status") == "MEASURED"
+                        for item in values
+                    )
+                    else "UNAVAILABLE"
+                ),
                 "inference_config": inference_config,
                 "evaluation_categories": evaluation_categories,
                 "hardware_profile": first.get("hardware_profile") or {},
@@ -2809,6 +2831,14 @@ def query_results(
                 "latency_p95_mean": round(metric_mean("latency_p95"), 2),
                 "fps_mean": round(metric_mean("fps"), 2),
                 "peak_memory_mean": round(metric_mean("peak_memory"), 2),
+                "parameters_total": (first.get("metrics") or {}).get(
+                    "parameters_total"
+                ),
+                "parameters_trainable": (first.get("metrics") or {}).get(
+                    "parameters_trainable"
+                ),
+                "macs": (first.get("metrics") or {}).get("macs"),
+                "flops": (first.get("metrics") or {}).get("flops"),
                 "delta_map_mean": round(sum(item["delta_map"] or 0 for item in values) / len(values), 4),
                 "seed_count": len(values),
                 "seeds": sorted({int(item["seed"]) for item in values}),
@@ -2819,7 +2849,7 @@ def query_results(
     summaries.sort(key=lambda item: item["map_mean"], reverse=True)
     dimensions = {
         "scenes": sorted({row["scene_domain"] for row in decoded}),
-        "conditions": sorted({row["weather"] for row in decoded}),
+        "conditions": sorted({row["condition_type"] for row in decoded}),
         "resolutions": sorted({row["resolution"] for row in decoded}),
         "models": sorted({row["model_name"] for row in decoded}),
         "model_options": sorted(

@@ -64,6 +64,7 @@ class Database:
             connection.executescript(SCHEMA)
             self._migrate_model_metadata(connection)
             self._migrate_dataset_metadata(connection)
+            self._migrate_result_performance(connection)
         self._seed_demo_data()
 
     @staticmethod
@@ -128,6 +129,28 @@ class Database:
                 "UPDATE datasets SET sensor_conditions=? WHERE id=?",
                 (json_dump(conditions), row["id"]),
             )
+
+    @staticmethod
+    def _migrate_result_performance(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(results)").fetchall()
+        }
+        columns = {
+            "performance_status": "TEXT NOT NULL DEFAULT 'LEGACY'",
+            "latency_mean": "REAL",
+            "inference_latency_p50": "REAL",
+            "inference_latency_p95": "REAL",
+            "throughput_fps": "REAL",
+            "torch_peak_allocated": "REAL",
+            "torch_peak_reserved": "REAL",
+            "nvml_process_peak": "REAL",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE results ADD COLUMN {name} {definition}"
+                )
         rows = connection.execute(
             """
             SELECT id,name,sensor_conditions,weather FROM datasets
@@ -1107,11 +1130,34 @@ CREATE TABLE IF NOT EXISTS results (
     latency_p95 REAL NOT NULL,
     fps REAL NOT NULL,
     peak_memory REAL NOT NULL,
+    performance_status TEXT NOT NULL DEFAULT 'LEGACY',
+    latency_mean REAL,
+    inference_latency_p50 REAL,
+    inference_latency_p95 REAL,
+    throughput_fps REAL,
+    torch_peak_allocated REAL,
+    torch_peak_reserved REAL,
+    nvml_process_peak REAL,
     delta_map REAL,
     metrics TEXT NOT NULL,
     curves TEXT NOT NULL,
     is_official INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS model_profiles (
+    id TEXT PRIMARY KEY,
+    model_id TEXT NOT NULL REFERENCES models(id),
+    weight_sha256 TEXT,
+    input_shape TEXT NOT NULL,
+    parameters_total INTEGER,
+    parameters_trainable INTEGER,
+    macs REAL,
+    flops REAL,
+    scope TEXT NOT NULL,
+    profiler TEXT,
+    unsupported_ops TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    UNIQUE(model_id, weight_sha256, input_shape, scope)
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_sample_annotations_progress

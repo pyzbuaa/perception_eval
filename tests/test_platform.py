@@ -1034,6 +1034,22 @@ def test_local_detector_model_registration_uses_bounded_resources(
         ["--confidence", "{confidence}"],
         {"confidence": 0.4},
     ) == ["/usr/bin/example", "--confidence", "0.4"]
+    database.execute(
+        """
+        INSERT INTO model_profiles
+        (id,model_id,weight_sha256,input_shape,scope,unsupported_ops,created_at)
+        VALUES (?,?,?,?,?,?,?)
+        """,
+        (
+            "profile_delete_test",
+            model["id"],
+            model["weight_sha256"],
+            "[1,3,960,1280]",
+            "forward_only",
+            "[]",
+            utc_now(),
+        ),
+    )
     deleted = delete_model(model["id"], database)
     assert deleted["deleted"] is True
     assert deleted["adapter_deleted"] is True
@@ -1045,6 +1061,32 @@ def test_local_detector_model_registration_uses_bounded_resources(
     assert database.row(
         "SELECT id FROM adapters WHERE id=?", (model["adapter_id"],)
     ) is None
+    assert database.row(
+        "SELECT id FROM model_profiles WHERE model_id=?", (model["id"],)
+    ) is None
+
+
+def test_known_detector_commands_are_upgraded_to_benchmark_protocol(
+    tmp_path: Path,
+) -> None:
+    database, app_settings = make_database(tmp_path)
+    arguments = JobAgent(database, app_settings)._benchmark_command_arguments(
+        [
+            "tools/inference/platform_coco.py",
+            "--weights",
+            "{weight_path}",
+            "--output",
+            "{predictions_path}",
+        ],
+        Path("/models/ultralytics-visdrone"),
+    )
+    assert arguments[0] == str(
+        app_settings.root_dir / "adapters" / "detector_benchmark.py"
+    )
+    assert arguments[arguments.index("--backend") + 1] == "ultralytics"
+    assert "{request_path}" in arguments
+    assert "{result_path}" in arguments
+    assert "{warmup}" in arguments
 
 
 def test_local_dataset_resources_are_bounded_and_validate_import_paths(
@@ -1463,14 +1505,16 @@ def test_structured_detector_command_only_requires_coco_predictions(
     assert completed["status"] == "SUCCEEDED"
     run = database.row(
         """
-        SELECT runs.config,results.map,results.latency_p50
+        SELECT runs.config,results.map,results.latency_p50,
+               results.performance_status
         FROM runs JOIN results ON results.run_id=runs.id
         WHERE runs.job_id=?
         """,
         (job["id"],),
     )
     assert run["map"] == pytest.approx(1)
-    assert run["latency_p50"] > 0
+    assert run["latency_p50"] == 0
+    assert run["performance_status"] == "UNAVAILABLE"
     config = json.loads(run["config"])
     assert config["category_mapping"] == {"0": 1}
     assert config["confidence"] == pytest.approx(0.42)
@@ -1546,7 +1590,23 @@ def test_dronedets_category_mapping_and_coco_metrics(tmp_path: Path) -> None:
     assert metrics["map50"] == pytest.approx(0.5)
     assert metrics["latency_p50"] == 10
     assert metrics["fps"] == 100
+    assert metrics["performance_status"] == "MEASURED"
     assert len(curves["recall"]) == len(curves["precision"]) == 101
+    batched_metrics, _ = evaluate_coco_predictions(
+        annotation_path,
+        predictions_path,
+        {
+            "inference_ms": [5, 5],
+            "end_to_end_ms": [10, 10],
+            "batch_duration_ms": [15],
+            "batch_image_counts": [2],
+            "torch_peak_allocated_mb": 900,
+            "torch_peak_reserved_mb": 1100,
+            "nvml_process_peak_mb": 1200,
+        },
+    )
+    assert batched_metrics["throughput_fps"] == pytest.approx(133.333)
+    assert batched_metrics["peak_memory"] == 1200
     selected_metrics, _ = evaluate_coco_predictions(
         annotation_path,
         predictions_path,
@@ -1555,6 +1615,7 @@ def test_dronedets_category_mapping_and_coco_metrics(tmp_path: Path) -> None:
     )
     assert selected_metrics["map"] == pytest.approx(1)
     assert selected_metrics["map50"] == pytest.approx(1)
+    assert selected_metrics["performance_status"] == "UNAVAILABLE"
 
 
 def test_result_query_keeps_resolution_as_group_dimension(tmp_path: Path) -> None:
@@ -1564,6 +1625,16 @@ def test_result_query_keeps_resolution_as_group_dimension(tmp_path: Path) -> Non
     assert len(result["groups"]) == 6
     assert {group["resolution"] for group in result["groups"]} == {"1920×1080"}
     assert all(group["seed_count"] == 3 for group in result["groups"])
+    assert {
+        run["condition_type"]
+        for run in result["runs"]
+        if run["dataset_id"] == "dataset_aerial_clean"
+    } == {"无"}
+    assert {
+        run["condition_type"]
+        for run in result["runs"]
+        if run["dataset_id"] == "dataset_aerial_blur"
+    } == {"运动模糊"}
 
 
 def test_result_query_does_not_merge_different_evaluation_categories(
@@ -2515,6 +2586,16 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
                         "postprocess_ms": [1],
                         "peak_memory_mb": 512,
                     },
+                    "complexity": {
+                        "parameters_total": 1000,
+                        "parameters_trainable": 900,
+                        "input_shape": [1, 3, 960, 1280],
+                        "macs": 2000,
+                        "flops": 4000,
+                        "scope": "forward_only",
+                        "profiler": "test-profiler",
+                        "unsupported_ops": [],
+                    },
                     "environment": {"device": "test-gpu"},
                 }
             ),
@@ -2528,7 +2609,8 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
     assert completed["status"] == "SUCCEEDED"
     run = database.row(
         """
-        SELECT runs.*,results.map,results.latency_p50,results.is_official
+        SELECT runs.*,results.map,results.latency_p50,results.is_official,
+               results.performance_status,results.inference_latency_p50
         FROM runs JOIN results ON results.run_id=runs.id
         WHERE runs.job_id=?
         """,
@@ -2537,7 +2619,14 @@ def test_real_detector_evaluation_converts_visdrone_annotations(
     assert run["model_id"] == "model_dronedets_yolov8m_visdrone"
     assert run["map"] == pytest.approx(1)
     assert run["latency_p50"] == 10
+    assert run["inference_latency_p50"] == 8
+    assert run["performance_status"] == "MEASURED"
     assert run["is_official"] == 0
+    profile = database.row(
+        "SELECT * FROM model_profiles WHERE model_id=?", (run["model_id"],)
+    )
+    assert profile["parameters_total"] == 1000
+    assert profile["flops"] == 4000
     run_config = json.loads(run["config"])
     assert run_config["annotation_conversion"]["images"] == 1
     assert run_config["evaluation_categories"] == ["car"]
