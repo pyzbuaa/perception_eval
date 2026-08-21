@@ -5,6 +5,7 @@ import {
   Card,
   Checkbox,
   Col,
+  Collapse,
   Descriptions,
   Divider,
   Drawer,
@@ -2481,6 +2482,12 @@ function evaluationCategoryLabel(categories: string[]) {
   return `${categories.length} 类（${categories.slice(0, 3).join('、')}…）`
 }
 
+const precisionRecallExplanation = '取自 COCOeval 在评测 IoU=0.5 下生成的 PR 曲线：先对全部评测类别的 Precision 求平均，再选择 F1 最大的曲线点。该点没有记录对应的置信度阈值，不代表 confidence=0.001 的固定工作点；NMS IoU=0.7 仅用于预测框去重。'
+
+function precisionRecallMetricLabel(label: string) {
+  return <Space size={4}>{label}<Tooltip title={precisionRecallExplanation}><QuestionCircleOutlined aria-label={`${label}取值依据`} style={{ color: '#1677ff', cursor: 'help' }} /></Tooltip></Space>
+}
+
 function runInferenceResolution(config: Record<string, unknown>) {
   if (config.input_width && config.input_height) return `${config.input_width}×${config.input_height}`
   if (config.input_resolution) return String(config.input_resolution)
@@ -2739,9 +2746,9 @@ export function ExplorerPage({ dark }: PageProps) {
           <Descriptions bordered size="small" column={3} items={[
             { key: 'map50', label: 'AP50', children: percent(selectedRun.map50) },
             { key: 'map75', label: 'AP75', children: percent(selectedRun.map75) },
-            { key: 'precision', label: '最佳F1点 Precision', children: percent(selectedRun.precision) },
-            { key: 'recall', label: '最佳F1点 Recall', children: percent(selectedRun.recall) },
-            { key: 'f1', label: '最佳 F1', children: percent(selectedRun.f1) },
+            { key: 'precision', label: precisionRecallMetricLabel('最佳F1点 Precision'), children: percent(selectedRun.precision) },
+            { key: 'recall', label: precisionRecallMetricLabel('最佳F1点 Recall'), children: percent(selectedRun.recall) },
+            { key: 'f1', label: precisionRecallMetricLabel('最佳 F1'), children: percent(selectedRun.f1) },
             { key: 'latency95', label: '端到端时延P95', children: performanceValue(selectedRun, selectedRun.latency_p95, ' ms') },
             { key: 'inference50', label: '纯推理时延P50', children: performanceValue(selectedRun, selectedRun.inference_latency_p50, ' ms') },
             { key: 'inference95', label: '纯推理时延P95', children: performanceValue(selectedRun, selectedRun.inference_latency_p95, ' ms') },
@@ -2754,18 +2761,20 @@ export function ExplorerPage({ dark }: PageProps) {
             { key: 'confidence', label: '置信度阈值', children: runParameterValue(selectedRun.config, 'confidence') },
             { key: 'nmsIou', label: 'NMS IoU', children: runParameterValue(selectedRun.config, 'nms_iou') },
           ]} />
-          <Alert type="info" showIcon message="Precision / Recall 取值依据" description="取自 COCOeval 在评测 IoU=0.5 下生成的 PR 曲线：先对全部评测类别的 Precision 求平均，再选择 F1 最大的曲线点。该点没有记录对应的置信度阈值，不代表 confidence=0.001 的固定工作点；NMS IoU=0.7 仅用于预测框去重。" />
           <Descriptions bordered column={1} items={[
             { key: 'model', label: '模型', children: selectedRun.model_name },
             { key: 'architecture', label: '架构 / Backbone', children: `${selectedRun.family} / ${selectedRun.backbone}` },
             { key: 'dataset', label: '数据集', children: selectedRun.dataset_name },
             { key: 'categories', label: '评测类别', children: selectedRun.evaluation_categories.length ? <Space wrap>{selectedRun.evaluation_categories.map((name) => <Tag key={name}>{name}</Tag>)}</Space> : evaluationCategoryLabel(selectedRun.evaluation_categories) },
-            { key: 'scene', label: '场景 / 条件', children: `${selectedRun.scene_domain} / ${selectedRun.condition_type || '无'}` },
-            { key: 'conditions', label: '条件参数', children: Object.keys(selectedRun.sensor_conditions).length ? <Typography.Text code copyable>{JSON.stringify(selectedRun.sensor_conditions)}</Typography.Text> : '未记录' },
+            { key: 'scene', label: '场景', children: selectedRun.scene_domain },
+            { key: 'condition', label: '条件', children: selectedRun.condition_type || '无' },
             { key: 'resolution', label: '数据分辨率', children: selectedRun.resolution },
-            { key: 'config', label: '推理配置', children: <Typography.Text code copyable>{JSON.stringify(selectedRun.config)}</Typography.Text> },
             { key: 'hardware', label: '硬件环境', children: <Typography.Text code copyable>{JSON.stringify(selectedRun.hardware_profile)}</Typography.Text> },
             { key: 'fingerprint', label: '环境指纹', children: <Typography.Text code copyable>{selectedRun.environment_fingerprint || '未记录'}</Typography.Text> },
+          ]} />
+          <Collapse size="small" items={[
+            { key: 'conditions', label: '条件参数', children: Object.keys(selectedRun.sensor_conditions).length ? <Typography.Text code copyable>{JSON.stringify(selectedRun.sensor_conditions)}</Typography.Text> : '未记录' },
+            { key: 'config', label: '推理配置', children: <Typography.Text code copyable>{JSON.stringify(selectedRun.config)}</Typography.Text> },
           ]} />
           <Card title="PR 曲线"><PRChart groups={[selectedRun]} dark={dark} height={320} /></Card>
         </Space>}
